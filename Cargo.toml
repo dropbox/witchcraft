@@ -1,0 +1,16 @@
+[package]
+name = "rustnn"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "*"
+serde = "*"
+serde_json = "*"
+candle-core = "*"
+candle-nn = "*"
+candle-transformers = "*"
+hf-hub = "*"
+tokenizers = "*"
+tracing = "*"
+serde_plain = "1.0.2"
