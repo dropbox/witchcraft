@@ -19,6 +19,7 @@ sqlite-vec = "0.1.6"
 rusqlite = "0.35.0"
 scan_dir = "0.3.3"
 sha2 = "0.10.9"
+min-heap = "1.0.0"
 
 #[dependencies.rusqlite]
 #version = "0.35.0"

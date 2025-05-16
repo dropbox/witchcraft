@@ -3,6 +3,7 @@ use rand::prelude::*;
 use rusqlite::{Connection, Statement, Result as SQLResult};
 use scan_dir::ScanDir;
 use sha2::{Sha256, Digest};
+use min_heap::MinHeap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::mem::size_of;
@@ -137,36 +138,69 @@ fn write_buckets(db: &DB,
     Ok(())
 }
 
+fn topk(x: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
+    // Sorted descending
+    let sorted_indices = x.arg_sort_last_dim(false)?;
+    let topk_indices = sorted_indices.narrow(D::Minus1, 0, k)?.contiguous()?;
+    Ok(( x.gather(&topk_indices, D::Minus1)?, topk_indices))
+}
+
 fn match_centroids(bucket_query: &mut Query, query_embeddings: &Tensor, centers: &Tensor) -> Result<()> {
     println!("******************** LOOKUP **********************\n");
     let sim = query_embeddings.matmul(&centers.transpose(D::Minus1, D::Minus2)?).unwrap();
-    println!("query {:?} centers {:?} sim dim {:?}",
-        query_embeddings.dims2()?,
-        centers.dims2()?,
-        sim.dims2()?);
 
-    let cluster_assignments = sim.argmax(D::Minus1)?;
-    println!("clusters {}", cluster_assignments);
+    let k = 2;
+    let (topk_plus1_scores, topk_plus1_clusters) = topk(&sim, k + 1)?;
+    let topk_clusters = topk_plus1_clusters.i((.., 0..k))?;
+    let (m, n) = topk_clusters.dims2()?;
 
-    let mut cluster_assignments = cluster_assignments.to_vec1::<u32>()?;
-    cluster_assignments.sort();
-    cluster_assignments.dedup();
+    let missing_similarities = topk_plus1_scores.i((.., k..k+1))?.reshape(m)?;
+    println!("missing_similarities {}", missing_similarities);
 
-    for i in cluster_assignments {
+    let topk_clusters = topk_clusters.reshape(m * n)?;
+    let mut topk_clusters = topk_clusters.to_vec1::<u32>()?;
+    topk_clusters.sort();
+    topk_clusters.dedup();
 
+    let mut heap = MinHeap::new();
+
+    let mut all_document_embeddings = vec![];
+    for i in topk_clusters {
         for result in bucket_query.iter3(i)? {
-            let (indices, embeddings) = result?;
-            let indices = u8_to_tensor2d_u32_1d(&indices);
-            println!("indices {}", indices);
-            let embeddings = u8_to_tensor2d_f32(&embeddings, 128);
-            let sim = query_embeddings.matmul(&embeddings.transpose(D::Minus1, D::Minus2)?)?;
-            let assignments = sim.argmax(D::Minus1)?;
-            let best_indices = indices.index_select(&assignments, 0)?;
-
-            println!("best {}", best_indices);
-            //println!("iter len {}", chunk?.embedding.len());
+            let (document_indices, document_embeddings) = result?;
+            let document_indices = u8_to_vec_u32(&document_indices);
+            let document_embeddings = u8_to_tensor2d_f32(&document_embeddings, 128);
+            let (m, _) = document_embeddings.dims2()?;
+            for j in 0..m {
+                heap.push((document_indices[j], all_document_embeddings.len()));
+                all_document_embeddings.push(document_embeddings.get(j)?);
+            }
         }
     }
+
+    let all_document_embeddings = Tensor::stack(all_document_embeddings.as_slice(), 1)?;
+    let sim = query_embeddings.matmul(&all_document_embeddings)?.transpose(0, 1)?;
+    println!("all sim {}", sim);
+
+    let mut last = std::u32::MAX;
+    let mut current = Tensor::zeros((n,), DType::F32, &Device::Cpu)?;
+
+    while let Some((idx, i)) = heap.pop() {
+
+        if last != idx || heap.len() == 0 {
+            println!("document={} scores={}", last, current.sum(0)?);
+        }
+
+        let row = sim.get(i)?;
+        current = if idx == last {
+            row.maximum(&current)?
+        } else {
+            row.maximum(&missing_similarities)?
+        };
+
+        last = idx;
+    }
+
     Ok(())
 }
 
@@ -503,6 +537,20 @@ pub fn u8_to_tensor2d_u32_1d(bytes: &[u8]) -> Tensor {
     Tensor::from_vec(u32s, total_u32s, &Device::Cpu).unwrap()
 }
 
+pub fn u8_to_vec_u32(bytes: &[u8]) -> Vec<u32> {
+    let u32_size = size_of::<u32>();
+
+    assert!(bytes.len() % u32_size == 0);
+    let total_u32s = bytes.len() / u32_size;
+
+    let mut u32s = Vec::with_capacity(total_u32s);
+    for chunk in bytes.chunks_exact(u32_size) {
+        let arr: [u8; 4] = chunk.try_into().unwrap();
+        u32s.push(u32::from_ne_bytes(arr));
+    }
+    u32s
+}
+
 fn main() -> Result<()> {
 
     let args: Vec<String> = env::args().collect();
@@ -528,13 +576,11 @@ fn main() -> Result<()> {
 
     let mut document_indices = Vec::<u32>::new();
     if args.len() == 2 && args[1] == "index" {
-        let mut all_filenames : Vec<String> = Vec::new();
         let mut all_embeddings = vec![];
         let mut total = 0;
         for (document_idx, result) in kmeans_query.iter2()?.enumerate() {
             let (filename, embedding) = result?;
             println!("filename {} start at {}", filename, all_embeddings.len());
-            all_filenames.push(filename);
             let t = u8_to_tensor2d_f32(&embedding, 128);
             let split = split_tensor(&t);
             all_embeddings.extend(split);
