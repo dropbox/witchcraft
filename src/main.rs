@@ -1,9 +1,9 @@
 use std::env;
 use rand::prelude::*;
 use rusqlite::{Connection, Statement, Result as SQLResult};
-use scan_dir::ScanDir;
 use sha2::{Sha256, Digest};
 use min_heap::MinHeap;
+use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::mem::size_of;
@@ -54,6 +54,7 @@ impl T5ModelBuilder {
 }
 
 fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(Tensor, Tensor)> {
+    println!("kmeans...");
     let (n, _) = data.dims2()?;
     //let mut rng = rand::rng();
     let mut rng = SmallRng::seed_from_u64(0);
@@ -149,6 +150,7 @@ fn write_buckets(db: &DB,
 fn match_centroids(
         bucket_sizes_query: &mut Query,
         bucket_query: &mut Query,
+        body_query: &mut Query,
         query_embeddings: &Tensor,
         centers: &Tensor) -> Result<()> {
     println!("******************** LOOKUP **********************\n");
@@ -237,8 +239,14 @@ fn match_centroids(
         last = idx;
     }
 
-    while let Some((score_as_u32, idx)) = heap2.pop() {
-        println!("score={} idx={}", (score_as_u32 as f32) / 1000.0, idx);
+    let mut results = heap2.into_vec();
+    results.reverse();
+
+    for (score_as_u32, idx) in results {
+        println!("================= score:{} ============", (score_as_u32 as f32) / 1000.0);
+        let body = body_query.point4(idx)?;
+        println!("{}", body);
+        println!("");
     }
 
     Ok(())
@@ -286,22 +294,29 @@ fn compute_sha256<P: AsRef<Path>>(path: P) -> Result<String, Box<dyn std::error:
 
 
 fn register_documents(db: &DB, dirname: &str) -> Result<()> {
-    ScanDir::files().read(dirname, |iter| {
-        for (entry, _name) in iter {
-            let path = entry.path();
-            let filename = path.to_str().unwrap();
-            let hash = compute_sha256(path.clone()).unwrap();
-            //println!("{} hash is {}", filename, hash);
-            db.add_doc(&filename, &hash).unwrap();
-        }
-    }).unwrap();
+
+    println!("register documents...");
+    let mut entries: Vec<_> = fs::read_dir(dirname)?
+        .filter_map(Result::ok) // Filter out errors
+        .filter(|e| e.path().is_file()) // Only files
+        .collect();
+
+    // Sort entries by file name
+    entries.sort_by_key(|e| e.file_name());
+    let bar = ProgressBar::new(entries.len() as u64);
+
+    for entry in entries {
+        let path = entry.path();
+        let filename = path.to_str().unwrap();
+        let body = fs::read_to_string(filename)?;
+        let hash = compute_sha256(path.clone()).unwrap();
+        //println!("{} hash is {}", filename, hash);
+        db.add_doc(&filename, &hash, &body).unwrap();
+        bar.inc(1);
+    }
+    bar.finish();
 
     Ok(())
-}
-
-struct Document {
-    filename: String,
-    hash: String,
 }
 
 struct Embedder {
@@ -332,7 +347,7 @@ impl Embedder {
 }
 
 pub struct Gatherer<'a> {
-    documents: Box<dyn Iterator<Item = Document> + 'a>,
+    documents: Box<dyn Iterator<Item = (String, String)> + 'a>,
     embedder: &'a Embedder,
 }
 
@@ -352,31 +367,14 @@ impl<'a> Iterator for Gatherer<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let mut doc_embedding = vec![];
         match self.documents.next() {
-            Some(document) => {
-                let filename = document.filename;
-                let hash = document.hash;
-                assert!(hash == compute_sha256(&filename).ok()?);
+            Some((hash, body)) => {
 
-                let path = PathBuf::from(filename);
-                println!("read file {:?}", path);
-                let file = File::open(path).unwrap();
-                let mut reader = BufReader::new(file);
-                let mut buffer = [0u8; 0x10000];
+                let now = std::time::Instant::now();
+                let embeddings = self.embedder.embed(&body);
+                println!("embedder took {} ms.", now.elapsed().as_millis());
 
-                loop {
-                    let bytes_read = reader.read(&mut buffer).unwrap();
-                    if bytes_read == 0 {
-                        break;
-                    }
-
-                    let now = std::time::Instant::now();
-                    let utf8 = std::str::from_utf8(&buffer[..bytes_read]).unwrap();
-                    let embeddings = self.embedder.embed(utf8);
-                    println!("embedder took {} ms.", now.elapsed().as_millis());
-
-                    let split = split_tensor(&embeddings.ok()?.get(0).ok()?);
-                    doc_embedding.extend(split);
-                }
+                let split = split_tensor(&embeddings.ok()?.get(0).ok()?);
+                doc_embedding.extend(split);
                 Some((hash, stack_tensors(doc_embedding)))
             }
             None => {
@@ -401,7 +399,7 @@ impl DB {
 
         println!("init");
         let query = "CREATE TABLE IF NOT EXISTS document(filename TEXT PRIMARY KEY,
-            hash TEXT NOT NULL)";
+            hash TEXT NOT NULL, body TEXT, UNIQUE(filename, hash))";
         connection.execute(query, ()).unwrap();
 
         let query = "CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY NOT NULL, embedding BLOB NOT NULL)";
@@ -414,7 +412,8 @@ impl DB {
     }
 
     fn make_query(self: &Self) -> SQLResult<Query> {
-        let stmt = self.connection.prepare("SELECT document.filename,document.hash
+        let stmt = self.connection.prepare("SELECT
+            document.filename,document.hash,document.body
             FROM document
             LEFT JOIN chunk ON document.hash = chunk.hash
             WHERE chunk.hash IS NULL
@@ -423,7 +422,7 @@ impl DB {
     }
 
     fn make_kmeans_query(self: &Self) -> SQLResult<Query> {
-        let stmt = self.connection.prepare("SELECT document.filename,chunk.hash,chunk.embedding FROM document,chunk
+        let stmt = self.connection.prepare("SELECT document.rowid,document.filename,chunk.hash,chunk.embedding FROM document,chunk
             WHERE document.hash == chunk.hash
             ORDER BY document.filename")?;
         Ok(Query { stmt })
@@ -444,8 +443,13 @@ impl DB {
         Ok(Query { stmt })
     }
 
-    fn add_doc(self: &Self, filename: &str, hash: &str) -> SQLResult<()> {
-        self.connection.execute("INSERT OR IGNORE INTO document VALUES(?1, ?2)", (&filename, &hash))?;
+    fn make_document_body_query(self: &Self) -> SQLResult<Query> {
+        let stmt = self.connection.prepare("SELECT body FROM document WHERE rowid = ?1")?;
+        Ok(Query { stmt })
+    }
+
+    fn add_doc(self: &Self, filename: &str, hash: &str, body: &str) -> SQLResult<()> {
+        self.connection.execute("INSERT OR IGNORE INTO document VALUES(?1, ?2, ?3)", (&filename, &hash, &body))?;
         Ok(())
     }
 
@@ -461,21 +465,22 @@ impl DB {
 }
 
 impl<'connection> Query<'connection> {
-    fn iter1(&mut self) -> SQLResult<impl Iterator<Item = SQLResult<Document>> + '_> {
+    fn iter1(&mut self) -> SQLResult<impl Iterator<Item = SQLResult<(String, String)>> + '_> {
         self.stmt.query_map([], |row| {
-            Ok(Document {
-                filename: row.get(0)?,
-                hash: row.get(1)?,
-            })
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+            ))
         })
     }
 
-    fn iter2(&mut self) -> SQLResult<impl Iterator<Item = SQLResult<(String, String, Vec<u8>)>> + '_> {
+    fn iter2(&mut self) -> SQLResult<impl Iterator<Item = SQLResult<(u32, String, String, Vec<u8>)>> + '_> {
         self.stmt.query_map([], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
                 row.get(2)?,
+                row.get(3)?,
             ))
         })
     }
@@ -495,6 +500,14 @@ impl<'connection> Query<'connection> {
                 row.get(0)?,
                 row.get(1)?,
             ))
+        })
+    }
+
+    fn point4(&mut self, id: u32) -> SQLResult<String> {
+        self.stmt.query_row([id], |row| {
+            Ok(
+                row.get(0)?,
+            )
         })
     }
 
@@ -595,11 +608,8 @@ fn main() -> Result<()> {
     let embedder = Embedder::new();
 
     let db = DB::new();
-    let mut query = db.make_query()?;
-    let mut kmeans_query = db.make_kmeans_query()?;
-    let mut bucket_sizes_query = db.make_bucket_sizes_query()?;
-    let mut bucket_query = db.make_bucket_embeddings_query()?;
-    let mut center_query = db.make_bucket_center_query()?;
+    let mut query = db.make_query().unwrap();
+    let mut kmeans_query = db.make_kmeans_query().unwrap();
 
     let args: Vec<String> = env::args().collect();
     if args.len() == 2 && args[1] == "index" {
@@ -609,7 +619,6 @@ fn main() -> Result<()> {
         let embedding_iter = Gatherer::new(&mut query, &embedder);
         for (hash, embeddings) in embedding_iter {
             println!("for hash {} {:?}", hash, embeddings.dims2().unwrap());
-            //let (b, n) = embeddings.dims2().unwrap();
             let vec = embeddings.flatten_all()?.to_vec1::<f32>()?;
             let bytes = vec_f32_to_u8_vec(&vec);
             db.add_chunk(&hash, &bytes).unwrap();
@@ -618,19 +627,19 @@ fn main() -> Result<()> {
         let mut document_indices = Vec::<u32>::new();
         let mut all_embeddings = vec![];
         let mut total = 0;
-        for (document_idx, result) in kmeans_query.iter2()?.enumerate() {
-            let (_filename, _hash, embedding) = result?;
+        for result in kmeans_query.iter2()? {
+            let (id, _filename, _hash, embedding) = result?;
+            //println!("id={} filename={}", id, _filename);
             let t = u8_to_tensor2d_f32(&embedding, 128);
             let split = split_tensor(&t);
             all_embeddings.extend(split);
             let (m, _n) = t.dims2()?;
             for _ in 0..m {
-                document_indices.push(document_idx as u32);
+                document_indices.push(id as u32);
             }
             total += m;
         }
         let matrix = stack_tensors(all_embeddings);
-        println!("kmeans...");
         let now = std::time::Instant::now();
         let k = 1024;
         let (centers, idxs) = kmeans(&matrix, k, 5, &device)?;
@@ -648,6 +657,11 @@ fn main() -> Result<()> {
         let q = &args[2..].join(" ");
         println!("Looking up: {}", q);
 
+        let mut center_query = db.make_bucket_center_query().unwrap();
+        let mut bucket_sizes_query = db.make_bucket_sizes_query().unwrap();
+        let mut bucket_query = db.make_bucket_embeddings_query().unwrap();
+        let mut body_query = db.make_document_body_query().unwrap();
+
         let mut centers = vec![];
         for center in center_query.iter4()? {
             let t = u8_to_tensor2d_f32(&center?, 128);
@@ -657,7 +671,7 @@ fn main() -> Result<()> {
         let centers = stack_tensors(centers);
 
         let qe = embedder.embed(q)?.get(0)?;
-        match_centroids(&mut bucket_sizes_query, &mut bucket_query, &qe, &centers).unwrap();
+        match_centroids(&mut bucket_sizes_query, &mut bucket_query, &mut body_query, &qe, &centers).unwrap();
     } else {
         usage(&args[0]);
     }
