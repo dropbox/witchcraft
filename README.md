@@ -26,7 +26,7 @@ script to dump them as individual files in the "documents" folder, which
 you have to create yourself. Once that is present and populated, you can
 run:
 
-For your convenience, nfcorpus.tsv is included, so this just do this:
+For your convenience, nfcorpus.tsv is included, so you can just do this:
 
 ```
 mkdir documents
