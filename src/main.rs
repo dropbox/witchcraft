@@ -561,8 +561,8 @@ fn u8_to_vec_u32(bytes: &[u8]) -> Vec<u32> {
 }
 
 fn usage(arg0: &String) {
-        eprintln!("Usage: {} index | query <text>", arg0);
-        std::process::exit(1)
+    eprintln!("Usage: {} index | query <text>", arg0);
+    std::process::exit(1)
 }
 
 fn main() -> Result<()> {
