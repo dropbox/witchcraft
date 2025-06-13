@@ -240,6 +240,32 @@ fn write_buckets(db: &DB,
     Ok(())
 }
 
+fn fulltext_search(
+    db: &DB,
+    q: &String
+) -> Result<Vec<u32>> {
+    let mut fts_idxs = vec![];
+    let mut query = db.query("SELECT rowid,bm25(document_fts) AS score
+        FROM document_fts
+        WHERE document_fts MATCH ?1 ORDER BY score")?;
+
+    let q: String = q.chars()
+         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+         .collect();
+
+    let results = query.iter((&q,), |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+            ))
+        })?;
+    for result in results {
+        let (rowid, ) = result?;
+        fts_idxs.push(rowid);
+    }
+    println!("full text found {} matches", fts_idxs.len());
+    Ok(fts_idxs)
+}
+
 fn reciprocal_rank_fusion(
     list1: &[u32],
     list2: &[u32],
@@ -811,49 +837,16 @@ fn main() -> Result<()> {
         write_buckets(&db, &centers, &device).unwrap();
         println!("write buckets took {} ms.", now.elapsed().as_millis());
 
-    } else if args.len() >= 3 && args[1] == "fts" {
-
-        let q = &args[2..].join(" ");
-        println!("Doing full text search for: {}", q);
-
-        let mut query = db.query("SELECT rowid,body,bm25(document_fts) AS score
-            FROM document_fts
-            WHERE document_fts MATCH ?1 ORDER BY score")?;
-        let results = query.iter((&q,), |row| {
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, String>(1)?,
-                ))
-            })?;
-        for result in results {
-            let (rowid, body) = result?;
-            println!("match in {} {}", rowid, body);
-
-
-        }
-
-
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
 
         let q = &args[2..].join(" ");
-        let mut fts_idxs = vec![];
 
-        if args[1] == "hybrid" {
+        let fts_idxs = if args[1] == "hybrid" {
             println!("Doing full text search for: {}", q);
-            let mut query = db.query("SELECT rowid,bm25(document_fts) AS score
-                FROM document_fts
-                WHERE document_fts MATCH ?1 ORDER BY score")?;
-            let results = query.iter((&q,), |row| {
-                    Ok((
-                        row.get::<_, u32>(0)?,
-                    ))
-                })?;
-            for result in results {
-                let (rowid, ) = result?;
-                fts_idxs.push(rowid);
-            }
-            println!("full text found {} matches", fts_idxs.len());
-        }
+            fulltext_search(&db, &q)?
+        } else {
+            [].to_vec()
+        };
 
         println!("Doing semantic search for: {}", q);
         let mut centers = vec![];
@@ -868,7 +861,7 @@ fn main() -> Result<()> {
         let qe = embedder.embed(q)?.get(0)?;
         let sem_matches = match_centroids(&mut bucket_sizes_query, &mut bucket_query, &qe, &centers, true).unwrap();
         let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
-        println!("semantic search found {} matches", fts_idxs.len());
+        println!("semantic search found {} matches", sem_idxs.len());
 
         let fused = reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0);
 
@@ -885,7 +878,10 @@ fn main() -> Result<()> {
             println!("");
         }
 
-    } else if args.len() >= 4 && args[1] == "querycsv" {
+    } else if args.len() >= 4 && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv") {
+
+        let use_fulltext = args[1] == "hybridcsv" || args[1] == "fulltextcsv";
+        let use_semantic = args[1] != "fulltextcsv";
 
         let mut centers = vec![];
         for center in center_query.iter4()? {
@@ -909,11 +905,28 @@ fn main() -> Result<()> {
             let key = record.0;
             let question = record.1;
 
-            let qe = embedder.embed(&question)?.get(0)?;
-            let results = match_centroids(&mut bucket_sizes_query, &mut bucket_query, &qe, &centers, false).unwrap();
+            let fts_idxs = if use_fulltext {
+                println!("Doing full text search for: {}", question);
+                fulltext_search(&db, &question)?
+            } else {
+                [].to_vec()
+            };
+
+            let sem_matches = if use_semantic {
+                let qe = embedder.embed(&question)?.get(0)?;
+                match_centroids(&mut bucket_sizes_query, &mut bucket_query, &qe, &centers, false).unwrap()
+            } else {
+                [].to_vec()
+            };
+            let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
+            if use_semantic {
+                println!("semantic search found {} matches", sem_idxs.len());
+            }
+
+            let fused = reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0);
 
             let mut filenames = vec![];
-            for (_score, idx) in results {
+            for (idx, _score) in fused {
                 let (filename, _) = body_query.point((idx,), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
