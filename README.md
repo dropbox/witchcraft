@@ -32,7 +32,19 @@ For your convenience, nfcorpus.tsv is included, so you can just do this:
 $ cargo run --release readcsv datasets/nfcorpus.tsv
 ```
 
-With all the documents in place, it is time to create the index:
+With all the documents in place, we can now create embeddings for them, with:
+
+```
+$ cargo run --release embed
+```
+
+This will look for documents that lack embeddings, and create and insert them.
+The embeddings are stored in float-32 precision, so this will inflate the database
+quite a bit. Technically we could drop the embeddings once they had been indexed,
+but right now we prefer to keep them around to not have to recompute them, at
+the expense of bloating up the database.
+
+Next we create the index over the embeddings, with:
 
 ```
 $ cargo run --release index
@@ -61,7 +73,16 @@ When you have the index, you can query it with:
 $ cargo run --release query "does milk intake cause acne in teenagers?"
 ```
 
-And hopefully get a bunch of relevant answers.
+And hopefully get a bunch of relevant answers. You can also try other
+variations of this, instead of "query" you can use:
+
+* **fulltext** to use traditional fulltext search
+* **hybrid** to combine fulltext and sematic using reciprocal rank fusion.
+
+There are also versions of these commands to run over tab-separate CSV files,
+useful for benchmarking. Please refer to the source code, or see the
+nfcorpus-score.sh and scifact-score.sh scripts for examples of doing this
+with datasets from BEIR.
 
 ## Caveats ##
 
