@@ -1,6 +1,6 @@
-use candle_transformers::models::with_tracing::Embedding;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{Activation, VarBuilder};
+use candle_transformers::models::with_tracing::Embedding;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ pub struct Linear {
 pub fn linear_no_bias(d1: usize, d2: usize, vb: VarBuilder) -> Result<Linear> {
     let init_ws = candle_nn::init::DEFAULT_KAIMING_NORMAL;
     let weight = vb.get_with_hints((d2, d1), "weight", init_ws)?;
-    Ok(Linear { weight, })
+    Ok(Linear { weight })
 }
 
 impl Module for Linear {
@@ -284,11 +284,7 @@ struct T5Attention {
 }
 
 impl T5Attention {
-    fn load(
-        has_relative_attention_bias: bool,
-        vb: VarBuilder,
-        cfg: &Config,
-    ) -> Result<Self> {
+    fn load(has_relative_attention_bias: bool, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let inner_dim = cfg.num_heads * cfg.d_kv;
         let q = linear_no_bias(cfg.d_model, inner_dim, vb.pp("q"))?;
         let k = linear_no_bias(cfg.d_model, inner_dim, vb.pp("k"))?;
@@ -350,9 +346,7 @@ impl T5Attention {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
         // TODO: Use flash_attn.
-        let scores = {
-            q.matmul(&k.t()?)?
-        };
+        let scores = { q.matmul(&k.t()?)? };
         let scores = match mask {
             None => scores,
             Some(mask) => masked_fill(
@@ -422,9 +416,7 @@ impl T5Attention {
             },
         };
 
-        let attn_weights = {
-            candle_nn::ops::softmax_last_dim(&scores)?
-        };
+        let attn_weights = { candle_nn::ops::softmax_last_dim(&scores)? };
         let attn_output = attn_weights.matmul(&v)?;
         let attn_output = attn_output
             .transpose(1, 2)?
@@ -509,14 +501,9 @@ struct T5Block {
 }
 
 impl T5Block {
-    fn load(
-        has_relative_attention_bias: bool,
-        vb: VarBuilder,
-        cfg: &Config,
-    ) -> Result<Self> {
+    fn load(has_relative_attention_bias: bool, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let vb = vb.pp("layer");
-        let self_attn =
-            T5LayerSelfAttention::load(has_relative_attention_bias, vb.pp("0"), cfg)?;
+        let self_attn = T5LayerSelfAttention::load(has_relative_attention_bias, vb.pp("0"), cfg)?;
         let cross_attn = if cfg.is_decoder {
             Some(T5LayerCrossAttention::load(vb.pp("1"), cfg)?)
         } else {
@@ -581,8 +568,7 @@ impl T5Stack {
             cfg.layer_norm_epsilon,
             vb.pp("final_layer_norm"),
         )?;
-        let final_projection = linear_no_bias(768, 128, vb.pp("linear"),
-        )?;
+        let final_projection = linear_no_bias(768, 128, vb.pp("linear"))?;
         Ok(Self {
             block,
             shared: shared.clone(),
@@ -654,4 +640,3 @@ impl T5EncoderModel {
         &self.device
     }
 }
-

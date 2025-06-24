@@ -18,9 +18,18 @@ impl Writer {
         Ok(Self { file, writer })
     }
 
-    pub fn write_record(&mut self, value: u32, count: u32, tags: &[u8], data: &[u8]) -> io::Result<()> {
+    pub fn write_record(
+        &mut self,
+        value: u32,
+        count: u32,
+        tags: &[u8],
+        data: &[u8],
+    ) -> io::Result<()> {
         if tags.len() != count as usize * 4 || data.len() != count as usize * 64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "mismatched lengths"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "mismatched lengths",
+            ));
         }
 
         self.writer.write_all(&value.to_ne_bytes())?;
@@ -60,7 +69,10 @@ impl Merger {
         let mut heap = BinaryHeap::new();
         for (i, reader) in readers.iter_mut().enumerate() {
             if let Some(record) = read_record(reader)? {
-                heap.push(HeapEntry { record, source_index: i });
+                heap.push(HeapEntry {
+                    record,
+                    source_index: i,
+                });
             }
         }
 
@@ -81,7 +93,10 @@ impl Iterator for Merger {
                 break;
             }
 
-            let HeapEntry { record, source_index } = self.heap.pop().unwrap();
+            let HeapEntry {
+                record,
+                source_index,
+            } = self.heap.pop().unwrap();
             combined_tags.extend(record.tags);
             combined_data.extend(record.data);
 
@@ -194,4 +209,3 @@ mod tests {
         Ok(())
     }
 }
-

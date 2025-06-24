@@ -1,6 +1,5 @@
-
+use anyhow::Result;
 use candle_core::{Device, Tensor};
-use anyhow::{Result};
 
 pub trait TensorPackOps {
     fn compand(&self) -> Result<Tensor>;
@@ -20,23 +19,22 @@ pub trait TensorPackOps {
 }
 
 impl TensorPackOps for Tensor {
-
     /* mu-law companding to improve quantization of residuals. Scale input by 4 to expand
-      to full [-1;1] range, as empirically residuals of normalized embeddings rarely exceed
-      [-0.26:0.26] range.
+    to full [-1;1] range, as empirically residuals of normalized embeddings rarely exceed
+    [-0.26:0.26] range.
 
-      The inverse operation is really slow, we should use a table and fold that into the dot
-      product calculations, like is done in the WARP paper.
+    The inverse operation is really slow, we should use a table and fold that into the dot
+    product calculations, like is done in the WARP paper.
 
-      See also https://en.wikipedia.org/wiki/%CE%9C-law_algorithm
-      */
+    See also https://en.wikipedia.org/wiki/%CE%9C-law_algorithm
+    */
 
     fn compand(&self) -> Result<Tensor> {
         let scale_param = 4.0;
         let companding_param = 255.0;
         let inv_denominator = 1.0f64 / (1.0f64 + companding_param).ln();
         let x = (self * scale_param)?;
-        Ok( (&x.sign()? * (((&x.abs()? * companding_param)? + 1.0)?.log()? * inv_denominator)?)? )
+        Ok((&x.sign()? * (((&x.abs()? * companding_param)? + 1.0)?.log()? * inv_denominator)?)?)
     }
 
     fn inv_compand(&self) -> Result<Tensor> {
@@ -46,7 +44,8 @@ impl TensorPackOps for Tensor {
         let ones = Tensor::ones_like(&self)?;
         let abs = self.abs()?;
         let sign = self.sign()?;
-        let scaled = (sign * (((&ones + companding_param)?.pow(&abs)? - 1.0)? * inv_companding_param)?)?;
+        let scaled =
+            (sign * (((&ones + companding_param)?.pow(&abs)? - 1.0)? * inv_companding_param)?)?;
         Ok((&scaled * inv_scale_param)?)
     }
 
@@ -174,7 +173,7 @@ impl TensorPackOps for Tensor {
     fn from_companded_q4_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
         let x = Tensor::arange(0.0f32, 16.0f32, &Device::Cpu)?;
         let x = x.dequantize(4)?.inv_compand()?;
-        let mut table : [f32; 16] = [0.0; 16];
+        let mut table: [f32; 16] = [0.0; 16];
         for i in 0..16 {
             table[i] = x.get(i)?.to_scalar()?;
         }
@@ -197,7 +196,7 @@ impl TensorPackOps for Tensor {
         Ok(Tensor::from_vec(out, &[rows, cols], device)?)
     }
 
-/*
+    /*
     fn from_companded_q8_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
         let x = Tensor::arange(0.0f32, 256.0f32, &Device::Cpu)?;
         let x = x.dequantize(8)?.inv_compand()?;
@@ -255,10 +254,7 @@ impl TensorPackOps for Tensor {
 
         Ok(Tensor::cat(&scaled_rows, 0)?)
     }
-
-
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -286,7 +282,9 @@ mod tests {
     fn test_stretch_quantize() -> Result<()> {
         let x1 = Tensor::randn(0f32, 1.0f32, (1, 128), &Device::Cpu)?.l2_normalize()?;
         let bytes = x1.stretch_rows()?.quantize(8)?.to_q8_bytes()?;
-        let x2 = Tensor::from_q8_bytes(&bytes, 128, &Device::Cpu)?.dequantize(8)?.l2_normalize()?;
+        let x2 = Tensor::from_q8_bytes(&bytes, 128, &Device::Cpu)?
+            .dequantize(8)?
+            .l2_normalize()?;
         let mse = (&x2 - &x1)?.powf(2.0)?.sum_all()?.to_scalar::<f32>()?;
         println!("mse {}", mse);
         assert!(mse < 0.001);

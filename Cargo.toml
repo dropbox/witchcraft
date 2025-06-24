@@ -3,8 +3,13 @@ name = "warp"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "warp"
+path = "src/main.rs"
+
 [lib]
 crate-type = ["cdylib"]
+path = "src/lib.rs"
 
 [dependencies]
 accelerate-src = { version = "0.3.2", optional = true }
