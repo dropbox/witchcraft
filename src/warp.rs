@@ -330,6 +330,7 @@ fn match_centroids(
     let k = 32;
     let t_prime = 40000;
     let device = query_embeddings.device();
+    let (m, n) = query_embeddings.dims2()?;
 
     // XXX this step is quite slow. We should consider storing the centers matrix separately from
     // the buckets
@@ -355,96 +356,104 @@ fn match_centroids(
         let t = Tensor::from_f32_bytes(&center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
         centers.push(t);
     }
-    assert!(centers.len() > 0);
-    let centers = Tensor::stack(&centers, 0)?.to_device(&device)?;
-
-    println!(
-        "reading and stacking centers took {} ms.",
-        now.elapsed().as_millis()
-    );
-    let now = std::time::Instant::now();
-
-    let query_centroid_similarity = query_embeddings
-        .matmul(&centers.transpose(D::Minus1, D::Minus2)?)
-        .unwrap();
-    let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
-
-    let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
-    let (m, n) = sorted_indices.dims2()?;
-
-    let mut topk_clusters = vec![];
-    let mut missing = vec![];
-    for i in 0..m {
-        let row = sorted_indices.get(i)?;
-        let row_scores_sorted = query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
-        let mut cumsum = 0;
-        let mut score = 0.0f32;
-        for j in 0..n {
-            let idx = row.get(j)?.to_scalar::<u32>()?;
-            if j < k {
-                topk_clusters.push(idx);
-            }
-            let size = sizes[idx as usize];
-            if cumsum < t_prime {
-                score = row_scores_sorted.get(j)?.to_scalar::<f32>()?;
-            }
-            cumsum += size;
-
-            if j >= k || cumsum >= t_prime {
-                break;
-            }
-        }
-        missing.push(score);
-    }
-    topk_clusters.sort();
-    topk_clusters.dedup();
-    let missing_similarities = Tensor::from_vec(missing, m, &Device::Cpu)?;
-    println!(
-        "finding top-{} out of {} clusters took {} ms.",
-        topk_clusters.len(),
-        n,
-        now.elapsed().as_millis()
-    );
-
-    let now = std::time::Instant::now();
-    let mut all = vec![];
-    let mut count = 0;
 
     let max_generation = db
-        .query("SELECT max(generation) FROM indexed_chunk")?
+        .query("SELECT MAX(generation) FROM indexed_chunk")?
         .point((), |row| Ok(row.get::<_, u32>(0)?))
         .unwrap_or(0);
 
     let mut all_document_embeddings = vec![];
-    for i in topk_clusters {
-        //let (document_indices, document_embeddings) = bucket_query.point3(cluster_ids[i as usize])?;
-        let (document_indices, document_embeddings) = bucket_query
-            .point((max_generation, cluster_ids[i as usize]), |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
+    let mut all = vec![];
+    let mut count = 0;
+    let mut missing = vec![];
 
-        let center = centers.get(i as usize)?;
+    if centers.len() > 0 {
+        let centers_matrix = Tensor::stack(&centers, 0)?.to_device(&device)?;
 
-        let document_indices = u8_to_vec_u32(&document_indices);
+        println!(
+            "reading and stacking centers took {} ms.",
+            now.elapsed().as_millis()
+        );
+        let now = std::time::Instant::now();
 
-        //let residuals = Tensor::from_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?.dequantize(4)?.inv_compand()?;
-        let residuals =
-            Tensor::from_companded_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?;
-        let embeddings = residuals.broadcast_add(&center)?;
-        //let embeddings = embeddings.broadcast_div(&embeddings.sqr()?.sum_keepdim(0)?.sqrt()?)?;
-        all_document_embeddings.push(embeddings);
+        let query_centroid_similarity = query_embeddings
+            .matmul(&centers_matrix.transpose(D::Minus1, D::Minus2)?)
+            .unwrap();
+        let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
 
-        let (m, _) = residuals.dims2()?;
-        for j in 0..m {
-            all.push((document_indices[j], count));
-            count += 1;
+        let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
+        let (m, n) = sorted_indices.dims2()?;
+
+        let mut topk_clusters = vec![];
+        for i in 0..m {
+            let row = sorted_indices.get(i)?;
+            let row_scores_sorted = query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
+            let mut cumsum = 0;
+            let mut score = 0.0f32;
+            for j in 0..n {
+                let idx = row.get(j)?.to_scalar::<u32>()?;
+                if j < k {
+                    topk_clusters.push(idx);
+                }
+                let size = sizes[idx as usize];
+                if cumsum < t_prime {
+                    score = row_scores_sorted.get(j)?.to_scalar::<f32>()?;
+                }
+                cumsum += size;
+
+                if j >= k || cumsum >= t_prime {
+                    break;
+                }
+            }
+            missing.push(score);
+        }
+        topk_clusters.sort();
+        topk_clusters.dedup();
+        println!(
+            "finding top-{} out of {} clusters took {} ms.",
+            topk_clusters.len(),
+            n,
+            now.elapsed().as_millis()
+        );
+
+        let now = std::time::Instant::now();
+
+        for i in topk_clusters {
+            //let (document_indices, document_embeddings) = bucket_query.point3(cluster_ids[i as usize])?;
+            let (document_indices, document_embeddings) = bucket_query
+                .point((max_generation, cluster_ids[i as usize]), |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?;
+
+            let center = &centers[i as usize];
+
+            let document_indices = u8_to_vec_u32(&document_indices);
+
+            //let residuals = Tensor::from_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?.dequantize(4)?.inv_compand()?;
+            let residuals =
+                Tensor::from_companded_q4_bytes(&document_embeddings, EMBEDDING_DIM, &Device::Cpu)?;
+            let embeddings = residuals.broadcast_add(&center)?;
+            //let embeddings = embeddings.broadcast_div(&embeddings.sqr()?.sum_keepdim(0)?.sqrt()?)?;
+            all_document_embeddings.push(embeddings);
+
+            let (m, _) = residuals.dims2()?;
+            for j in 0..m {
+                all.push((document_indices[j], count));
+                count += 1;
+            }
+        }
+        println!(
+            "reading {} indexed embeddings took {} ms.",
+            count,
+            now.elapsed().as_millis()
+        );
+    } else {
+        for _ in 0..m {
+            missing.push(0.0);
         }
     }
-    println!(
-        "reading {} indexed embeddings took {} ms.",
-        count,
-        now.elapsed().as_millis()
-    );
+
+    let missing_similarities = Tensor::from_vec(missing, m, &Device::Cpu)?;
 
     let now = std::time::Instant::now();
     let mut num_unindexed = 0;
@@ -467,7 +476,7 @@ fn match_centroids(
     for result in results {
         let (id, hash, embeddings) = result?;
         println!("reading unindexed chunk with hash={}", hash);
-        let embeddings = Tensor::from_q8_bytes(&embeddings, EMBEDDING_DIM, &device)?
+        let embeddings = Tensor::from_q8_bytes(&embeddings, EMBEDDING_DIM, &Device::Cpu)?
             .dequantize(8)?
             .l2_normalize()?;
         let (m, _) = embeddings.dims2()?;
@@ -483,6 +492,10 @@ fn match_centroids(
         num_unindexed,
         now.elapsed().as_millis()
     );
+
+    if all_document_embeddings.len() == 0 {
+        return Ok([].to_vec());
+    }
 
     let all_document_embeddings = Tensor::cat(&all_document_embeddings, 0).unwrap();
     let all_document_embeddings = all_document_embeddings.to_device(query_embeddings.device())?;
