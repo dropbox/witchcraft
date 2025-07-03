@@ -9,8 +9,8 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::mem::size_of;
-use std::path::PathBuf;
 mod t5;
+pub mod assets;
 
 mod packops;
 use packops::TensorPackOps;
@@ -19,41 +19,9 @@ mod merger;
 
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_nn::VarBuilder;
 use tokenizers::Tokenizer;
 
-const DTYPE: DType = DType::F32;
 const EMBEDDING_DIM: usize = 128;
-
-struct T5ModelBuilder {
-    config: t5::Config,
-    weights_filename: Vec<PathBuf>,
-}
-
-impl T5ModelBuilder {
-    pub fn load() -> Result<(Self, Tokenizer)> {
-        let path = PathBuf::from(r"xtr.safetensors");
-        let weights_filename = vec![path];
-        let config = std::fs::read_to_string("xtr-base-en/config.json").unwrap();
-        let config: t5::Config = serde_json::from_str(&config)?;
-        let tokenizer = Tokenizer::from_file("xtr-base-en/tokenizer.json")
-            .map_err(E::msg)
-            .unwrap();
-        Ok((
-            Self {
-                config,
-                weights_filename,
-            },
-            tokenizer,
-        ))
-    }
-
-    pub fn build_encoder(&self, device: &Device) -> Result<t5::T5EncoderModel> {
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&self.weights_filename, DTYPE, device)? };
-        Ok(t5::T5EncoderModel::load(vb, &self.config)?)
-    }
-}
 
 fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(Tensor, Tensor)> {
     let (m, n) = data.dims2()?;
@@ -663,7 +631,7 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn new(device: &Device) -> Self {
-        let (builder, tokenizer) = T5ModelBuilder::load().unwrap();
+        let (builder, tokenizer) = t5::T5ModelBuilder::load().unwrap();
         let model = builder.build_encoder(&device).unwrap();
         Self { tokenizer, model }
     }

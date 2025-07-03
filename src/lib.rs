@@ -2,10 +2,6 @@ use anyhow::Result;
 use candle_core::Device;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use once_cell::sync::Lazy;
-use std::sync::Mutex;
-//use std::thread;
-use std::time::Duration;
 
 use std::{
     sync::{mpsc, LazyLock},
@@ -64,7 +60,6 @@ mod warp;
 #[napi(js_name = "Warp")]
 pub struct Warp {
     db: warp::DB,
-    device: Device,
     embedder: warp::Embedder,
 }
 
@@ -79,7 +74,6 @@ impl Warp {
 
         Self {
             db: db,
-            device: device,
             embedder: embedder,
         }
     }

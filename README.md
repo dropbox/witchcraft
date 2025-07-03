@@ -13,7 +13,9 @@ and exporting to a single safetensors file:
 * downloadxtr.py downloads the full repo, we only need the tokenizers
 
 * downloadweights.py downloads the weights (again), adds the extra
-  XTRLinear layer, and exports into xtr.safetensors
+  XTRLinear layer, and exports into xtr.safetensors. It also compressed
+  the weights with zstd, unfortunately takes some time, but you only have
+  to do it once.
 
 (If you encounter TLS cerficiate errors running these scripts locally there is a
 problem with your ZScaler cert setup.)
@@ -83,3 +85,25 @@ There are also versions of these commands to run over tab-separate CSV files,
 useful for benchmarking. Please refer to the source code, or see the
 nfcorpus-score.sh and scifact-score.sh scripts for examples of doing this
 with datasets from BEIR.
+
+## Using as Node module ##
+
+We include a Makefile for building with Napi-rs and copying things around.
+
+```
+make buildemb
+```
+
+Builds target/release/warp.node with all the weights embedded into the binary,
+not not have to deal with loading any files in production.  For day-to-day
+development, you may prefer to instead use:
+
+
+```
+make build
+```
+
+Which loads the compressed weights from the "assets" dir, and deal with
+symlinking "assets" into your Dash build tree by hand, as unfortunately Rust is
+quite slow at embedding the binaries, and does it from scratch every time you
+build.

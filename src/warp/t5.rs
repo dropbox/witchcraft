@@ -3,6 +3,7 @@ use candle_nn::{Activation, VarBuilder};
 use candle_transformers::models::with_tracing::Embedding;
 use serde::Deserialize;
 use std::sync::Arc;
+use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone)]
 pub struct Linear {
@@ -640,3 +641,33 @@ impl T5EncoderModel {
         &self.device
     }
 }
+
+use crate::embed_zst_asset;
+embed_zst_asset!(pub CONFIG, "assets/config.json.zst");
+embed_zst_asset!(pub TOKENIZER, "assets/tokenizer.json.zst");
+embed_zst_asset!(pub MODEL, "assets/xtr.safetensors.zst");
+
+pub struct T5ModelBuilder {
+    config: Config,
+}
+
+impl T5ModelBuilder {
+    pub fn load() -> Result<(Self, Tokenizer)> {
+        let config: Config = serde_json::from_str(CONFIG.as_str()).unwrap();
+        let tokenizer = Tokenizer::from_bytes(TOKENIZER.bytes())
+            .map_err(anyhow::Error::msg)
+            .unwrap();
+        Ok((
+            Self {
+                config,
+            },
+            tokenizer,
+        ))
+    }
+
+    pub fn build_encoder(&self, device: &Device) -> Result<T5EncoderModel> {
+        let vb = VarBuilder::from_slice_safetensors(MODEL.bytes(), DType::F32, device)?;
+        Ok(T5EncoderModel::load(vb, &self.config)?)
+    }
+}
+

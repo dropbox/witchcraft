@@ -1,3 +1,4 @@
 torch
 transformers
 huggingface_hub
+zstandard
