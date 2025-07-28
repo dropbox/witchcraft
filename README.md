@@ -107,3 +107,16 @@ Which loads the compressed weights from the "assets" dir, and deal with
 symlinking "assets" into your Dash build tree by hand, as unfortunately Rust is
 quite slow at embedding the binaries, and does it from scratch every time you
 build.
+
+I've also played with adding a simple Node MCP server, you can test it with:
+
+```
+pip install cmcp
+make mcp
+```
+
+cmcp is a command line MCP client available in pip, and ts/index.ts provides
+a simple MPC server in typescript. Not sure yet what if anything we could use
+it for, we would have to tunnel the traffic back from the cloud the the MCP
+server running locally, but then our Assistent would be able to search your
+local files.

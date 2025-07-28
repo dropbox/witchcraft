@@ -11,3 +11,7 @@ buildemb:
 
 run: build
 	node index.js
+
+mcp:
+	yarn build
+	cmcp "yarn start" tools/call name=search 'arguments:={"q": "is there a connection between milk intake and pimples in young people?" }'
