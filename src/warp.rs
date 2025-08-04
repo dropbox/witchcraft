@@ -620,7 +620,6 @@ pub fn add_doc_from_file(db: &DB, filename: &str) -> Result<()> {
     hasher.update(&body);
     let hash = format!("{:x}", hasher.finalize());
     db.add_doc(&filename, &hash, &body).unwrap();
-    println!("added with hash {}", hash);
     Ok(())
 }
 
@@ -629,7 +628,6 @@ pub fn add_doc_from_string(db: &DB, metadata: &str, body: &str) -> Result<()> {
     hasher.update(&body);
     let hash = format!("{:x}", hasher.finalize());
     db.add_doc(metadata, &hash, &body).unwrap();
-    println!("added with hash {}", hash);
     Ok(())
 }
 

@@ -28,7 +28,6 @@ impl Indexer {
             let device = Device::new_metal(0).unwrap();
             while let Ok(job) = rx.recv() {
                 let (command, arg1, arg2) = job;
-                println!("got job {}", command);
                 if command == "add" {
                     warp::add_doc_from_string(&db, &arg1, &arg2).unwrap();
                 } else if command == "index" {
@@ -88,7 +87,6 @@ impl Warp {
 
     #[napi]
     pub fn add(&self, metadata: String, body: String) {
-        println!("add {}", body);
         INDEXER.submit(("add".to_string(), metadata, body));
     }
 
