@@ -371,8 +371,7 @@ fn match_centroids(
         .query("SELECT MAX(generation) FROM indexed_chunk")?
         .point((), |row| Ok(row.get::<_, u32>(0)?))
         .unwrap_or(0);
-    let mut bucket_query =
-        db.query("SELECT indices,residuals FROM bucket WHERE generation = ?1 and id = ?2")?;
+
     println!("readying database took {} ms.", now.elapsed().as_millis());
 
     let k = 32;
@@ -387,7 +386,6 @@ fn match_centroids(
     let mut missing = vec![];
 
     let (cluster_ids, sizes, centers, centers_matrix) = get_centers(&db, &device, max_generation as u64)?;
-
 
     if centers.len() > 0 {
         let now = std::time::Instant::now();
@@ -434,14 +432,30 @@ fn match_centroids(
 
         let now = std::time::Instant::now();
 
+        db.execute("CREATE TEMPORARY TABLE temp(id INTEGER)").unwrap();
+
+        let mut bucket_query =
+            db.query("SELECT bucket.id,indices,residuals FROM bucket
+                JOIN temp ON bucket.id = temp.id
+                WHERE generation = ?1")?;
+        let mut insert_temp_query = db.query("INSERT INTO TEMP VALUES(?1)")?;
+
         for i in topk_clusters {
+            insert_temp_query.execute((cluster_ids[i as usize],)).unwrap()
+        }
 
-            let (document_indices, document_embeddings) = bucket_query
-                .point((max_generation, cluster_ids[i as usize]), |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?;
+        let results = bucket_query.iter((max_generation,), |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
 
-            let center = &centers[i as usize];
+        for result in results {
+            let (cluster_id, document_indices, document_embeddings) = result?;
+
+            let center = &centers[cluster_id as usize];
             let document_indices = u8_to_vec_u32(&document_indices);
 
             //let residuals = Tensor::from_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?.dequantize(4)?.inv_compand()?;
@@ -456,6 +470,8 @@ fn match_centroids(
                 count += 1;
             }
         }
+        db.execute("DROP TABLE temp").unwrap();
+
         println!(
             "reading {} indexed embeddings took {} ms.",
             count,
