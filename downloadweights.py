@@ -42,8 +42,8 @@ class XTRLinear(torch.nn.Module):
 class XTR(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained("google/xtr-base-en", torch_dtype=torch.float16, use_safetensors=True).encoder
-        to_dense_path = hf_hub_download(repo_id="google/xtr-base-en", filename="2_Dense/pytorch_model.bin")
+        self.encoder = AutoModel.from_pretrained("google/xtr-base-multilingual", torch_dtype=torch.float16, use_safetensors=True).encoder
+        to_dense_path = hf_hub_download(repo_id="google/xtr-base-multilingual", filename="2_Dense/pytorch_model.bin")
 
         self.encoder.linear = torch.nn.Linear(768, 128, bias=False)
         state = torch.load(to_dense_path)
@@ -56,6 +56,6 @@ xtr = XTR()
 fp16_state_dict = {k: v.half().cpu() for k, v in xtr.state_dict().items()}
 save_file(fp16_state_dict, "xtr.safetensors")
 
-compress_file("xtr-base-en/config.json", "assets/config.json.zst")
-compress_file("xtr-base-en/tokenizer.json", "assets/tokenizer.json.zst")
+compress_file("xtr-base-multilingual/config.json", "assets/config.json.zst")
+compress_file("xtr-base-multilingual/tokenizer.json", "assets/tokenizer.json.zst")
 compress_file("xtr.safetensors", "assets/xtr.safetensors.zst")
