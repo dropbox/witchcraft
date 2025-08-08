@@ -365,17 +365,21 @@ fn match_centroids(
     cutoff: f32,
     top_k: usize,
 ) -> Result<Vec<(f32, u32)>> {
+
     let now = std::time::Instant::now();
+    let max_generation = db
+        .query("SELECT MAX(generation) FROM indexed_chunk")?
+        .point((), |row| Ok(row.get::<_, u32>(0)?))
+        .unwrap_or(0);
+    let mut bucket_query =
+        db.query("SELECT indices,residuals FROM bucket WHERE generation = ?1 and id = ?2")?;
+    println!("readying database took {} ms.", now.elapsed().as_millis());
 
     let k = 32;
     let t_prime = 40000;
     let device = query_embeddings.device();
     let (m, n) = query_embeddings.dims2()?;
 
-    let max_generation = db
-        .query("SELECT MAX(generation) FROM indexed_chunk")?
-        .point((), |row| Ok(row.get::<_, u32>(0)?))
-        .unwrap_or(0);
 
     let mut all_document_embeddings = vec![];
     let mut all = vec![];
@@ -384,12 +388,9 @@ fn match_centroids(
 
     let (cluster_ids, sizes, centers, centers_matrix) = get_centers(&db, &device, max_generation as u64)?;
 
-    let mut bucket_query =
-        db.query("SELECT indices,residuals FROM bucket WHERE generation = ?1 and id = ?2")?;
-
-    println!("readying database took {} ms.", now.elapsed().as_millis());
 
     if centers.len() > 0 {
+        let now = std::time::Instant::now();
 
         let query_centroid_similarity = query_embeddings
             .matmul(&centers_matrix.transpose(D::Minus1, D::Minus2)?)
@@ -434,21 +435,19 @@ fn match_centroids(
         let now = std::time::Instant::now();
 
         for i in topk_clusters {
-            //let (document_indices, document_embeddings) = bucket_query.point3(cluster_ids[i as usize])?;
+
             let (document_indices, document_embeddings) = bucket_query
                 .point((max_generation, cluster_ids[i as usize]), |row| {
                     Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })?;
 
             let center = &centers[i as usize];
-
             let document_indices = u8_to_vec_u32(&document_indices);
 
             //let residuals = Tensor::from_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?.dequantize(4)?.inv_compand()?;
             let residuals =
                 Tensor::from_companded_q4_bytes(&document_embeddings, EMBEDDING_DIM, &Device::Cpu)?;
             let embeddings = residuals.broadcast_add(&center)?;
-            //let embeddings = embeddings.broadcast_div(&embeddings.sqr()?.sum_keepdim(0)?.sqrt()?)?;
             all_document_embeddings.push(embeddings);
 
             let (m, _) = residuals.dims2()?;
