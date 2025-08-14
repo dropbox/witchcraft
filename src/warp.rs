@@ -810,12 +810,10 @@ impl DB {
         Self { connection }
     }
 
-    /*
     fn execute(self: &Self, sql: &str) -> SQLResult<()> {
         self.connection.execute(sql, ()).unwrap();
         Ok(())
     }
-    */
 
     fn query(self: &Self, sql: &str) -> SQLResult<Query> {
         let stmt = self.connection.prepare(&sql)?;
