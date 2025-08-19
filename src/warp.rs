@@ -13,13 +13,15 @@ use std::io::{BufWriter, Write};
 use std::mem::size_of;
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
-mod t5;
+mod quantized_t5;
 pub mod assets;
 
 mod packops;
 use packops::TensorPackOps;
 
 mod merger;
+//pub mod qtensor;
+//pub mod varbuilder;
 
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
@@ -703,12 +705,13 @@ pub fn add_doc_from_string(db: &DB, metadata: &str, body: &str) -> Result<()> {
 
 pub struct Embedder {
     tokenizer: Tokenizer,
-    model: t5::T5EncoderModel,
+    //model: t5::T5EncoderModel,
+    model: quantized_t5::T5EncoderModel,
 }
 
 impl Embedder {
     pub fn new(device: &Device) -> Self {
-        let (builder, tokenizer) = t5::T5ModelBuilder::load().unwrap();
+        let (builder, tokenizer) = quantized_t5::T5ModelBuilder::load().unwrap();
         let model = builder.build_encoder(&device).unwrap();
         Self { tokenizer, model }
     }
@@ -1039,6 +1042,7 @@ pub fn search(
     use_fulltext: bool,
     sql_filter: Option<&str>,
 ) -> Result<Vec<(String, String)>> {
+    let now = std::time::Instant::now();
 
     let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
 
@@ -1081,6 +1085,7 @@ pub fn search(
         })?;
         results.push((metadata, body));
     }
+    println!("search took {} ms end-to-end.", now.elapsed().as_millis());
     Ok(results)
 }
 

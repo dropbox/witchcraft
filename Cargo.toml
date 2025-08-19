@@ -38,6 +38,8 @@ napi-derive = "3.2.2"
 once_cell = "1.21.3"
 zstd = "0.13.3"
 lru = "0.16.0"
+tracing = "0.1.41"
+safetensors = "0.6.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { version = "*", features = ["metal"] }
@@ -45,6 +47,9 @@ candle-nn = { version = "*", features = ["metal"] }
 
 [build-dependencies]
 napi-build = "2.2.3"
+
+#[package.metadata.napi]
+#ts-declarations = true
 
 [features]
 embed-assets = []

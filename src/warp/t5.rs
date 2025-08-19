@@ -1,5 +1,8 @@
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{Activation, VarBuilder};
+use candle_transformers::models::t5::{
+    deserialize_feed_forward_proj_activation, ActivationWithOptionalGating,
+};
 use candle_transformers::models::with_tracing::Embedding;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -58,31 +61,6 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
 pub struct ActivationWithOptionalGating {
     pub gated: bool,
     pub activation: candle_nn::Activation,
-}
-
-pub fn deserialize_feed_forward_proj_activation<'de, D>(
-    deserializer: D,
-) -> std::result::Result<ActivationWithOptionalGating, D::Error>
-where
-    D: serde::de::Deserializer<'de>,
-{
-    match String::deserialize(deserializer)?.as_str() {
-        "gated-gelu" => Ok(ActivationWithOptionalGating {
-            gated: true,
-            activation: candle_nn::Activation::NewGelu,
-        }),
-        "gated-silu" => Ok(ActivationWithOptionalGating {
-            gated: true,
-            activation: candle_nn::Activation::Silu,
-        }),
-        buf => {
-            let activation = serde_plain::from_str(buf).map_err(serde::de::Error::custom)?;
-            Ok(ActivationWithOptionalGating {
-                gated: false,
-                activation,
-            })
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -657,12 +635,7 @@ impl T5ModelBuilder {
         let tokenizer = Tokenizer::from_bytes(TOKENIZER.bytes())
             .map_err(anyhow::Error::msg)
             .unwrap();
-        Ok((
-            Self {
-                config,
-            },
-            tokenizer,
-        ))
+        Ok((Self { config }, tokenizer))
     }
 
     pub fn build_encoder(&self, device: &Device) -> Result<T5EncoderModel> {
@@ -670,4 +643,3 @@ impl T5ModelBuilder {
         Ok(T5EncoderModel::load(vb, &self.config)?)
     }
 }
-

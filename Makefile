@@ -15,6 +15,9 @@ buildemb: download
 	cargo build --release --features accelerate,embed-assets
 	ln -vf target/release/libwarp.dylib target/release/warp.node
 
+win: download
+	cargo xwin build --release --target x86_64-pc-windows-msvc --features embed-assets
+
 run: build
 	node index.js
 

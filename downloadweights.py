@@ -39,11 +39,15 @@ class XTRLinear(torch.nn.Module):
     def forward(self, x):
         return self.linear(x)
 
-class XTR(nn.Module):
+class T5(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = AutoModel.from_pretrained("google/xtr-base-en", torch_dtype=torch.float16, use_safetensors=True).encoder
         to_dense_path = hf_hub_download(repo_id="google/xtr-base-en", filename="2_Dense/pytorch_model.bin")
+
+class XTR(T5):
+    def __init__(self):
+        super().__init__()
 
         self.encoder.linear = torch.nn.Linear(768, 128, bias=False)
         state = torch.load(to_dense_path)
@@ -51,8 +55,14 @@ class XTR(nn.Module):
         other["weight"] = state["linear.weight"]
         self.encoder.linear.load_state_dict(other)
 
-xtr = XTR()
+t5 = T5()
+fp16_state_dict = {k: v.half().cpu() for k, v in t5.state_dict().items()}
+save_file(fp16_state_dict, "t5.safetensors")
 
+import sys
+sys.exit(0)
+
+xtr = XTR()
 fp16_state_dict = {k: v.half().cpu() for k, v in xtr.state_dict().items()}
 save_file(fp16_state_dict, "xtr.safetensors")
 
