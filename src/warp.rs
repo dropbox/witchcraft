@@ -261,9 +261,12 @@ fn fulltext_search(db: &DB, q: &String, sql_filter: Option<&str>) -> Result<Vec<
     let mut fts_idxs = vec![];
 
     let sql = format!(
-        "SELECT rowid,bm25(document_fts) AS score
-        FROM document_fts
-        WHERE document_fts MATCH ?1 {} ORDER BY score",
+        "SELECT document.rowid,bm25(document_fts) AS score
+        FROM document,document_fts
+        WHERE document.rowid == document_fts.rowid
+        AND document_fts MATCH ?1
+        {}
+        ORDER BY score",
         match sql_filter {
             Some(filter) => format!("AND {filter}"),
             _ => String::new(),
@@ -587,12 +590,13 @@ fn match_centroids(
 
     let sql = format!(
         "SELECT score,document.rowid
-        FROM document
-        JOIN temp2 ON document.rowid = temp2.rowid
+        FROM document,temp2
+        WHERE document.rowid = temp2.rowid
+        {}
         ORDER BY score DESC
-        LIMIT ?1 {}",
+        LIMIT ?1",
         match sql_filter {
-            Some(filter) => format!("WHERE {filter}"),
+            Some(filter) => format!("AND {filter}"),
             _ => String::new(),
         }
     );
