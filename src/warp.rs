@@ -2,7 +2,7 @@
 
 use csv;
 use indicatif::ProgressBar;
-use rusqlite::{Connection, OpenFlags, Result as SQLResult, Row, Statement};
+use rusqlite::{Connection, OpenFlags, Result as SQLResult, Statement};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -94,8 +94,8 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     let mut writes_total = 0;
 
     let embeddings_count = db
-        .query("SELECT sum(length(embeddings)/?1) FROM chunk")?
-        .point((EMBEDDING_DIM,), |row| Ok(row.get::<_, u32>(0)?))
+        .query("SELECT sum(length(embeddings)/?1) FROM chunk")
+        .query_row((EMBEDDING_DIM,), |row| Ok(row.get::<_, u32>(0)?))
         .unwrap();
     assert!(embeddings_count > 0);
     let bar = ProgressBar::new(embeddings_count as u64);
@@ -109,9 +109,9 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
         "SELECT document.rowid,chunk.hash,chunk.embeddings FROM document,chunk
         WHERE document.hash = chunk.hash
         ORDER BY document.rowid",
-    )?;
+    );
 
-    let mut results = query.iter((), |row| {
+    let mut results = query.query_map((), |row| {
         Ok((
             row.get::<_, u32>(0)?,
             row.get::<_, String>(1)?,
@@ -223,8 +223,8 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     db.begin_transaction().unwrap();
 
     let max_generation = db
-        .query("SELECT max(generation) FROM indexed_chunk")?
-        .point((), |row| Ok(row.get::<_, u32>(0)?))
+        .query("SELECT max(generation) FROM indexed_chunk")
+        .query_row((), |row| Ok(row.get::<_, u32>(0)?))
         .unwrap_or(0);
     let next_generation = max_generation + 1;
 
@@ -247,10 +247,10 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
         db.add_indexed_chunk(&hash, next_generation).unwrap();
     }
 
-    db.query("DELETE FROM bucket WHERE generation = ?1")?
+    db.query("DELETE FROM bucket WHERE generation = ?1")
         .execute((max_generation,))
         .unwrap();
-    db.query("DELETE FROM indexed_chunk WHERE generation = ?1")?
+    db.query("DELETE FROM indexed_chunk WHERE generation = ?1")
         .execute((max_generation,))
         .unwrap();
     db.commit_transaction().unwrap();
@@ -273,14 +273,14 @@ fn fulltext_search(db: &DB, q: &String, sql_filter: Option<&str>) -> Result<Vec<
             _ => String::new(),
         }
     );
-    let mut query = db.query(&sql)?;
+    let mut query = db.query(&sql);
 
     let q: String = q
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect();
 
-    let results = query.iter((&q,), |row| Ok((row.get::<_, u32>(0)?,)))?;
+    let results = query.query_map((&q,), |row| Ok((row.get::<_, u32>(0)?,)))?;
     for result in results {
         let (rowid,) = result?;
         fts_idxs.push(rowid);
@@ -330,11 +330,11 @@ fn get_centers(db: &DB, device: &Device, version: u64) -> Result<(Vec<u32>, Vec<
     }
 
     let mut center_query =
-        db.query("SELECT id,length(indices)/4,center FROM bucket ORDER BY id")?;
+        db.query("SELECT id,length(indices)/4,center FROM bucket ORDER BY id");
     let mut cluster_ids = vec![];
     let mut sizes = vec![];
     let mut centers = vec![];
-    for result in center_query.iter((), |row| {
+    for result in center_query.query_map((), |row| {
         let id = row.get(0)?;
         let size = row.get(1)?;
         let blob: Vec<u8> = row.get(2)?;
@@ -376,8 +376,8 @@ fn match_centroids(
     sql_filter: Option<&str>,
 ) -> Result<Vec<(f32, u32)>> {
     let max_generation = db
-        .query("SELECT MAX(generation) FROM indexed_chunk")?
-        .point((), |row| Ok(row.get::<_, u32>(0)?))
+        .query("SELECT MAX(generation) FROM indexed_chunk")
+        .query_row((), |row| Ok(row.get::<_, u32>(0)?))
         .unwrap_or(0);
 
     let k = 32;
@@ -444,16 +444,16 @@ fn match_centroids(
             "SELECT bucket.id,indices,residuals FROM bucket
                 JOIN temp ON bucket.id = temp.id
                 WHERE generation = ?1",
-        )?;
-        let mut insert_temp_query = db.query("INSERT INTO TEMP VALUES(?1)")?;
+        );
+        let mut insert_temp_query = db.query("INSERT INTO TEMP VALUES(?1)");
 
         for i in topk_clusters {
             insert_temp_query
                 .execute((cluster_ids[i as usize],))
-                .unwrap()
+                .unwrap();
         }
 
-        let results = bucket_query.iter((max_generation,), |row| {
+        let results = bucket_query.query_map((max_generation,), |row| {
             Ok((
                 row.get::<_, u32>(0)?,
                 row.get::<_, Vec<u8>>(1)?,
@@ -503,9 +503,9 @@ fn match_centroids(
         JOIN document d ON c.hash = d.hash
         LEFT JOIN indexed_chunk ic ON ic.generation = ?1 AND ic.hash = c.hash
         WHERE ic.hash IS NULL",
-    )?;
+    );
 
-    let results = unindexed_chunks_query.iter((max_generation,), |row| {
+    let results = unindexed_chunks_query.query_map((max_generation,), |row| {
         Ok((
             row.get::<_, u32>(0)?,
             row.get::<_, String>(1)?,
@@ -557,7 +557,7 @@ fn match_centroids(
     let mut prev_idx = 0;
 
     db.execute("CREATE TEMPORARY TABLE temp2(rowid INTEGER PRIMARY KEY, score FLOAT)").unwrap();
-    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2)")?;
+    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2)");
 
     for i in 0.. {
         let is_last = i == all.len() - 1;
@@ -602,9 +602,9 @@ fn match_centroids(
         }
     );
 
-    let mut scored_documents_query = db.query(&sql)?;
+    let mut scored_documents_query = db.query(&sql);
     let results = scored_documents_query
-        .iter((top_k,), |row| {
+        .query_map((top_k,), |row| {
             Ok((row.get::<_, f32>(0)?, row.get::<_, u32>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -737,10 +737,10 @@ pub struct Gatherer<'a> {
 }
 
 impl<'a> Gatherer<'a> {
-    fn new(query: &'a mut Query, embedder: &'a Embedder) -> Self {
+    fn new(stmt: &'a mut Statement, embedder: &'a Embedder) -> Self {
         let documents = Box::new(
-            query
-                .iter((), |row| {
+            stmt
+                .query_map((), |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .unwrap()
@@ -780,10 +780,6 @@ impl<'a> Iterator for Gatherer<'a> {
 
 pub struct DB {
     connection: Connection,
-}
-
-struct Query<'connection> {
-    stmt: Statement<'connection>,
 }
 
 impl DB {
@@ -843,9 +839,8 @@ impl DB {
         Ok(())
     }
 
-    fn query(self: &Self, sql: &str) -> SQLResult<Query<'_>> {
-        let stmt = self.connection.prepare(&sql)?;
-        Ok(Query { stmt })
+    fn query(self: &Self, sql: &str) -> Statement<'_> {
+        self.connection.prepare(&sql).unwrap()
     }
 
     fn begin_transaction(&self) -> SQLResult<()> {
@@ -904,33 +899,6 @@ impl DB {
     }
 }
 
-impl<'connection> Query<'connection> {
-    fn iter<'stmt, T1, T2, F>(
-        &'stmt mut self,
-        args: T1,
-        map_fn: F,
-    ) -> SQLResult<impl Iterator<Item = SQLResult<T2>> + 'stmt>
-    where
-        F: FnMut(&Row) -> SQLResult<T2> + 'stmt,
-        T1: rusqlite::Params,
-    {
-        self.stmt.query_map(args, map_fn)
-    }
-
-    fn point<'stmt, T1, T2, F>(&'stmt mut self, args: T1, map_fn: F) -> SQLResult<T2>
-    where
-        F: FnOnce(&Row) -> SQLResult<T2> + 'stmt,
-        T1: rusqlite::Params,
-    {
-        self.stmt.query_row(args, map_fn)
-    }
-
-    fn execute<'stmt, T1: rusqlite::Params>(&'stmt mut self, args: T1) -> SQLResult<()> {
-        self.stmt.execute(args).unwrap();
-        Ok(())
-    }
-}
-
 fn u8_to_vec_u32(bytes: &[u8]) -> Vec<u32> {
     let u32_size = size_of::<u32>();
 
@@ -960,8 +928,7 @@ pub fn embed_chunks(db: &DB, device: &Device) -> Result<()> {
         LEFT JOIN chunk ON document.hash = chunk.hash
         WHERE chunk.hash IS NULL
         ORDER BY document.hash",
-        )
-        .unwrap();
+        );
 
     let embedding_iter = Gatherer::new(&mut query, &embedder);
     for (hash, embeddings) in embedding_iter {
@@ -991,21 +958,21 @@ pub fn count_unindexed_chunks(db: &DB) -> Result<usize> {
         LEFT JOIN indexed_chunk ic ON ic.generation =
             (SELECT MAX(generation) FROM indexed_chunk) AND ic.hash = c.hash
         WHERE ic.hash IS NULL",
-    )?;
+    );
 
-    let count = unindexed_chunks_query.point((), |row| {
+    let count = unindexed_chunks_query.query_row((), |row| {
         Ok( row.get::<_, usize>(0)? )
     })?;
     Ok(count)
 }
 
 pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
-    let mut kmeans_query1 = db.query("SELECT chunk.embeddings FROM chunk")?;
+    let mut kmeans_query = db.query("SELECT chunk.embeddings FROM chunk");
     let mut total_embeddings = 0;
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
     println!("read embeddings...");
-    for embeddings in kmeans_query1.iter((), |row| Ok(row.get::<_, Vec<u8>>(0)?))? {
+    for embeddings in kmeans_query.query_map((), |row| Ok(row.get::<_, Vec<u8>>(0)?))? {
         let t = Tensor::from_q8_bytes(&embeddings?, EMBEDDING_DIM, &Device::Cpu)?;
         let (m, _) = t.dims2()?;
         let k = ((m as f32).sqrt().ceil()) as usize;
@@ -1107,9 +1074,9 @@ pub fn search(
     };
 
     let mut results = vec![];
-    let mut body_query = db.query("SELECT metadata,body FROM document WHERE rowid = ?1")?;
+    let mut body_query = db.query("SELECT metadata,body FROM document WHERE rowid = ?1");
     for idx in fused {
-        let (metadata, body) = body_query.point((idx,), |row| {
+        let (metadata, body) = body_query.query_row((idx,), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         results.push((metadata, body));
@@ -1183,7 +1150,7 @@ pub fn bulk_search(
     let file = File::create(outputname).unwrap();
     let mut writer = BufWriter::new(file);
 
-    let mut filename_query = db.query("SELECT metadata FROM document WHERE rowid = ?1")?;
+    let mut filename_query = db.query("SELECT metadata FROM document WHERE rowid = ?1");
 
     for result in rdr.deserialize() {
         let record: (String, String) = result?;
@@ -1218,7 +1185,7 @@ pub fn bulk_search(
 
         let mut filenames = vec![];
         for idx in fused {
-            let filename = filename_query.point((idx,), |row| Ok(row.get::<_, String>(0)?))?;
+            let filename = filename_query.query_row((idx,), |row| Ok(row.get::<_, String>(0)?))?;
             filenames.push(filename);
         }
 
