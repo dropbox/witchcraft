@@ -558,7 +558,7 @@ fn match_centroids(
     println!("sim mmul took {} ms.", now.elapsed().as_millis());
 
     let now = std::time::Instant::now();
-    all.sort();
+    all.sort_unstable();
     println!("sorting {} rows took {}ms", all.len(), now.elapsed().as_millis());
 
     let now = std::time::Instant::now();
