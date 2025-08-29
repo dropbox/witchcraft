@@ -13,7 +13,13 @@ use std::io::{BufWriter, Write};
 use std::mem::size_of;
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
+
+//mod t5;
+//use t5 as t5_encoder;
+
 mod quantized_t5;
+use quantized_t5 as t5_encoder;
+
 pub mod assets;
 mod histogram;
 
@@ -771,13 +777,12 @@ pub fn add_doc_from_string(db: &DB, metadata: &str, body: &str) -> Result<()> {
 
 pub struct Embedder {
     tokenizer: Tokenizer,
-    //model: t5::T5EncoderModel,
-    model: quantized_t5::T5EncoderModel,
+    model: t5_encoder::T5EncoderModel,
 }
 
 impl Embedder {
     pub fn new(device: &Device) -> Self {
-        let (builder, tokenizer) = quantized_t5::T5ModelBuilder::load().unwrap();
+        let (builder, tokenizer) = t5_encoder::T5ModelBuilder::load().unwrap();
         let model = builder.build_encoder(&device).unwrap();
         Self { tokenizer, model }
     }
