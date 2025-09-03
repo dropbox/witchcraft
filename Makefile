@@ -4,24 +4,34 @@ env/bin/activate:
 env/bin/transformers-cli: env/bin/activate
 	(source env/bin/activate; pip install -r requirements.txt)
 
+assets:
+	mkdir -p assets
+
 assets/config.json.zst assets/tokenizer.json.zst xtr.safetensors assets/xtr.safetensors.zst: env/bin/transformers-cli
 	(source env/bin/activate; python downloadweights.py)
 
-xtr.gguf: xtr.safetensors
-	cargo run --release --bin quantize-tool xtr.safetensors xtr.gguf
-
-assets/xtr.gguf.zst: xtr.gguf
-	zstd -19 -f xtr.gguf -o assets/xtr.gguf.zst
+assets/xtr.gguf.zst: xtr.safetensors
+	cargo run --release --bin quantize-tool xtr.safetensors assets/xtr.gguf.zst
 
 download: assets/config.json.zst assets/tokenizer.json.zst assets/xtr.safetensors.zst assets/xtr.gguf.zst
 
 build: download
-	cargo build --release --features accelerate
-	ln -vf target/release/libwarp.dylib target/release/warp.node
+	cargo build --release --target aarch64-apple-darwin --features accelerate
+	ln -vf target/aarch64-apple-darwin/release/libwarp.dylib target/release/warp.node
 
 buildemb: download
-	cargo build --release --features accelerate,embed-assets
-	ln -vf target/release/libwarp.dylib target/release/warp.node
+	cargo build --release --target aarch64-apple-darwin --features accelerate,embed-assets
+	cargo build --release --target x86_64-apple-darwin --features accelerate,embed-assets
+	ln -vf target/aarch64-apple-darwin/release/libwarp.dylib target/release/warp.node
+
+module:
+	cargo build --release --target aarch64-apple-darwin --features accelerate
+	cargo build --release --target x86_64-apple-darwin --features accelerate
+	lipo -create target/aarch64-apple-darwin/release/libwarp.dylib target/x86_64-apple-darwin/release/libwarp.dylib -output target/release/warp-macos-universal.node
+
+winmodule:
+	cargo xwin build --release --target x86_64-pc-windows-msvc
+	ln -vf target/x86_64-pc-windows-msvc/release/warp.dll target/release/warp-windows.node
 
 win: download
 	cargo xwin build --release --target x86_64-pc-windows-msvc --features embed-assets
