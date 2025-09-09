@@ -791,19 +791,26 @@ fn u8_to_vec_u32(bytes: &[u8]) -> Vec<u32> {
     u32s
 }
 
-pub fn embed_chunks(db: &DB, device: &Device) -> Result<()> {
+pub fn embed_chunks(db: &DB, device: &Device, limit: Option<usize>) -> Result<usize> {
     let embedder = Embedder::new(&device);
 
-    let mut query = db.query(
+    let sql = format!(
         "SELECT
         document.hash,document.body
         FROM document
         LEFT JOIN chunk ON document.hash = chunk.hash
         WHERE chunk.hash IS NULL
-        ORDER BY document.hash",
+        ORDER BY document.hash
+        {}",
+        match limit {
+            Some(limit) => format!("LIMIT {limit}"),
+            _ => String::new(),
+        }
     );
+    let mut query = db.query(&sql);
 
     let embedding_iter = Gatherer::new(&mut query, &embedder);
+    let mut count = 0;
     for (hash, embeddings) in embedding_iter {
         println!(
             "got embedding for chunk with hash {} {:?}",
@@ -817,9 +824,10 @@ pub fn embed_chunks(db: &DB, device: &Device) -> Result<()> {
 
         //let now = std::time::Instant::now();
         db.add_chunk(&hash, "xtr-base-en", &bytes).unwrap();
+        count += 1;
         //println!("database insert took {} ms.", now.elapsed().as_millis());
     }
-    Ok(())
+    Ok(count)
 }
 
 pub fn count_unindexed_chunks(db: &DB) -> Result<usize> {
@@ -929,9 +937,7 @@ pub fn search(
     };
 
     let qe = match cache.get(&q) {
-        Some(existing) => {
-            existing
-        }
+        Some(existing) => existing,
         None => {
             let qe = embedder.embed(&q)?.get(0)?;
             cache.put(&q, &qe);

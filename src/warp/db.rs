@@ -4,14 +4,20 @@ use sha2::{Digest, Sha256};
 const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
 
 pub struct DB {
+    db_fn: String,
     connection: Connection,
+    remove_on_shutdown: bool,
 }
 
 impl DB {
     pub fn new_reader(db_fn: &str) -> Self {
         let connection =
             Connection::open_with_flags(db_fn, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        Self { connection }
+        Self {
+            db_fn: db_fn.to_string(),
+            connection: connection,
+            remove_on_shutdown: false,
+        }
     }
 
     pub fn new(db_fn: &str) -> Self {
@@ -65,8 +71,27 @@ impl DB {
         let query =
             "CREATE UNIQUE INDEX IF NOT EXISTS indexed_chunk_index ON indexed_chunk(chunkid, generation)";
         connection.execute(query, ()).unwrap();
+        Self {
+            db_fn: db_fn.to_string(),
+            connection: connection,
+            remove_on_shutdown: false,
+        }
+    }
 
-        Self { connection }
+    pub fn clear(&mut self) {
+        self.execute("DELETE FROM document").unwrap();
+        self.execute("DELETE FROM chunk").unwrap();
+        self.execute("DELETE FROM bucket").unwrap();
+        self.execute("DELETE FROM indexed_chunk").unwrap();
+        self.execute("VACUUM").unwrap();
+        self.remove_on_shutdown = true;
+    }
+
+    pub fn shutdown(&mut self) {
+        if self.remove_on_shutdown {
+            let _ = std::fs::remove_file(&self.db_fn);
+            self.remove_on_shutdown = false;
+        }
     }
 
     pub fn execute(self: &Self, sql: &str) -> SQLResult<()> {
@@ -88,7 +113,7 @@ impl DB {
         Ok(())
     }
 
-    pub fn add_doc(self: &Self, metadata: &str, body: &str) -> SQLResult<()> {
+    pub fn add_doc(self: &mut Self, metadata: &str, body: &str) -> SQLResult<()> {
         let mut hasher = Sha256::new();
         hasher.update(&body);
         let hash = format!("{:x}", hasher.finalize());
@@ -97,6 +122,7 @@ impl DB {
             "INSERT OR IGNORE INTO document VALUES(?1, ?2, ?3)",
             (&metadata, &hash, &body),
         )?;
+        self.remove_on_shutdown = false;
         Ok(())
     }
 

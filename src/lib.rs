@@ -5,6 +5,7 @@ use napi::{Env, ScopedTask};
 use napi_derive::napi;
 
 use std::{
+    sync::atomic::{AtomicBool, Ordering},
     sync::{mpsc, Arc, Mutex, OnceLock},
     thread::{self, JoinHandle},
 };
@@ -14,19 +15,43 @@ type Job = (String, String, String);
 #[derive(Debug)]
 pub struct Indexer {
     tx: mpsc::Sender<Job>,
-    _handle: JoinHandle<()>,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 static INDEXER: OnceLock<Indexer> = OnceLock::new();
+static CLEAR: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+fn accepting_commands() -> bool {
+    SHUTDOWN.load(Ordering::Relaxed) == false
+}
+
+fn drain_commands() -> bool {
+    CLEAR.load(Ordering::Relaxed) || SHUTDOWN.load(Ordering::Relaxed)
+}
 
 impl Indexer {
     pub fn new(db_name: String) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
-        let db = warp::DB::new(&db_name);
+        let mut db = warp::DB::new(&db_name);
+
         let handle = thread::spawn(move || {
             let device = warp::make_device();
             while let Ok(job) = rx.recv() {
                 let (command, arg1, arg2) = job;
+
+                if command == "clear" {
+                    db.clear();
+                    CLEAR.store(false, Ordering::Release);
+                } else if command == "shutdown" {
+                    db.shutdown();
+                    return;
+                }
+
+                if drain_commands() {
+                    continue;
+                }
+
                 if command == "add" {
                     db.add_doc(&arg1, &arg2).unwrap();
                 } else if command == "index" {
@@ -35,13 +60,18 @@ impl Indexer {
                         warp::index_chunks(&db, &device).unwrap();
                     }
                 } else if command == "embed" {
-                    warp::embed_chunks(&db, &device).unwrap();
+                    loop {
+                        let got = warp::embed_chunks(&db, &device, Some(10)).unwrap();
+                        if got == 0 || drain_commands() {
+                            break;
+                        }
+                    }
                 }
             }
         });
         Indexer {
             tx,
-            _handle: handle,
+            handle: Mutex::new(Some(handle)),
         }
     }
     pub fn init_global(db_name: String) -> &'static Self {
@@ -52,6 +82,49 @@ impl Indexer {
         INDEXER
             .get()
             .expect("Indexer not initialized. Call `Indexer::init_global()` first.")
+    }
+
+    pub fn add(&self, metadata: String, body: String) {
+        if accepting_commands() {
+            let _ = self.tx.send(("add".to_string(), metadata, body));
+        }
+    }
+
+    pub fn embed(&self) {
+        if accepting_commands() {
+            let _ = self
+                .tx
+                .send(("embed".to_string(), String::new(), String::new()));
+        }
+    }
+
+    pub fn index(&self) {
+        if accepting_commands() {
+            let _ = self
+                .tx
+                .send(("index".to_string(), String::new(), String::new()));
+        }
+    }
+
+    pub fn clear(&self) {
+        if accepting_commands() {
+            CLEAR.store(true, Ordering::Release);
+            let _ = self
+                .tx
+                .send(("clear".to_string(), String::new(), String::new()));
+        }
+    }
+
+    pub fn shutdown(&self) {
+        if accepting_commands() {
+            SHUTDOWN.store(true, Ordering::Release);
+            let _ = self
+                .tx
+                .send(("shutdown".to_string(), String::new(), String::new()));
+            if let Some(h) = self.handle.lock().unwrap().take() {
+                h.join().unwrap();
+            }
+        }
     }
 }
 
@@ -231,25 +304,26 @@ impl Warp {
 
     #[napi]
     pub fn add(&self, metadata: String, body: String) {
-        Indexer::global()
-            .tx
-            .send(("add".to_string(), metadata, body))
-            .unwrap();
+        Indexer::global().add(metadata, body);
     }
 
     #[napi]
     pub fn embed(&self) {
-        Indexer::global()
-            .tx
-            .send(("embed".to_string(), "".to_string(), "".to_string()))
-            .unwrap();
+        Indexer::global().embed();
     }
 
     #[napi]
     pub fn index(&self) {
-        Indexer::global()
-            .tx
-            .send(("index".to_string(), "".to_string(), "".to_string()))
-            .unwrap();
+        Indexer::global().index();
+    }
+
+    #[napi]
+    pub fn clear(&self) {
+        Indexer::global().clear();
+    }
+
+    #[napi]
+    pub fn shutdown(&self) {
+        Indexer::global().shutdown();
     }
 }

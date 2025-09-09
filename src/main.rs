@@ -21,7 +21,7 @@ struct CorpusMetaData {
     key: String,
 }
 
-pub fn read_csv(db: &DB, csvname: std::path::PathBuf) -> Result<()> {
+pub fn read_csv(db: &mut DB, csvname: std::path::PathBuf) -> Result<()> {
     println!("register documents from CSV...");
 
     let file = File::open(csvname)?;
@@ -123,16 +123,16 @@ pub fn bulk_search(
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let db = DB::new("mydb.sqlite");
+    let mut db = DB::new("mydb.sqlite");
     let device = warp::make_device();
     let embedder = warp::Embedder::new(&device);
     let mut cache = warp::EmbeddingsCache::new(1);
 
     if args.len() == 3 && args[1] == "readcsv" {
         let csvname = &args[2];
-        read_csv(&db, csvname.into()).unwrap();
+        read_csv(&mut db, csvname.into()).unwrap();
     } else if args.len() == 2 && &args[1] == "embed" {
-        warp::embed_chunks(&db, &device).unwrap();
+        let _got = warp::embed_chunks(&db, &device, None).unwrap();
     } else if args.len() == 2 && &args[1] == "index" {
         warp::index_chunks(&db, &device).unwrap();
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
