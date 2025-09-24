@@ -23,7 +23,20 @@ impl DB {
     }
 
     pub fn new(db_fn: &str) -> Self {
-        let connection = Connection::open(db_fn).unwrap();
+        let mut connection = Connection::open(db_fn).unwrap();
+
+        let status: SQLResult<String> =
+            connection.query_row("PRAGMA quick_check;", [], |row| row.get(0));
+        let db_ok = match status {
+            Ok(text) => text.trim().eq_ignore_ascii_case("ok"),
+            Err(_e) => false,
+        };
+        if db_ok == false {
+            println!("warp database corrupted, recreating it!");
+            drop(connection);
+            let _ = std::fs::remove_file(&db_fn);
+            connection = Connection::open(db_fn).unwrap();
+        }
 
         //connection
         //.pragma_update(None, "journal_mode", &"WAL")
