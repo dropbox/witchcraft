@@ -29,7 +29,6 @@ enum Job {
     Shutdown,
 }
 
-#[derive(Debug)]
 pub struct Indexer {
     tx: mpsc::Sender<Job>,
     handle: Mutex<Option<JoinHandle<()>>>,
@@ -50,20 +49,38 @@ fn drain_commands() -> bool {
 impl Indexer {
     pub fn new(db_name: String, assets: String) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
-        let mut db = warp::DB::new(&db_name);
+        let mut db = match warp::DB::new(&db_name) {
+            Ok(db) => Some(db),
+            Err(v) => {
+                println!("database `{}' could not be opened {}", db_name, v);
+                None
+            }
+        };
+        let device = warp::make_device();
+        let embedder = match warp::Embedder::new(&device, &std::path::PathBuf::from(&assets)) {
+            Ok(embedder) => Some(embedder),
+            Err(v) => {
+                println!(
+                    "embedder with assets in `{}` could not be created {}",
+                    assets, v
+                );
+                None
+            }
+        };
 
         let handle = thread::spawn(move || {
-            let device = warp::make_device();
-            let assets = std::path::PathBuf::from(assets);
-            let embedder = warp::Embedder::new(&device, &assets);
             while let Ok(job) = rx.recv() {
                 match job {
                     Job::Clear => {
-                        db.clear();
+                        if let Some(db) = db.as_mut() {
+                            db.clear();
+                        }
                         CLEAR.store(false, Ordering::Release);
                     }
                     Job::Shutdown => {
-                        db.shutdown();
+                        if let Some(db) = db.as_mut() {
+                            db.shutdown();
+                        }
                         return;
                     }
                     _ => {}
@@ -73,31 +90,55 @@ impl Indexer {
                     continue;
                 }
 
-                match job {
-                    Job::Add {
-                        uuid,
-                        date,
-                        metadata,
-                        body,
-                    } => {
-                        db.add_doc(&uuid, date, &metadata, &body).unwrap();
-                    }
-                    Job::Remove { uuid } => {
-                        db.remove_doc(&uuid).unwrap();
-                    }
-                    Job::Index => {
-                        let count = warp::count_unindexed_chunks(&db).unwrap();
-                        if count >= 2048 {
-                            warp::index_chunks(&db, &device).unwrap();
+                if let Some(db) = db.as_mut() {
+                    match job {
+                        Job::Add {
+                            uuid,
+                            date,
+                            metadata,
+                            body,
+                        } => match db.add_doc(&uuid, date, &metadata, &body) {
+                            Ok(()) => {}
+                            Err(v) => {
+                                println!("add_doc failed! {}", v);
+                            }
+                        },
+                        Job::Remove { uuid } => match db.remove_doc(&uuid) {
+                            Ok(()) => {}
+                            Err(v) => {
+                                println!("remove_doc failed! {}", v);
+                            }
+                        },
+                        Job::Index => {
+                            if warp::count_unindexed_chunks(&db).unwrap_or(0) > 2048 {
+                                match warp::index_chunks(&db, &device) {
+                                    Ok(()) => {}
+                                    Err(v) => {
+                                        println!("index_chunks failed! {}", v);
+                                    }
+                                }
+                            }
                         }
+                        Job::Embed => loop {
+                            match &embedder {
+                                Some(embedder) => {
+                                    let got = match warp::embed_chunks(&db, &embedder, Some(10)) {
+                                        Ok(got) => got,
+                                        Err(_v) => {
+                                            break;
+                                        }
+                                    };
+                                    if got == 0 || drain_commands() {
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    break;
+                                }
+                            };
+                        },
+                        _ => {}
                     }
-                    Job::Embed => loop {
-                        let got = warp::embed_chunks(&db, &embedder, Some(10)).unwrap();
-                        if got == 0 || drain_commands() {
-                            break;
-                        }
-                    },
-                    _ => {}
                 }
             }
         });
@@ -166,24 +207,24 @@ impl Indexer {
 mod warp;
 
 struct WarpInner {
-    embedder: warp::Embedder,
-    db: warp::DB,
+    db: Option<warp::DB>,
     cache: warp::EmbeddingsCache,
+    embedder: Option<warp::Embedder>,
 }
 
 impl WarpInner {
     pub fn new(db_name: String, assets: String) -> Self {
         let _indexer = Indexer::init_global(db_name.clone(), assets.clone());
-        let db = warp::DB::new_reader(&db_name.clone());
+        let db = warp::DB::new_reader(&db_name.clone()).ok();
+        let cache = warp::EmbeddingsCache::new(16);
         let device = warp::make_device();
         let assets = std::path::PathBuf::from(assets);
-        let embedder = warp::Embedder::new(&device, &assets);
-        let cache = warp::EmbeddingsCache::new(16);
+        let embedder = warp::Embedder::new(&device, &assets).ok();
 
         Self {
-            embedder: embedder,
             db: db,
             cache: cache,
+            embedder: embedder,
         }
     }
 
@@ -199,36 +240,48 @@ impl WarpInner {
         } else {
             None
         };
-        match warp::search(
-            &self.db,
-            &self.embedder,
-            &mut self.cache,
-            &q,
-            threshold,
-            top_k,
-            true,
-            filter,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                println!("error {} querying", e);
-                [].to_vec()
-            }
-        }
+
+        self.embedder
+            .as_ref()
+            .and_then(|embedder| self.db.as_ref().map(|db| (embedder, db)))
+            .map_or_else(
+                || {
+                    println!("no embedder or db");
+                    Vec::new()
+                },
+                |(embedder, db)| {
+                    warp::search(
+                        db,
+                        embedder,
+                        &mut self.cache,
+                        &q,
+                        threshold,
+                        top_k,
+                        true,
+                        filter,
+                    )
+                    .unwrap_or_else(|e| {
+                        println!("error {e} querying");
+                        Vec::new()
+                    })
+                },
+            )
     }
 
     pub fn score(&mut self, q: &String, sentences: &Vec<String>) -> Vec<f32> {
-        if sentences.len() != 0 {
-            match warp::score_query_sentences(&self.embedder, &mut self.cache, &q, &sentences) {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("error {} scoring", e);
-                    [].to_vec()
-                }
-            }
-        } else {
-            [].to_vec()
-        }
+        self.embedder
+            .as_ref()
+            .filter(|_| !sentences.is_empty())
+            .map_or_else(
+                || Vec::new(),
+                |embedder| {
+                    warp::score_query_sentences(embedder, &mut self.cache, q, sentences)
+                        .unwrap_or_else(|e| {
+                            println!("error {e} scoring");
+                            Vec::new()
+                        })
+                },
+            )
     }
 }
 

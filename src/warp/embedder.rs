@@ -12,10 +12,10 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    pub fn new(device: &Device, assets: &std::path::PathBuf) -> Self {
-        let (builder, tokenizer) = t5_encoder::T5ModelBuilder::load(assets).unwrap();
-        let model = builder.build_encoder(&device, assets).unwrap();
-        Self { tokenizer, model }
+    pub fn new(device: &Device, assets: &std::path::PathBuf) -> Result<Self> {
+        let (builder, tokenizer) = t5_encoder::T5ModelBuilder::load(assets)?;
+        let model = builder.build_encoder(&device, assets)?;
+        Ok(Self { tokenizer, model })
     }
     pub fn embed(self: &Self, text: &str) -> Result<Tensor> {
         //let now = std::time::Instant::now();

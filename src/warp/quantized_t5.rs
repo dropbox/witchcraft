@@ -15,6 +15,7 @@
 //! - 🤗 [Model Card](https://huggingface.co/t5-base)
 //! - 🤗 Original model from [T5](https://github.com/huggingface/transformers/blob/main/src/transformers/models/t5/modeling_t5.py)
 
+use crate::embed_zst_asset;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::Activation;
 use candle_transformers::models::t5::{
@@ -24,6 +25,7 @@ use candle_transformers::models::with_tracing::QMatMul;
 use candle_transformers::quantized_nn::Embedding;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
@@ -598,21 +600,40 @@ impl T5EncoderModel {
     }
 }
 
-use crate::embed_zst_asset;
-embed_zst_asset!(pub CONFIG, "config.json.zst");
+embed_zst_asset!(pub CONFIG,    "config.json.zst");
 embed_zst_asset!(pub TOKENIZER, "tokenizer.json.zst");
-embed_zst_asset!(pub MODEL, "xtr.gguf.zst");
+embed_zst_asset!(pub MODEL,     "xtr.gguf.zst");
 
 pub struct T5ModelBuilder {
     config: Config,
 }
 
 impl T5ModelBuilder {
-    pub fn load(assets: &std::path::PathBuf) -> Result<(Self, Tokenizer)> {
-        let config: Config = serde_json::from_str(CONFIG.as_str(assets)).unwrap();
-        let tokenizer = Tokenizer::from_bytes(TOKENIZER.bytes(assets))
-            .map_err(anyhow::Error::msg)
-            .unwrap();
+    pub fn load(assets: &std::path::PathBuf) -> candle_core::Result<(Self, Tokenizer)> {
+        // CONFIG: bytes -> JSON
+        let cfg_bytes = CONFIG.bytes(assets).map_err(|_| {
+            Error::new(
+                ErrorKind::Other,
+                "failed to get decompressed bytes for CONFIG",
+            )
+        })?;
+        let config: Config = serde_json::from_slice(cfg_bytes).map_err(|e| {
+            Error::new(
+                ErrorKind::Other,
+                format!("failed to parse CONFIG as JSON: {e}"),
+            )
+        })?;
+
+        // TOKENIZER: bytes -> Tokenizer
+        let tok_bytes = TOKENIZER.bytes(assets).map_err(|_| {
+            Error::new(
+                ErrorKind::Other,
+                "failed to get decompressed bytes for TOKENIZER",
+            )
+        })?;
+        let tokenizer = Tokenizer::from_bytes(tok_bytes)
+            .map_err(|e| Error::new(ErrorKind::Other, format!("failed to parse TOKENIZER: {e}")))?;
+
         Ok((Self { config }, tokenizer))
     }
 
@@ -620,11 +641,23 @@ impl T5ModelBuilder {
         &self,
         device: &Device,
         assets: &std::path::PathBuf,
-    ) -> Result<T5EncoderModel> {
+    ) -> candle_core::Result<T5EncoderModel> {
+        // MODEL: bytes -> gguf VarBuilder
+        let model_bytes = MODEL.bytes(assets).map_err(|_| {
+            Error::new(
+                ErrorKind::Other,
+                "failed to get decompressed bytes for MODEL",
+            )
+        })?;
+
         let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
-            MODEL.bytes(assets),
-            &device,
+            model_bytes,
+            device,
         )?;
-        Ok(T5EncoderModel::load(vb, &self.config)?)
+
+        let enc = T5EncoderModel::load(vb, &self.config)
+            .map_err(|e| Error::new(ErrorKind::Other, format!("failed to load T5 encoder: {e}")))?;
+
+        Ok(enc)
     }
 }

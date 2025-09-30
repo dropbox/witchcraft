@@ -12,18 +12,17 @@ pub struct DB {
 }
 
 impl DB {
-    pub fn new_reader(db_fn: &str) -> Self {
-        let connection =
-            Connection::open_with_flags(db_fn, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        Self {
+    pub fn new_reader(db_fn: &str) -> SQLResult<Self> {
+        let connection = Connection::open_with_flags(db_fn, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self {
             db_fn: db_fn.to_string(),
             connection: connection,
             remove_on_shutdown: false,
-        }
+        })
     }
 
-    pub fn new(db_fn: &str) -> Self {
-        let mut connection = Connection::open(db_fn).unwrap();
+    pub fn new(db_fn: &str) -> SQLResult<Self> {
+        let mut connection = Connection::open(db_fn)?;
 
         let status: SQLResult<String> =
             connection.query_row("PRAGMA quick_check;", [], |row| row.get(0));
@@ -35,15 +34,13 @@ impl DB {
             println!("warp database corrupted, recreating it!");
             drop(connection);
             let _ = std::fs::remove_file(&db_fn);
-            connection = Connection::open(db_fn).unwrap();
+            connection = Connection::open(db_fn)?;
         }
 
         //connection
         //.pragma_update(None, "journal_mode", &"WAL")
-        //.unwrap();
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        //?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
 
         let query = format!(
             "CREATE TABLE IF NOT EXISTS document(uuid TEXT NOT NULL PRIMARY KEY,
@@ -52,19 +49,19 @@ impl DB {
             CHECK (length(hash) = {HASH_CHARS}),
             body TEXT)"
         );
-        connection.execute(&query, ()).unwrap();
+        connection.execute(&query, ())?;
 
         let query = "CREATE INDEX IF NOT EXISTS document_uuid_index ON document(uuid)";
-        connection.execute(query, ()).unwrap();
+        connection.execute(query, ())?;
 
         let query = "CREATE INDEX IF NOT EXISTS document_index ON document(hash)";
-        connection.execute(query, ()).unwrap();
+        connection.execute(query, ())?;
 
         let query = "CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(body, content='document', content_rowid='rowid')";
-        connection.execute(query, ()).unwrap();
+        connection.execute(query, ())?;
 
         let query = "INSERT INTO document_fts(document_fts) VALUES('rebuild')";
-        connection.execute(query, ()).unwrap();
+        connection.execute(query, ())?;
 
         let query = format!(
             "CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY
@@ -72,10 +69,10 @@ impl DB {
             model TEXT,
             embeddings BLOB NOT NULL)"
         );
-        connection.execute(&query, ()).unwrap();
+        connection.execute(&query, ())?;
 
         let query = "CREATE INDEX IF NOT EXISTS chunk_index ON chunk(hash)";
-        connection.execute(query, ()).unwrap();
+        connection.execute(query, ())?;
 
         let query = "CREATE TRIGGER IF NOT EXISTS document_after_delete
             AFTER DELETE ON document
@@ -84,42 +81,53 @@ impl DB {
               WHERE hash = OLD.hash
                 AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
             END";
-        connection.execute(query, ()).unwrap();
+        connection.execute(query, ())?;
 
         let query = "CREATE TABLE IF NOT EXISTS bucket(id INTEGER PRIMARY KEY,
             generation INTEGER NOT NULL,
             center BLOB NOT NULL, indices BLOB NOT NULL, residuals BLOB NOT NULL)";
-        connection.execute(query, ()).unwrap();
+        connection.execute(query, ())?;
 
         let query = "CREATE INDEX IF NOT EXISTS bucket_index ON bucket(generation, id)";
-        connection.execute(query, ()).unwrap();
+        connection.execute(query, ())?;
 
         let query = "CREATE TABLE IF NOT EXISTS indexed_chunk(chunkid INTEGER PRIMARY KEY NOT NULL, generation INTEGER NOT NULL)";
-        connection.execute(query, ()).unwrap();
+        connection.execute(query, ())?;
 
         let query =
             "CREATE UNIQUE INDEX IF NOT EXISTS indexed_chunk_index ON indexed_chunk(chunkid, generation)";
-        connection.execute(query, ()).unwrap();
-        Self {
+        connection.execute(query, ())?;
+        Ok(Self {
             db_fn: db_fn.to_string(),
             connection: connection,
             remove_on_shutdown: false,
-        }
+        })
+    }
+
+    fn clear_inner(&mut self) -> SQLResult<()> {
+        self.execute("DELETE FROM document")?;
+        self.execute("DELETE FROM chunk")?;
+        self.execute("DELETE FROM bucket")?;
+        self.execute("DELETE FROM indexed_chunk")?;
+        self.execute("VACUUM")?;
+        Ok(())
     }
 
     pub fn clear(&mut self) {
-        self.execute("DELETE FROM document").unwrap();
-        self.execute("DELETE FROM chunk").unwrap();
-        self.execute("DELETE FROM bucket").unwrap();
-        self.execute("DELETE FROM indexed_chunk").unwrap();
-        self.execute("VACUUM").unwrap();
         self.remove_on_shutdown = true;
+        let _ = self.clear_inner();
     }
 
     pub fn shutdown(&mut self) {
         if self.remove_on_shutdown {
-            let _ = std::fs::remove_file(&self.db_fn);
-            self.remove_on_shutdown = false;
+            match std::fs::remove_file(&self.db_fn) {
+                Ok(()) => {
+                    self.remove_on_shutdown = false;
+                }
+                Err(v) => {
+                    println!("unable to remove database file {} : {}", self.db_fn, v);
+                }
+            };
         }
     }
 
@@ -128,16 +136,23 @@ impl DB {
         Ok(())
     }
 
-    pub fn query(self: &Self, sql: &str) -> Statement<'_> {
-        self.connection.prepare(&sql).unwrap()
+    pub fn query(self: &Self, sql: &str) -> SQLResult<Statement<'_>> {
+        self.connection.prepare(&sql)
     }
 
-    pub fn begin_transaction(&self) {
-        self.connection.execute("BEGIN", ()).unwrap();
+    pub fn begin_transaction(&self) -> SQLResult<()> {
+        self.connection.execute("BEGIN", ())?;
+        Ok(())
     }
 
-    pub fn commit_transaction(&self) {
-        self.connection.execute("COMMIT", ()).unwrap();
+    pub fn commit_transaction(&self) -> SQLResult<()> {
+        self.connection.execute("COMMIT", ())?;
+        Ok(())
+    }
+
+    pub fn rollback_transaction(&self) -> SQLResult<()> {
+        self.connection.execute("ROLLBACK", ())?;
+        Ok(())
     }
 
     pub fn add_doc(
@@ -167,13 +182,12 @@ impl DB {
         Ok(())
     }
 
-    pub fn add_chunk(self: &Self, hash: &str, model: &str, embeddings: &Vec<u8>) {
-        self.connection
-            .execute(
-                "INSERT OR REPLACE INTO chunk VALUES(?1, ?2, ?3)",
-                (&hash, &model, embeddings),
-            )
-            .unwrap();
+    pub fn add_chunk(self: &Self, hash: &str, model: &str, embeddings: &Vec<u8>) -> SQLResult<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO chunk VALUES(?1, ?2, ?3)",
+            (&hash, &model, embeddings),
+        )?;
+        Ok(())
     }
 
     pub fn add_bucket(
@@ -183,21 +197,19 @@ impl DB {
         center: &Vec<u8>,
         indices: &Vec<u8>,
         residuals: &Vec<u8>,
-    ) {
-        self.connection
-            .execute(
-                "INSERT OR REPLACE INTO bucket VALUES(?1, ?2, ?3, ?4, ?5)",
-                (id, generation, center, indices, residuals),
-            )
-            .unwrap();
+    ) -> SQLResult<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO bucket VALUES(?1, ?2, ?3, ?4, ?5)",
+            (id, generation, center, indices, residuals),
+        )?;
+        Ok(())
     }
 
-    pub fn add_indexed_chunk(self: &Self, chunkid: u32, generation: u32) {
-        self.connection
-            .execute(
-                "INSERT OR REPLACE INTO indexed_chunk VALUES(?1, ?2)",
-                (chunkid, generation),
-            )
-            .unwrap();
+    pub fn add_indexed_chunk(self: &Self, chunkid: u32, generation: u32) -> SQLResult<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO indexed_chunk VALUES(?1, ?2)",
+            (chunkid, generation),
+        )?;
+        Ok(())
     }
 }

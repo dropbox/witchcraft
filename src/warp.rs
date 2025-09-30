@@ -30,7 +30,13 @@ const EMBEDDING_DIM: usize = 128;
 
 pub fn make_device() -> Device {
     if cfg!(target_os = "macos") {
-        Device::new_metal(0).unwrap()
+        match Device::new_metal(0) {
+            Ok(device) => device,
+            Err(v) => {
+                println!("unable to create metal device: {v}");
+                Device::Cpu
+            }
+        }
     } else {
         Device::Cpu
     }
@@ -71,7 +77,7 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(
     let (m, n) = data.dims2()?;
     println!("kmeans k={} m={} n={}...", k, m, n);
 
-    let total: u64 = (max_iter * k).try_into().unwrap();
+    let total: u64 = (max_iter * k).try_into()?;
     let bar = progress::new(total);
 
     let mut rng = rand::rng();
@@ -126,9 +132,8 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     let mut writes_total = 0;
 
     let embeddings_count = db
-        .query("SELECT sum(length(embeddings)/?1) FROM chunk")
-        .query_row((EMBEDDING_DIM,), |row| Ok(row.get::<_, u32>(0)?))
-        .unwrap();
+        .query("SELECT sum(length(embeddings)/?1) FROM chunk")?
+        .query_row((EMBEDDING_DIM,), |row| Ok(row.get::<_, u32>(0)?))?;
     assert!(embeddings_count > 0);
     let bar = progress::new(embeddings_count as u64);
 
@@ -140,7 +145,7 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     let mut query = db.query(
         "SELECT document.rowid,chunk.rowid,chunk.embeddings FROM document,chunk
         WHERE document.hash = chunk.hash",
-    );
+    )?;
 
     let mut results = query.query_map((), |row| {
         Ok((
@@ -185,14 +190,14 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
 
             let embeddings = all_embeddings.split_off(left);
             let indices = document_indices.split_off(left);
-            let data = Tensor::cat(&embeddings, 0)?.to_device(&device).unwrap();
+            let data = Tensor::cat(&embeddings, 0)?.to_device(&device)?;
 
             let sim = data.matmul(&centers.transpose(D::Minus1, D::Minus2)?)?;
             let cluster_assignments = sim.argmax(D::Minus1)?.to_device(&Device::Cpu)?;
             mmuls_total += now.elapsed().as_millis();
 
             let now = std::time::Instant::now();
-            let mut writer = merger::Writer::new().unwrap();
+            let mut writer = merger::Writer::new()?;
 
             let mut pairs: Vec<(usize, u32)> = cluster_assignments
                 .to_vec1::<u32>()?
@@ -251,41 +256,51 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     println!("writes took {} ms.", writes_total);
     println!("merge all");
 
-    db.begin_transaction();
+    let txstatus = match db.begin_transaction() {
+        Ok(()) => {
+            let max_generation = db
+                .query("SELECT max(generation) FROM indexed_chunk")?
+                .query_row((), |row| Ok(row.get::<_, u32>(0)?))
+                .unwrap_or(0);
+            let next_generation = max_generation + 1;
 
-    let max_generation = db
-        .query("SELECT max(generation) FROM indexed_chunk")
-        .query_row((), |row| Ok(row.get::<_, u32>(0)?))
-        .unwrap_or(0);
-    let next_generation = max_generation + 1;
+            let mut merger = merger::Merger::from_tempfiles(tmpfiles)?;
+            for result in &mut merger {
+                let entry = result?;
+                let center = centers_cpu.get(entry.value as usize)?;
+                let center_bytes = center.to_f32_bytes()?;
+                db.add_bucket(
+                    entry.value,
+                    next_generation,
+                    &center_bytes,
+                    &entry.tags,
+                    &entry.data,
+                )?;
+            }
+            println!("write {} chunk ids to indexed_chunk", all_chunkids.len());
+            for chunkid in all_chunkids {
+                let _ = db.add_indexed_chunk(chunkid, next_generation)?;
+            }
 
-    let mut merger = merger::Merger::from_tempfiles(tmpfiles)?;
-    for result in &mut merger {
-        let entry = result?;
-        let center = centers_cpu.get(entry.value as usize)?;
-        let center_bytes = center.to_f32_bytes()?;
-        db.add_bucket(
-            entry.value,
-            next_generation,
-            &center_bytes,
-            &entry.tags,
-            &entry.data,
-        );
+            db.query("DELETE FROM bucket WHERE generation <= ?1")?
+                .execute((max_generation,))?;
+            db.query("DELETE FROM indexed_chunk WHERE generation <= ?1")?
+                .execute((max_generation,))?;
+            Ok(())
+        }
+        Err(v) => {
+            println!("unable to begin transaction, index not created/updated! {v}");
+            Err(v)
+        }
+    };
+    match txstatus {
+        Ok(()) => Ok(db.commit_transaction()?),
+        Err(v) => {
+            println!("failure during indexing transaction {v}");
+            let _ = db.rollback_transaction();
+            Err(v.into())
+        }
     }
-    println!("write {} chunk ids to indexed_chunk", all_chunkids.len());
-    for chunkid in all_chunkids {
-        db.add_indexed_chunk(chunkid, next_generation);
-    }
-
-    db.query("DELETE FROM bucket WHERE generation <= ?1")
-        .execute((max_generation,))
-        .unwrap();
-    db.query("DELETE FROM indexed_chunk WHERE generation <= ?1")
-        .execute((max_generation,))
-        .unwrap();
-    db.commit_transaction();
-
-    Ok(())
 }
 
 pub fn fulltext_search(
@@ -335,7 +350,7 @@ pub fn fulltext_search(
         format!("{q}*").to_string()
     };
 
-    let mut query = db.query(&sql);
+    let mut query = db.query(&sql)?;
     let results = query.query_map((&q, top_k), |row| Ok((row.get::<_, u32>(0)?,)))?;
     for result in results {
         let (rowid,) = result?;
@@ -394,7 +409,8 @@ fn get_centers(
         }
     }
 
-    let mut center_query = db.query("SELECT id,length(indices)/4,center FROM bucket ORDER BY id");
+    let mut center_query =
+        db.query("SELECT id,length(indices)/4,center FROM bucket ORDER BY id")?;
     let mut cluster_ids = vec![];
     let mut sizes = vec![];
     let mut centers = vec![];
@@ -464,7 +480,7 @@ pub fn match_centroids(
     sql_filter: Option<&str>,
 ) -> Result<Vec<(f32, u32)>> {
     let max_generation = db
-        .query("SELECT MAX(generation) FROM indexed_chunk")
+        .query("SELECT MAX(generation) FROM indexed_chunk")?
         .query_row((), |row| Ok(row.get::<_, u32>(0)?))
         .unwrap_or(0);
 
@@ -484,9 +500,8 @@ pub fn match_centroids(
     if centers.len() > 0 {
         let now = std::time::Instant::now();
 
-        let query_centroid_similarity = query_embeddings
-            .matmul(&centers_matrix.transpose(D::Minus1, D::Minus2)?)
-            .unwrap();
+        let query_centroid_similarity =
+            query_embeddings.matmul(&centers_matrix.transpose(D::Minus1, D::Minus2)?)?;
         let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
 
         let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
@@ -526,19 +541,16 @@ pub fn match_centroids(
 
         let now = std::time::Instant::now();
 
-        db.execute("CREATE TEMPORARY TABLE temp(id INTEGER)")
-            .unwrap();
+        db.execute("CREATE TEMPORARY TABLE temp(id INTEGER)")?;
         let mut bucket_query = db.query(
             "SELECT bucket.id,indices,residuals FROM bucket
                 JOIN temp ON bucket.id = temp.id
                 WHERE generation = ?1",
-        );
-        let mut insert_temp_query = db.query("INSERT INTO TEMP VALUES(?1)");
+        )?;
+        let mut insert_temp_query = db.query("INSERT INTO TEMP VALUES(?1)")?;
 
         for i in topk_clusters {
-            insert_temp_query
-                .execute((cluster_ids[i as usize],))
-                .unwrap();
+            let _ = insert_temp_query.execute((cluster_ids[i as usize],));
         }
 
         let results = bucket_query.query_map((max_generation,), |row| {
@@ -567,7 +579,7 @@ pub fn match_centroids(
                 count += 1;
             }
         }
-        db.execute("DROP TABLE temp").unwrap();
+        db.execute("DROP TABLE temp")?;
 
         println!(
             "reading in {} indexed embeddings took {} ms.",
@@ -602,7 +614,7 @@ pub fn match_centroids(
           WHERE i.chunkid = c.rowid
             AND i.generation = ?1
         )",
-    );
+    )?;
 
     let results = unindexed_chunks_query.query_map((max_generation,), |row| {
         Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -630,14 +642,13 @@ pub fn match_centroids(
         return Ok([].to_vec());
     }
 
-    let all_document_embeddings = Tensor::cat(&all_document_embeddings, 0).unwrap();
+    let all_document_embeddings = Tensor::cat(&all_document_embeddings, 0)?;
     let all_document_embeddings = all_document_embeddings.to_device(query_embeddings.device())?;
 
     let now = std::time::Instant::now();
     let sim = query_embeddings
         .matmul(&all_document_embeddings.t()?)?
-        .transpose(0, 1)
-        .unwrap();
+        .transpose(0, 1)?;
     let sim = sim.to_device(&Device::Cpu)?;
 
     let sim = sim.to_dtype(DType::F32)?.contiguous()?;
@@ -699,12 +710,11 @@ pub fn match_centroids(
     );
 
     let now = std::time::Instant::now();
-    db.execute("CREATE TEMPORARY TABLE temp2(rowid INTEGER PRIMARY KEY, score FLOAT)")
-        .unwrap();
-    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2)");
+    db.execute("CREATE TEMPORARY TABLE temp2(rowid INTEGER PRIMARY KEY, score FLOAT)")?;
+    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2)")?;
 
     for (idx, score) in all_scored.iter() {
-        insert_temp_query.execute((idx, score)).unwrap();
+        let _ = insert_temp_query.execute((idx, score));
     }
 
     let sql = format!(
@@ -720,14 +730,14 @@ pub fn match_centroids(
         }
     );
 
-    let mut scored_documents_query = db.query(&sql);
+    let mut scored_documents_query = db.query(&sql)?;
     let results = scored_documents_query
         .query_map((top_k,), |row| {
             Ok((row.get::<_, f32>(0)?, row.get::<_, u32>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    db.execute("DROP TABLE temp2")?;
 
-    db.execute("DROP TABLE temp2").unwrap();
     println!(
         "reading scored and filtered document ids from DB took {} ms",
         now.elapsed().as_millis()
@@ -831,7 +841,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
             _ => String::new(),
         }
     );
-    let mut query = db.query(&sql);
+    let mut query = db.query(&sql)?;
 
     let embedding_iter = Gatherer::new(&mut query, embedder);
     let mut count = 0;
@@ -839,17 +849,20 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
         println!(
             "got embedding for chunk with hash {} {:?}",
             hash,
-            embeddings.dims2().unwrap()
+            embeddings.dims2()?
         );
 
-        //let now = std::time::Instant::now();
         let bytes = embeddings.stretch_rows()?.quantize(8)?.to_q8_bytes()?;
-        //println!("quantization took {} ms.", now.elapsed().as_millis());
 
-        //let now = std::time::Instant::now();
-        db.add_chunk(&hash, "xtr-base-en", &bytes);
-        count += 1;
-        //println!("database insert took {} ms.", now.elapsed().as_millis());
+        match db.add_chunk(&hash, "xtr-base-en", &bytes) {
+            Ok(()) => {
+                count += 1;
+            }
+            Err(v) => {
+                println!("add_chunk failed {}", v);
+                break;
+            }
+        };
     }
     Ok(count)
 }
@@ -862,7 +875,7 @@ pub fn count_unindexed_chunks(db: &DB) -> Result<usize> {
         ON i.chunkid = c.rowid
         AND i.generation = (SELECT MAX(generation) FROM indexed_chunk)
         WHERE i.chunkid IS NULL"
-    ));
+    ))?;
 
     let count = unindexed_chunks_query.query_row((), |row| Ok(row.get::<_, usize>(0)?))?;
     Ok(count)
@@ -876,7 +889,7 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     }
     println!("database has {} unindexed chunks, reindexing...", unindexed);
 
-    let mut kmeans_query = db.query("SELECT chunk.embeddings FROM chunk");
+    let mut kmeans_query = db.query("SELECT chunk.embeddings FROM chunk")?;
     let mut total_embeddings = 0;
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
@@ -910,7 +923,12 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
 
     println!("write buckets...");
     let now = std::time::Instant::now();
-    write_buckets(&db, &centers, &device).unwrap();
+    match write_buckets(&db, &centers, &device) {
+        Ok(()) => {}
+        Err(v) => {
+            println!("write buckets failed {}", v);
+        }
+    }
     println!("write buckets took {} ms.", now.elapsed().as_millis());
     Ok(())
 }
@@ -968,7 +986,13 @@ pub fn search(
                 qe
             }
         };
-        match_centroids(&db, &qe, threshold, top_k, sql_filter).unwrap()
+        match match_centroids(&db, &qe, threshold, top_k, sql_filter) {
+            Ok(result) => result,
+            Err(v) => {
+                println!("match_centroids failed {v}");
+                [].to_vec()
+            }
+        }
     } else {
         [].to_vec()
     };
@@ -989,7 +1013,7 @@ pub fn search(
     fused.truncate(top_k);
 
     let mut results = vec![];
-    let mut body_query = db.query("SELECT metadata,body FROM document WHERE rowid = ?1");
+    let mut body_query = db.query("SELECT metadata,body FROM document WHERE rowid = ?1")?;
     for idx in fused {
         let score = match scores.get(&idx) {
             Some(score) => *score,

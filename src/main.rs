@@ -60,7 +60,7 @@ pub fn bulk_search(
     let file = File::create(outputname).unwrap();
     let mut writer = BufWriter::new(file);
 
-    let mut metadata_query = db.query("SELECT metadata FROM document WHERE rowid = ?1");
+    let mut metadata_query = db.query("SELECT metadata FROM document WHERE rowid = ?1")?;
     let mut histogram = histogram::Histogram::new(10000);
     let mut embedder_histogram = histogram::Histogram::new(10000);
 
@@ -125,20 +125,24 @@ pub fn bulk_search(
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let mut db = DB::new("mydb.sqlite");
     let device = warp::make_device();
     let assets = std::path::PathBuf::from("assets");
-    let embedder = warp::Embedder::new(&device, &assets);
+    let embedder = warp::Embedder::new(&device, &assets).unwrap();
     let mut cache = warp::EmbeddingsCache::new(1);
+    let db_name = "mydb.sqlite";
 
     if args.len() == 3 && args[1] == "readcsv" {
+        let mut db = DB::new(db_name).unwrap();
         let csvname = &args[2];
         read_csv(&mut db, csvname.into()).unwrap();
     } else if args.len() == 2 && &args[1] == "embed" {
+        let db = DB::new(db_name).unwrap();
         let _got = warp::embed_chunks(&db, &embedder, None).unwrap();
     } else if args.len() == 2 && &args[1] == "index" {
+        let db = DB::new(db_name).unwrap();
         warp::index_chunks(&db, &device).unwrap();
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
+        let db = DB::new_reader(db_name).unwrap();
         let q = &args[2..].join(" ");
         let use_fulltext = args[1] == "hybrid";
         let results =
@@ -149,6 +153,7 @@ fn main() -> Result<()> {
     } else if args.len() >= 4
         && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv")
     {
+        let db = DB::new_reader(db_name).unwrap();
         let use_fulltext = args[1] == "hybridcsv" || args[1] == "fulltextcsv";
         let use_semantic = args[1] != "fulltextcsv";
         let csvname = &args[2];
