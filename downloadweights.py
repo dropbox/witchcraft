@@ -46,7 +46,7 @@ class XTR(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.encoder = AutoModel.from_pretrained("google/xtr-base-en", torch_dtype=torch.float16, use_safetensors=True).encoder
+        self.encoder = AutoModel.from_pretrained("google/xtr-base-en", dtype=torch.float16, use_safetensors=True).encoder
         self.encoder.linear = torch.nn.Linear(768, 128, bias=False)
 
         to_dense_path = hf_hub_download(repo_id="google/xtr-base-en", filename="2_Dense/pytorch_model.bin")
@@ -56,7 +56,7 @@ class XTR(nn.Module):
         other["weight"] = state["linear.weight"]
         self.encoder.linear.load_state_dict(other)
 
-snapshot_download(repo_id="google/xtr-base-en", local_dir="xtr-base-en", revision="main")
+snapshot_download(repo_id="google/xtr-base-en", local_dir="xtr-base-en", local_dir_use_symlinks=False, revision="main")
 
 xtr = XTR()
 fp16_state_dict = {k: v.half().cpu() for k, v in xtr.state_dict().items()}

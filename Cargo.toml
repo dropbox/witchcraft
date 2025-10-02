@@ -7,9 +7,9 @@ edition = "2024"
 name = "warp-cli"               # !Dash
 path = "src/main.rs"            # !Dash
 
-[[bin]]
-name = "quantize-tool"
-path = "src/quantize-tool.rs"
+[[bin]]                         # !Dash
+name = "quantize-tool"          # !Dash
+path = "src/quantize-tool.rs"   # !Dash
 
 [lib]
 crate-type = ["cdylib"]

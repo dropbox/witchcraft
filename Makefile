@@ -11,7 +11,7 @@ assets/config.json.zst assets/tokenizer.json.zst xtr.safetensors assets/xtr.safe
 	(source env/bin/activate; python downloadweights.py)
 
 assets/xtr.gguf.zst: xtr.safetensors
-	cargo run --release --bin quantize-tool
+	cargo run --release --bin quantize-tool xtr.safetensors assets/xtr.gguf.zst
 
 download: assets/config.json.zst assets/tokenizer.json.zst assets/xtr.safetensors.zst assets/xtr.gguf.zst
 
