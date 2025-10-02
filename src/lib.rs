@@ -1,7 +1,6 @@
 /* Node module API for Warp */
 
 use iso8601_timestamp::Timestamp;
-use napi::bindgen_prelude::*;
 use napi::{Env, ScopedTask};
 use napi_derive::napi;
 
@@ -12,6 +11,90 @@ use std::{
 };
 
 use uuid::Uuid;
+
+use log::{info, warn, LevelFilter, Log, Metadata, Record};
+use napi::bindgen_prelude::*; // Env, Function, Result, etc.
+use napi::threadsafe_function::ThreadsafeCallContext;
+use once_cell::sync::OnceCell;
+
+#[napi(object)]
+pub struct LogEvent {
+    pub level: String,
+    pub message: String,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+}
+
+// Store the threadsafe function using a boxed type-erased version
+static TSFN: OnceCell<Box<dyn Fn(LogEvent) + Send + Sync>> = OnceCell::new();
+
+struct JsLogger;
+
+impl Log for JsLogger {
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record) {
+        if let Some(callback) = TSFN.get() {
+            let evt = LogEvent {
+                level: record.level().to_string().to_lowercase(),
+                message: record.args().to_string(),
+                file: record.file().map(|s| s.to_string()),
+                line: record.line(),
+            };
+            callback(evt);
+        } else {
+            println!(
+                "[{}] {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: JsLogger = JsLogger;
+
+#[napi]
+pub fn set_log_callback(
+    callback: Function<(LogEvent,), Unknown>,
+    max_level: Option<String>,
+) -> Result<()> {
+    use napi::threadsafe_function::ThreadsafeFunctionCallMode;
+
+    // Safety: We're intentionally leaking the callback reference to make it 'static
+    // This is okay because we only set the callback once and it lives for the duration of the program
+    let callback_static: Function<'static, (LogEvent,), Unknown> =
+        unsafe { std::mem::transmute(callback) };
+
+    let tsfn = callback_static.build_threadsafe_function().build_callback(
+        |ctx: ThreadsafeCallContext<(LogEvent,)>| {
+            // Extract the first element from the tuple (LogEvent,) to pass just the LogEvent
+            Ok(ctx.value.0)
+        },
+    )?;
+
+    // Wrap the threadsafe function in a closure that we can store
+    let _ = TSFN.set(Box::new(move |evt: LogEvent| {
+        let _ = tsfn.call((evt,), ThreadsafeFunctionCallMode::NonBlocking);
+    }));
+
+    let lvl = match max_level.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("error") => LevelFilter::Error,
+        Some("warn") => LevelFilter::Warn,
+        Some("info") => LevelFilter::Info,
+        Some("debug") => LevelFilter::Debug,
+        Some("trace") => LevelFilter::Trace,
+        Some("off") => LevelFilter::Off,
+        _ => LevelFilter::Trace,
+    };
+    let _ = log::set_logger(&LOGGER).map(|_| log::set_max_level(lvl));
+    Ok(())
+}
 
 enum Job {
     Add {
@@ -51,7 +134,7 @@ impl Indexer {
         let mut db = match warp::DB::new(&db_name) {
             Ok(db) => Some(db),
             Err(v) => {
-                println!("database `{}' could not be opened {}", db_name, v);
+                warn!("database `{}' could not be opened {}", db_name, v);
                 None
             }
         };
@@ -59,7 +142,7 @@ impl Indexer {
         let embedder = match warp::Embedder::new(&device, &std::path::PathBuf::from(&assets)) {
             Ok(embedder) => Some(embedder),
             Err(v) => {
-                println!(
+                warn!(
                     "embedder with assets in `{}` could not be created {}",
                     assets, v
                 );
@@ -99,13 +182,13 @@ impl Indexer {
                         } => match db.add_doc(&uuid, date, &metadata, &body) {
                             Ok(()) => {}
                             Err(v) => {
-                                println!("add_doc failed! {}", v);
+                                warn!("add_doc failed! {}", v);
                             }
                         }
                         Job::Remove { uuid } => match db.remove_doc(&uuid) {
                             Ok(()) => {}
                             Err(v) => {
-                                println!("remove_doc failed! {}", v);
+                                warn!("remove_doc failed! {}", v);
                             }
                         }
                         Job::Index=> {
@@ -132,7 +215,7 @@ impl Indexer {
                                 match warp::index_chunks(&db, &device) {
                                     Ok(()) => {}
                                     Err(v) => {
-                                        println!("index_chunks failed! {}", v);
+                                        warn!("index_chunks failed! {}", v);
                                     }
                                 }
                             }
@@ -240,7 +323,7 @@ impl WarpInner {
             .and_then(|embedder| self.db.as_ref().map(|db| (embedder, db)))
             .map_or_else(
                 || {
-                    println!("no embedder or db");
+                    warn!("no embedder or db");
                     Vec::new()
                 },
                 |(embedder, db)| {
@@ -255,7 +338,7 @@ impl WarpInner {
                         filter,
                     )
                     .unwrap_or_else(|e| {
-                        println!("error {e} querying");
+                        warn!("error {e} querying");
                         Vec::new()
                     })
                 },
@@ -271,7 +354,7 @@ impl WarpInner {
                 |embedder| {
                     warp::score_query_sentences(embedder, &mut self.cache, q, sentences)
                         .unwrap_or_else(|e| {
-                            println!("error {e} scoring");
+                            warn!("error {e} scoring");
                             Vec::new()
                         })
                 },
@@ -355,7 +438,7 @@ impl Warp {
     #[napi(constructor)]
     pub fn new(db_name: String, assets: String) -> Self {
         let cwd = std::env::current_dir().unwrap();
-        println!(
+        info!(
             "warp running db=`{}' assets=`{}' cwd=`{}'",
             db_name,
             assets,

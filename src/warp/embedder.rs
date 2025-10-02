@@ -31,7 +31,7 @@ impl Embedder {
             .unsqueeze(0)
             .unwrap();
         let embeddings = self.model.forward(&token_ids).unwrap();
-        //println!("embedder took {} ms.", now.elapsed().as_millis());
+        //info!("embedder took {} ms.", now.elapsed().as_millis());
         normalize_l2(&embeddings)
     }
 }

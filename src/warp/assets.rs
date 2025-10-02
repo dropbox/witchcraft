@@ -39,17 +39,17 @@ impl Asset {
     }
 
     /// Return the decompressed bytes; performs work only on first call.
-    pub fn bytes(&'static self, assets: &PathBuf) -> Result<&'static [u8], ()> {
+    pub fn bytes(&'static self, _assets: &PathBuf) -> Result<&'static [u8], ()> {
         self.decompressed
             .get_or_init(|| {
                 #[cfg(feature = "embed-assets")]
                 let compressed: Vec<u8> = self.compressed.to_vec();
 
                 #[cfg(not(feature = "embed-assets"))]
-                let compressed: Vec<u8> = match fs::read(Path::new(&assets.join(self.path))) {
+                let compressed: Vec<u8> = match fs::read(Path::new(&_assets.join(self.path))) {
                     Ok(c) => c,
                     Err(e) => {
-                        println!("failed to read warp asset {}: {}", self.path, e);
+                        log::warn!("failed to read warp asset {}: {}", self.path, e);
                         return Err(());
                     }
                 };
@@ -58,7 +58,7 @@ impl Asset {
                 match zstd::stream::decode_all(&mut cursor) {
                     Ok(d) => Ok(d),
                     Err(e) => {
-                        println!("failed to decompress warp asset {}: {}", self.path, e);
+                        log::warn!("failed to decompress warp asset {}", e);
                         Err(())
                     }
                 }
@@ -74,7 +74,7 @@ macro_rules! embed_zst_asset {
         #[cfg(feature = "embed-assets")]
         $vis static $name: $crate::warp::assets::Asset =
             $crate::warp::assets::Asset::new_embedded(include_bytes!(
-                concat!(env!("CARGO_MANIFEST_DIR"), "/", $path)
+                concat!(env!("CARGO_MANIFEST_DIR"), "/assets/", $path)
             ));
 
         #[cfg(not(feature = "embed-assets"))]

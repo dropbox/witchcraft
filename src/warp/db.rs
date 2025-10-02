@@ -1,4 +1,5 @@
 use iso8601_timestamp::Timestamp;
+use log::warn;
 use rusqlite::{Connection, OpenFlags, Result as SQLResult, Statement};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -31,7 +32,7 @@ impl DB {
             Err(_e) => false,
         };
         if db_ok == false {
-            println!("warp database corrupted, recreating it!");
+            warn!("warp database corrupted, recreating it!");
             drop(connection);
             let _ = std::fs::remove_file(&db_fn);
             connection = Connection::open(db_fn)?;
@@ -131,7 +132,7 @@ impl DB {
                     self.remove_on_shutdown = false;
                 }
                 Err(v) => {
-                    println!("unable to remove database file {} : {}", self.db_fn, v);
+                    warn!("unable to remove database file {} : {}", self.db_fn, v);
                 }
             };
         }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use csv;
+use log::{Level, LevelFilter, Metadata, Record};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::File;
@@ -11,8 +12,25 @@ mod warp;
 
 use warp::DB;
 
+struct SimpleLogger;
+impl log::Log for SimpleLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= Level::Info
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            println!("[{}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: SimpleLogger = SimpleLogger;
+
 #[derive(Debug, Deserialize)]
-struct Record {
+struct CSVRecord {
     name: String,
     body: String,
 }
@@ -32,7 +50,7 @@ pub fn read_csv(db: &mut DB, csvname: std::path::PathBuf) -> Result<()> {
         .from_reader(file);
 
     for result in rdr.deserialize() {
-        let record: Record = result?;
+        let record: CSVRecord = result?;
         let metadata = CorpusMetaData { key: record.name };
         let metadata = serde_json::to_string(&metadata)?;
         let body = record.body;
@@ -124,6 +142,8 @@ pub fn bulk_search(
 }
 
 fn main() -> Result<()> {
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Debug));
+
     let args: Vec<String> = env::args().collect();
     let device = warp::make_device();
     let assets = std::path::PathBuf::from("assets");

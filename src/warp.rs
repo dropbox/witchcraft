@@ -1,3 +1,4 @@
+use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 use rusqlite::Statement;
 use std::collections::HashMap;
@@ -33,7 +34,7 @@ pub fn make_device() -> Device {
         match Device::new_metal(0) {
             Ok(device) => device,
             Err(v) => {
-                println!("unable to create metal device: {v}");
+                warn!("unable to create metal device: {v}");
                 Device::Cpu
             }
         }
@@ -75,7 +76,7 @@ pub mod progress {
 
 fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(Tensor, Tensor)> {
     let (m, n) = data.dims2()?;
-    println!("kmeans k={} m={} n={}...", k, m, n);
+    debug!("kmeans k={} m={} n={}...", k, m, n);
 
     let total: u64 = (max_iter * k).try_into()?;
     let bar = progress::new(total);
@@ -126,8 +127,6 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(
 }
 
 fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
-    let (k, _) = centers.dims2()?;
-    println!("k={}", k);
     let mut mmuls_total = 0;
     let mut writes_total = 0;
 
@@ -252,9 +251,8 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     }
     bar.finish();
 
-    println!("mmuls took {} ms.", mmuls_total);
-    println!("writes took {} ms.", writes_total);
-    println!("merge all");
+    debug!("mmuls took {} ms.", mmuls_total);
+    debug!("writes took {} ms.", writes_total);
 
     let txstatus = match db.begin_transaction() {
         Ok(()) => {
@@ -277,7 +275,7 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
                     &entry.data,
                 )?;
             }
-            println!("write {} chunk ids to indexed_chunk", all_chunkids.len());
+            info!("write {} chunk ids to indexed_chunk", all_chunkids.len());
             for chunkid in all_chunkids {
                 let _ = db.add_indexed_chunk(chunkid, next_generation)?;
             }
@@ -289,14 +287,14 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
             Ok(())
         }
         Err(v) => {
-            println!("unable to begin transaction, index not created/updated! {v}");
+            warn!("unable to begin transaction, index not created/updated! {v}");
             Err(v)
         }
     };
     match txstatus {
         Ok(()) => Ok(db.commit_transaction()?),
         Err(v) => {
-            println!("failure during indexing transaction {v}");
+            warn!("failure during indexing transaction {v}");
             let _ = db.rollback_transaction();
             Err(v.into())
         }
@@ -356,7 +354,7 @@ pub fn fulltext_search(
         let (rowid,) = result?;
         fts_idxs.push(rowid);
     }
-    println!("full text found {} matches", fts_idxs.len());
+    info!("full text found {} matches", fts_idxs.len());
     Ok(fts_idxs)
 }
 
@@ -431,7 +429,7 @@ fn get_centers(
     } else {
         Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, &device)?
     };
-    println!(
+    debug!(
         "reading and stacking centers took {} ms (caching result for future queries.)",
         now.elapsed().as_millis()
     );
@@ -532,7 +530,7 @@ pub fn match_centroids(
         }
         topk_clusters.sort();
         topk_clusters.dedup();
-        println!(
+        debug!(
             "finding top-{} out of {} clusters took {} ms.",
             topk_clusters.len(),
             n,
@@ -581,7 +579,7 @@ pub fn match_centroids(
         }
         db.execute("DROP TABLE temp")?;
 
-        println!(
+        debug!(
             "reading in {} indexed embeddings took {} ms.",
             count,
             now.elapsed().as_millis()
@@ -632,7 +630,7 @@ pub fn match_centroids(
         }
         num_unindexed += m;
     }
-    println!(
+    debug!(
         "reading {} unindexed embeddings took {} ms.",
         num_unindexed,
         now.elapsed().as_millis()
@@ -661,11 +659,11 @@ pub fn match_centroids(
 
     let missing_similarities = missing_similarities.contiguous()?.to_vec1::<f32>()?;
 
-    println!("sim mmul took {} ms.", now.elapsed().as_millis());
+    debug!("sim mmul took {} ms.", now.elapsed().as_millis());
 
     let now = std::time::Instant::now();
     all.sort_unstable();
-    println!(
+    debug!(
         "sorting {} rows took {}ms",
         all.len(),
         now.elapsed().as_millis()
@@ -702,7 +700,7 @@ pub fn match_centroids(
 
         prev_idx = idx;
     }
-    println!(
+    debug!(
         "scoring {} documents into {} candidates took {} ms.",
         unique_docs,
         all_scored.len(),
@@ -738,7 +736,7 @@ pub fn match_centroids(
         .collect::<Result<Vec<_>, _>>()?;
     db.execute("DROP TABLE temp2")?;
 
-    println!(
+    debug!(
         "reading scored and filtered document ids from DB took {} ms",
         now.elapsed().as_millis()
     );
@@ -798,7 +796,7 @@ impl<'a> Iterator for Gatherer<'a> {
 
                 let (_b, m, _n) = embeddings.dims3().unwrap();
                 let dt = now.elapsed().as_secs_f64();
-                println!(
+                debug!(
                     "embedder took {} ms ({} rows/s).",
                     now.elapsed().as_millis(),
                     ((m as f64) / dt).round()
@@ -846,7 +844,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
     let embedding_iter = Gatherer::new(&mut query, embedder);
     let mut count = 0;
     for (hash, embeddings) in embedding_iter {
-        println!(
+        debug!(
             "got embedding for chunk with hash {} {:?}",
             hash,
             embeddings.dims2()?
@@ -859,11 +857,12 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
                 count += 1;
             }
             Err(v) => {
-                println!("add_chunk failed {}", v);
+                info!("add_chunk failed {}", v);
                 break;
             }
         };
     }
+    debug!("embedded {count} chunks");
     Ok(count)
 }
 
@@ -884,16 +883,16 @@ pub fn count_unindexed_chunks(db: &DB) -> Result<usize> {
 pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     let unindexed = count_unindexed_chunks(&db)?;
     if unindexed == 0 {
-        println!("all chunks indexed already!");
+        info!("all chunks indexed already!");
         return Ok(());
     }
-    println!("database has {} unindexed chunks, reindexing...", unindexed);
+    info!("database has {} unindexed chunks, reindexing...", unindexed);
 
     let mut kmeans_query = db.query("SELECT chunk.embeddings FROM chunk")?;
     let mut total_embeddings = 0;
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
-    println!("read embeddings...");
+    debug!("read embeddings...");
     for embeddings in kmeans_query.query_map((), |row| Ok(row.get::<_, Vec<u8>>(0)?))? {
         let t = Tensor::from_q8_bytes(&embeddings?, EMBEDDING_DIM, &Device::Cpu)?;
         let (m, _) = t.dims2()?;
@@ -913,23 +912,23 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     let now = std::time::Instant::now();
     let log2_k = (16.0 * (total_embeddings as f64).sqrt()).log(2.0).floor() as u32;
     let mut k = 1 << log2_k;
-    println!("total_embeddings={} k={}", total_embeddings, k);
+    debug!("total_embeddings={} k={}", total_embeddings, k);
     let (m, _) = matrix.dims2()?;
     if m < k {
         k = m / 4;
     }
     let (centers, _idxs) = kmeans(&matrix, k as usize, 5, &device)?;
-    println!("kmeans took {} ms.", now.elapsed().as_millis());
+    debug!("kmeans took {} ms.", now.elapsed().as_millis());
 
-    println!("write buckets...");
+    debug!("write buckets...");
     let now = std::time::Instant::now();
     match write_buckets(&db, &centers, &device) {
         Ok(()) => {}
         Err(v) => {
-            println!("write buckets failed {}", v);
+            info!("write buckets failed {}", v);
         }
     }
-    println!("write buckets took {} ms.", now.elapsed().as_millis());
+    info!("write buckets took {} ms.", now.elapsed().as_millis());
     Ok(())
 }
 
@@ -989,7 +988,7 @@ pub fn search(
         match match_centroids(&db, &qe, threshold, top_k, sql_filter) {
             Ok(result) => result,
             Err(v) => {
-                println!("match_centroids failed {v}");
+                info!("match_centroids failed {v}");
                 [].to_vec()
             }
         }
@@ -1003,7 +1002,7 @@ pub fn search(
     }
 
     let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
-    println!("semantic search found {} matches", sem_idxs.len());
+    info!("semantic search found {} matches", sem_idxs.len());
 
     let mut fused = if use_fulltext {
         reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
@@ -1024,7 +1023,7 @@ pub fn search(
         })?;
         results.push((score, metadata, body));
     }
-    println!(
+    info!(
         "warp search took {} ms end-to-end.",
         now.elapsed().as_millis()
     );
@@ -1071,9 +1070,9 @@ pub fn score_query_sentences(
         i += sz;
     }
     for i in 0usize..sentences.len() {
-        println!("warp sentence score {} {}", sentences[i], scores[i]);
+        info!("warp sentence score {} {}", sentences[i], scores[i]);
     }
-    println!(
+    info!(
         "scoring {} sentences took {} ms.",
         sentences.len(),
         now.elapsed().as_millis()
