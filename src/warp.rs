@@ -301,12 +301,16 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     }
 }
 
+fn bm25_to_cosine_approx(bm25: f32) -> f32 {
+    1.0 - (1.0 / (1.0 + (-bm25 / 2.0).exp())) // logistic-shaped
+}
+
 pub fn fulltext_search(
     db: &DB,
     q: &String,
     top_k: usize,
     sql_filter: Option<&str>,
-) -> Result<Vec<u32>> {
+) -> Result<Vec<(f32, u32)>> {
     let mut fts_idxs = vec![];
 
     let mut last_is_space = false;
@@ -349,10 +353,14 @@ pub fn fulltext_search(
     };
 
     let mut query = db.query(&sql)?;
-    let results = query.query_map((&q, top_k), |row| Ok((row.get::<_, u32>(0)?,)))?;
+    let results = query.query_map((&q, top_k), |row| Ok((
+        row.get::<_, u32>(0)?,
+        row.get::<_, f32>(1)?,
+    )))?;
     for result in results {
-        let (rowid,) = result?;
-        fts_idxs.push(rowid);
+        let (rowid, score) = result?;
+        let score2 = bm25_to_cosine_approx(score);
+        fts_idxs.push((score2, rowid));
     }
     info!("full text found {} matches", fts_idxs.len());
     Ok(fts_idxs)
@@ -955,13 +963,13 @@ pub fn search(
 
     let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    let fts_idxs = if use_fulltext {
+    let fts_matches = if use_fulltext {
         fulltext_search(&db, &q, top_k, sql_filter)?
     } else {
         [].to_vec()
     };
 
-    let sem_matches = if q.len() > 0 {
+    let sem_matches = if q.len() > 3 {
         let qe = match cache.get(&q) {
             Some(existing) => existing,
             None => {
@@ -985,7 +993,11 @@ pub fn search(
     for (score, idx) in &sem_matches {
         scores.insert(*idx, *score);
     }
+    for (score, idx) in &fts_matches {
+        scores.insert(*idx, *score);
+    }
 
+    let fts_idxs: Vec<u32> = fts_matches.iter().map(|&(_, idx)| idx).collect();
     let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
     info!("semantic search found {} matches", sem_idxs.len());
 
@@ -1008,6 +1020,13 @@ pub fn search(
         })?;
         results.push((score, metadata, body));
     }
+
+    let mut max = -1.0f32;
+    for (score, _metadata, _body) in results.iter_mut().rev() {
+        max = max.max(*score);
+        *score = max;
+    }
+
     info!(
         "warp search took {} ms end-to-end.",
         now.elapsed().as_millis()

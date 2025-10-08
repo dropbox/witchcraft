@@ -89,7 +89,7 @@ pub fn bulk_search(
 
         println!("\nSearching for: {}", question);
         let now = std::time::Instant::now();
-        let fts_idxs = if use_fulltext {
+        let fts_matches = if use_fulltext {
             warp::fulltext_search(&db, &question, 100, None)?
         } else {
             [].to_vec()
@@ -111,6 +111,7 @@ pub fn bulk_search(
             println!("semantic search found {} matches", sem_idxs.len());
         }
 
+        let fts_idxs: Vec<u32> = fts_matches.iter().map(|&(_, idx)| idx).collect();
         let fused = if use_fulltext && use_semantic {
             warp::reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
         } else if use_fulltext {
