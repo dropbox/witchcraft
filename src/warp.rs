@@ -868,10 +868,6 @@ pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
 
 pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     let unindexed = count_unindexed_embeddings(&db)?;
-    if unindexed == 0 {
-        info!("all chunks indexed already!");
-        return Ok(());
-    }
     info!(
         "database has {} unindexed embeddings, reindexing...",
         unindexed
@@ -1027,7 +1023,9 @@ pub fn score_query_sentences(
 ) -> Result<Vec<f32>> {
     let now = std::time::Instant::now();
     let qe = match cache.get(&q) {
-        Some(existing) => existing,
+        Some(existing) => {
+            existing
+        }
         None => {
             let qe = embedder.embed(&q)?.get(0)?;
             cache.put(&q, &qe);
@@ -1068,3 +1066,6 @@ pub fn score_query_sentences(
     );
     Ok(scores)
 }
+
+#[cfg(test)]
+mod tests;

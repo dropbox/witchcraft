@@ -3,40 +3,44 @@ use log::warn;
 use rusqlite::{Connection, OpenFlags, Result as SQLResult, Statement};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use std::path::PathBuf;
 
 const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
 
 pub struct DB {
-    db_fn: String,
+    db_fn: PathBuf,
     connection: Connection,
     remove_on_shutdown: bool,
 }
 
 impl DB {
-    pub fn new_reader(db_fn: &str) -> SQLResult<Self> {
-        let connection = Connection::open_with_flags(db_fn, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    pub fn new_reader(db_fn: PathBuf) -> SQLResult<Self> {
+        let connection = Connection::open_with_flags(db_fn.clone(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self {
-            db_fn: db_fn.to_string(),
+            db_fn: db_fn,
             connection: connection,
             remove_on_shutdown: false,
         })
     }
 
-    pub fn new(db_fn: &str) -> SQLResult<Self> {
-        let mut connection = Connection::open(db_fn)?;
-
+    pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
+        let connection = Connection::open(&db_fn)?;
         let status: SQLResult<String> =
             connection.query_row("PRAGMA quick_check;", [], |row| row.get(0));
         let db_ok = match status {
             Ok(text) => text.trim().eq_ignore_ascii_case("ok"),
             Err(_e) => false,
         };
-        if db_ok == false {
+        let connection = if db_ok {
+            connection
+        } else {
             warn!("warp database corrupted, recreating it!");
-            drop(connection);
-            let _ = std::fs::remove_file(&db_fn);
-            connection = Connection::open(db_fn)?;
-        }
+            connection.close().map_err(|(_conn, e)| e)?;
+            std::fs::remove_file(&db_fn).map_err(|_e| {
+                rusqlite::Error::InvalidPath(db_fn.clone())
+            })?;
+            Connection::open(&db_fn)?
+        };
 
         //connection
         //.pragma_update(None, "journal_mode", &"WAL")
@@ -108,7 +112,7 @@ impl DB {
             "CREATE UNIQUE INDEX IF NOT EXISTS indexed_chunk_index ON indexed_chunk(chunkid, generation)";
         connection.execute(query, ())?;
         Ok(Self {
-            db_fn: db_fn.to_string(),
+            db_fn: db_fn,
             connection: connection,
             remove_on_shutdown: false,
         })
@@ -140,7 +144,7 @@ impl DB {
                     self.remove_on_shutdown = false;
                 }
                 Err(v) => {
-                    warn!("unable to remove database file {} : {}", self.db_fn, v);
+                    warn!("unable to remove database file {v}");
                 }
             };
         }

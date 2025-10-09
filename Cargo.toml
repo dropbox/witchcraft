@@ -49,6 +49,9 @@ uuid = {version = "1.18.1", features = ["v5"] }
 iso8601-timestamp = "0.3.3"
 log = "0.4.28"
 
+[dev-dependencies]
+test-log = { version = "0.2.16", features = ["trace", "color"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { git = "https://github.com/huggingface/candle", rev="03e9ce0e7248002f150bf40bb647116361020381", features = ["metal"] }
 candle-nn = { git = "https://github.com/huggingface/candle", rev="03e9ce0e7248002f150bf40bb647116361020381", features = ["metal"] }

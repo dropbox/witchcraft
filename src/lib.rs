@@ -8,6 +8,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::{mpsc, Arc, Mutex, OnceLock},
     thread::{self, JoinHandle},
+    path::PathBuf,
 };
 
 use uuid::Uuid;
@@ -130,8 +131,9 @@ fn drain_commands() -> bool {
 
 impl Indexer {
     pub fn new(db_name: String, assets: String) -> Self {
+        let db_path = PathBuf::from(db_name.clone());
         let (tx, rx) = mpsc::channel::<Job>();
-        let mut db = match warp::DB::new(&db_name) {
+        let mut db = match warp::DB::new(db_path) {
             Ok(db) => Some(db),
             Err(v) => {
                 warn!("database `{}' could not be opened {}", db_name, v);
@@ -139,7 +141,7 @@ impl Indexer {
             }
         };
         let device = warp::make_device();
-        let embedder = match warp::Embedder::new(&device, &std::path::PathBuf::from(&assets)) {
+        let embedder = match warp::Embedder::new(&device, &PathBuf::from(&assets)) {
             Ok(embedder) => Some(embedder),
             Err(v) => {
                 warn!(
@@ -292,7 +294,7 @@ struct WarpInner {
 impl WarpInner {
     pub fn new(db_name: String, assets: String) -> Self {
         let _indexer = Indexer::init_global(db_name.clone(), assets.clone());
-        let db = warp::DB::new_reader(&db_name.clone()).ok();
+        let db = warp::DB::new_reader(db_name.into()).ok();
         let cache = warp::EmbeddingsCache::new(16);
         let device = warp::make_device();
         let assets = std::path::PathBuf::from(assets);

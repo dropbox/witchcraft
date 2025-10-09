@@ -1,0 +1,186 @@
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+    use crate::warp;
+    use crate::warp::DB;
+    use test_log::test;
+    use tempfile::Builder;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_end_to_end() -> std::io::Result<()> {
+
+        let facts = [
+            "Bananas are berries, but strawberries aren't.",
+            "Octopuses have three hearts and blue blood.",
+            "A day on Venus is longer than a year on Venus.",
+            "There are more trees on Earth than stars in the Milky Way.",
+            "Water can boil and freeze at the same time, known as the triple point.",
+            "A shrimp's heart is located in its head.",
+            "Honey never spoils; archaeologists have found 3000-year-old edible honey.",
+            "Wombat poop is cube-shaped to prevent it from rolling away.",
+            "There's a species of jellyfish that is biologically immortal.",
+            "Humans share about 60% of their DNA with bananas.",
+            "The Eiffel Tower can grow taller in the summer due to heat expansion.",
+            "Some turtles can breathe through their butts.",
+            "The shortest war in history lasted 38 to 45 minutes (Anglo-Zanzibar War).",
+            "There's a gas cloud in space that smells like rum and tastes like raspberries.",
+            "Cows have best friends and get stressed when separated.",
+            "A group of flamingos is called a 'flamboyance'.",
+            "Bananas are berries, but strawberries aren't.",
+            "There's a species of fungus that can turn ants into zombies.",
+            "Sharks existed before trees.",
+            "Scotland has 421 words for 'snow'.",
+            "Hot water freezes faster than cold water, known as the Mpemba effect.",
+            "The inventor of the frisbee was turned into a frisbee after he died.",
+            "There's an island in Japan where bunnies outnumber people.",
+            "Sloths can hold their breath longer than dolphins.",
+            "You can hear a blue whale's heartbeat from over 2 miles away.",
+            "Butterflies can taste with their feet.",
+            "A day on Earth was once only 6 hours long in the distant past.",
+            "Vatican City has the highest crime rate per capita due to its tiny population.",
+            "There's an official Wizard of New Zealand, appointed by the government.",
+            "A bolt of lightning is five times hotter than the surface of the sun.",
+            "The letter 'E' is the most common letter in the English language.",
+            "There's a lake in Australia that stays bright pink regardless of conditions.",
+            "Cleopatra lived closer in time to the first moon landing than to the building of the Great Pyramid."
+        ];
+
+        let queries = [
+            ("a lake with funny colors", 31),
+            ("A group of flamingos", 15),
+            ("facts about fruits and berries", 0),
+        ];
+
+        let tmp = Builder::new().prefix("warp-").suffix(".db").tempfile()?;
+        let (_file, path): (std::fs::File, PathBuf) = tmp.keep()?;
+
+        let mut db = DB::new(path.clone()).unwrap();
+        let reader_db = DB::new_reader(path.clone()).unwrap();
+
+        let device = warp::make_device();
+        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let embedder = warp::Embedder::new(&device, &assets).unwrap();
+        let mut cache = warp::EmbeddingsCache::new(4);
+
+        let mut uuids = vec!();
+        for body in facts {
+            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
+            uuids.push(uuid.clone());
+            db.add_doc(&uuid, None, &uuid.to_string(), &body).unwrap();
+        }
+        for round in 0..3 {
+            warp::embed_chunks(&db, &embedder, None).unwrap();
+            db.refresh_ft().unwrap();
+            for (i, (q, pos)) in queries.iter().enumerate() {
+                let use_fulltext = round == 0;
+                println!("searching for {q}");
+                let results =
+                    warp::search(&reader_db, &embedder, &mut cache, &q.to_string(), 0.75, 10, use_fulltext, None).unwrap();
+                if round == 0 {
+                    assert!(results.len() == 1);
+                } else {
+                    if i < 2 {
+                        assert!(results.len() == 1);
+                    } else {
+                        assert!(results.len() == 0);
+                    }
+                }
+                for (score, metadata, body) in results {
+                    let uuid = Uuid::parse_str(&metadata).unwrap();
+                    let index = uuids.iter().position(|&u| u == uuid).unwrap();
+                    println!("i={i} score={score} metadata={metadata} body={body} uuid-index {index}");
+                    assert!(index == *pos);
+                }
+            }
+            db.remove_doc(&uuids[0].clone()).unwrap();
+            warp::index_chunks(&db, &device).unwrap();
+        }
+        let _ = warp::search(&reader_db, &embedder, &mut cache, &"".to_string(), 0.75, 10, true, None).unwrap();
+        db.clear();
+        db.shutdown();
+
+        match std::fs::metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { }
+                Err(e) => return Err(e),
+                Ok(_) => panic!("temp file still exists: {}", path.display()),
+            }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_scoring() -> std::io::Result<()> {
+        let device = warp::make_device();
+        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let embedder = warp::Embedder::new(&device, &assets).unwrap();
+        let mut cache = warp::EmbeddingsCache::new(4);
+        let sentences = [
+            "The inventor of the frisbee was turned into a frisbee after he died.",
+            "There's an island in Japan where bunnies outnumber people.",
+            "Sloths can hold their breath longer than dolphins.",
+            "The shortest war in history lasted 38 to 45 minutes (Anglo-Zanzibar War).",
+            "You can hear a blue whale's heartbeat from over 2 miles away.",
+            "Butterflies can taste with their feet.",
+            "A day on Earth was once only 6 hours long in the distant past.",
+            ];
+        let sentences = sentences.map(|s| s.to_string());
+
+        let query = "what wash the shortest war ever?";
+        for _ in 0..2 {
+            let scores =
+                warp::score_query_sentences(&embedder, &mut cache, &query.to_string(), &sentences).unwrap();
+            let mut max = -1.0f32;
+            let mut i_max = 0usize;
+            for (i, score) in scores.iter().enumerate() {
+                println!("score {score}");
+                if *score > max {
+                    max = *score;
+                    i_max = i ;
+                }
+            }
+            assert!(i_max == 3);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_embedder_without_assets() -> std::io::Result<()> {
+        let device = warp::make_device();
+        let assets = std::path::PathBuf::from("assets.notfound");
+        match warp::Embedder::new(&device, &assets) {
+            Ok(_embedder) => {
+                unreachable!("should fail to create embedder without assets!");
+            }
+            Err(_v) => {}
+        };
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_bad_db_path() -> std::io::Result<()> {
+        let badpath = std::path::PathBuf::from("/unknown/db/xxx");
+        match DB::new_reader(badpath) {
+            Ok(_db) => {
+                unreachable!("should fail to create read-only db from bad path!");
+            }
+            Err(_v) => {}
+        };
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_corrupted_db() -> std::io::Result<()> {
+        use std::io::Write;
+        let tmp = Builder::new().prefix("warp-").suffix(".db").tempfile()?;
+        let (mut file, path): (std::fs::File, PathBuf) = tmp.keep()?;
+        let foo: u32 = 0xfede_abe0;
+        file.write_all(&foo.to_le_bytes())?;
+        file.flush()?;
+        let mut db = DB::new(path.to_path_buf()).unwrap();
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+}
+

@@ -146,3 +146,16 @@ and build with
 ```
 make win
 ```
+
+## Unit tests and Code Coverage
+
+```
+cargo install cargo-nextest
+cargo install cargo-llvm-cov
+cargo install llvm-tools-preview
+make test
+```
+
+NOTICE that nextest is necessary, simply using "cargo test" will lead
+to random test failures, because individual tests run in the same process,
+leading to "history effects".

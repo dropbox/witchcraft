@@ -150,6 +150,7 @@ fn main() -> Result<()> {
     let embedder = warp::Embedder::new(&device, &assets).unwrap();
     let mut cache = warp::EmbeddingsCache::new(1);
     let db_name = "mydb.sqlite";
+    let db_name = std::path::PathBuf::from(db_name);
 
     if args.len() == 3 && args[1] == "readcsv" {
         let mut db = DB::new(db_name).unwrap();
