@@ -23,23 +23,41 @@ impl DB {
         })
     }
 
+
     pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
+        const APP_ID: i32 = 0x07DB_DA55;
+        const EXPECTED_VERSION: i32 = 1;
+
         let connection = Connection::open(&db_fn)?;
+
         let status: SQLResult<String> =
             connection.query_row("PRAGMA quick_check;", [], |row| row.get(0));
         let db_ok = match status {
             Ok(text) => text.trim().eq_ignore_ascii_case("ok"),
             Err(_e) => false,
         };
-        let connection = if db_ok {
+
+        // check app_id and user_version
+        let app_id: SQLResult<i32> = connection.query_row("PRAGMA application_id;", [], |r| r.get(0));
+        let user_version: SQLResult<i32> =
+            connection.query_row("PRAGMA user_version;", [], |r| r.get(0));
+
+        let schema_ok = matches!((app_id, user_version),
+            (Ok(a), Ok(v)) if a == APP_ID && v == EXPECTED_VERSION && a != 0 && v != 0
+        );
+
+        let connection = if db_ok && schema_ok {
             connection
         } else {
-            warn!("warp database corrupted, recreating it!");
+            warn!("warp database corrupted or schema mismatch, recreating it!");
             connection.close().map_err(|(_conn, e)| e)?;
-            std::fs::remove_file(&db_fn).map_err(|_e| {
-                rusqlite::Error::InvalidPath(db_fn.clone())
-            })?;
-            Connection::open(&db_fn)?
+            std::fs::remove_file(&db_fn)
+                .map_err(|_e| rusqlite::Error::InvalidPath(db_fn.clone()))?;
+            let _ = std::fs::remove_file(db_fn.with_extension("wal"));
+            let _ = std::fs::remove_file(db_fn.with_extension("shm"));
+            let connection = Connection::open(&db_fn)?;
+            connection.execute_batch(&format!("PRAGMA application_id = {APP_ID}; PRAGMA user_version = {EXPECTED_VERSION}"))?;
+            connection
         };
 
         //connection
