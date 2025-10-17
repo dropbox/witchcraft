@@ -26,7 +26,7 @@ impl DB {
 
     pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
         const APP_ID: i32 = 0x07DB_DA55;
-        const EXPECTED_VERSION: i32 = 1;
+        const EXPECTED_VERSION: i32 = 2;
 
         let connection = Connection::open(&db_fn)?;
 
@@ -70,7 +70,8 @@ impl DB {
             date TEXT NOT NULL,
             metadata JSON, hash TEXT
             CHECK (length(hash) = {HASH_CHARS}),
-            body TEXT)"
+            body TEXT,
+            lens TEXT)"
         );
         connection.execute(&query, ())?;
 
@@ -90,7 +91,8 @@ impl DB {
             "CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY
             CHECK (length(hash) = {HASH_CHARS}),
             model TEXT,
-            embeddings BLOB NOT NULL)"
+            embeddings BLOB NOT NULL,
+            counts TEXT NOT NULL)"
         );
         connection.execute(&query, ())?;
 
@@ -198,18 +200,38 @@ impl DB {
         date: Option<Timestamp>,
         metadata: &str,
         body: &str,
+        lens: Option<Vec<usize>>,
     ) -> SQLResult<()> {
+
+        let lens = match lens {
+            Some(lens) => lens,
+            None => [body.chars().count()].to_vec()
+        };
+
+        let total: usize = lens.iter().copied().sum();
+        if total != body.chars().count() {
+            warn!("bad length: [{} vs {}]", total, body.chars().count());
+        }
+
+        let lens = lens
+            .iter()
+            .map(|len| len.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
         let mut hasher = Sha256::new();
         hasher.update(&body);
+        hasher.update(&lens);
         let hash = format!("{:x}", hasher.finalize());
         let hash = &hash[..HASH_CHARS];
+
         let date = date.unwrap_or_else(Timestamp::now_utc);
 
         self.connection.execute(
-            "INSERT INTO document VALUES(?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO document VALUES(?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(uuid) DO UPDATE SET
-                date = ?2, metadata = ?3, hash = ?4, body = ?5",
-            (&uuid.to_string(), date.to_string(), metadata, &hash, &body),
+                date = ?2, metadata = ?3, hash = ?4, body = ?5, lens = ?6",
+            (&uuid.to_string(), date.to_string(), metadata, &hash, &body, &lens),
         )?;
         self.remove_on_shutdown = false;
         Ok(())
@@ -221,10 +243,16 @@ impl DB {
         Ok(())
     }
 
-    pub fn add_chunk(self: &Self, hash: &str, model: &str, embeddings: &Vec<u8>) -> SQLResult<()> {
+    pub fn add_chunk(
+        self: &Self,
+        hash: &str,
+        model: &str,
+        embeddings: &Vec<u8>,
+        counts: &str,
+    ) -> SQLResult<()> {
         self.connection.execute(
-            "INSERT OR IGNORE INTO chunk VALUES(?1, ?2, ?3)",
-            (&hash, &model, embeddings),
+            "INSERT OR IGNORE INTO chunk VALUES(?1, ?2, ?3, ?4)",
+            (&hash, &model, embeddings, counts),
         )?;
         Ok(())
     }

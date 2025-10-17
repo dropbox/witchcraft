@@ -2,9 +2,7 @@ use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 use rusqlite::Statement;
 use std::collections::HashMap;
-use std::mem::size_of;
 use std::sync::RwLock;
-
 //mod t5;
 //use t5 as t5_encoder;
 
@@ -126,6 +124,67 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(
     Ok((centers, cluster_assignments))
 }
 
+fn compress_keys(keys: &[(u32, u32)]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(keys.len() * 8);
+    let mut iter = keys.iter();
+
+    // Store first key as-is
+    if let Some(&(major, minor)) = iter.next() {
+        bytes.extend_from_slice(&major.to_ne_bytes());
+        bytes.extend_from_slice(&minor.to_ne_bytes());
+
+        let mut base = (major, minor);
+
+        for &(major, minor) in iter {
+            let delta_major = major - base.0;
+            let delta_minor = if delta_major == 0 {
+                minor - base.1
+            } else {
+                minor
+            };
+
+            bytes.extend_from_slice(&delta_major.to_ne_bytes());
+            bytes.extend_from_slice(&delta_minor.to_ne_bytes());
+
+            base = (major, minor);
+        }
+    }
+
+    lz4_flex::block::compress_prepend_size(&bytes)
+}
+
+fn decompress_keys(bytes: &[u8]) -> Result<Vec<(u32, u32)>> {
+    let decompressed = lz4_flex::block::decompress_size_prepended(bytes)?;
+    let mut keys = Vec::with_capacity(decompressed.len() / 8);
+    let mut chunks = decompressed.chunks_exact(8);
+
+    // decode first key as absolute
+    if let Some(chunk) = chunks.next() {
+        let major = u32::from_ne_bytes(chunk[0..4].try_into()?);
+        let minor = u32::from_ne_bytes(chunk[4..8].try_into()?);
+
+        let mut base = (major, minor);
+        keys.push(base);
+
+        for chunk in chunks {
+            let delta_major = u32::from_ne_bytes(chunk[0..4].try_into()?);
+            let delta_minor = u32::from_ne_bytes(chunk[4..8].try_into()?);
+
+            let major = base.0.wrapping_add(delta_major);
+            let minor = if delta_major == 0 {
+                base.1.wrapping_add(delta_minor)
+            } else {
+                delta_minor
+            };
+
+            base = (major, minor);
+            keys.push(base);
+        }
+    }
+
+    Ok(keys)
+}
+
 fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     let mut mmuls_total = 0;
     let mut writes_total = 0;
@@ -136,14 +195,14 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     assert!(embeddings_count > 0);
     let bar = progress::new(embeddings_count as u64);
 
-    //let mut document_indices = vec![];
-    let mut document_indices = Vec::<u32>::new();
+    let mut document_indices = Vec::<(u32, u32)>::new();
     let mut all_chunkids = vec![];
     let mut all_embeddings = vec![];
 
     let mut query = db.query(
-        "SELECT document.rowid,chunk.rowid,chunk.embeddings FROM document,chunk
-        WHERE document.hash = chunk.hash",
+        "SELECT document.rowid,chunk.rowid,chunk.embeddings,chunk.counts FROM document,chunk
+        WHERE document.hash = chunk.hash
+        ORDER BY document.rowid",
     )?;
 
     let mut results = query.query_map((), |row| {
@@ -151,6 +210,7 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
             row.get::<_, u32>(0)?,
             row.get::<_, u32>(1)?,
             row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
 
@@ -161,15 +221,21 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     while !done {
         match results.next() {
             Some(result) => {
-                let (id, chunkid, embeddings) = result?;
+                let (id, chunkid, embeddings, counts) = result?;
+
                 let t = Tensor::from_q8_bytes(&embeddings, EMBEDDING_DIM, &Device::Cpu)?
                     .dequantize(8)?
                     .l2_normalize()?;
                 let split = split_tensor(&t);
                 let m = split.len();
-                for _ in 0..m {
-                    document_indices.push(id as u32);
-                }
+
+                for (i, count) in counts
+                    .split(',')
+                    .filter_map(|s| s.parse::<u32>().ok()).enumerate() {
+                        for _ in 0..count {
+                            document_indices.push((id, i as u32));
+                        }
+                    }
                 all_chunkids.push(chunkid);
                 all_embeddings.extend(split);
                 batch += m;
@@ -206,10 +272,9 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
                 .collect();
             pairs.sort_by_key(|&(_, bucket)| bucket);
 
-            let mut indices_bytes: Vec<u8> = Vec::with_capacity(take * 4);
+            let mut keys: Vec<(u32, u32)> = Vec::with_capacity(take);
             let mut residuals_bytes: Vec<u8> = Vec::with_capacity(take * 64);
             let (_, mut prev_bucket) = pairs[0];
-            let mut count = 0;
             let mut bucket_done = false;
 
             for i in 0.. {
@@ -220,27 +285,25 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
                     (0, std::u32::MAX)
                 };
 
-                if (bucket != prev_bucket || bucket_done) && count > 0 {
+                if (bucket != prev_bucket || bucket_done) && keys.len() > 0 {
                     assert!(prev_bucket < bucket);
-                    writer.write_record(prev_bucket, count, &indices_bytes, &residuals_bytes)?;
+                    writer.write_record(prev_bucket, &keys, &residuals_bytes)?;
 
-                    indices_bytes.clear();
+                    keys.clear();
                     residuals_bytes.clear();
                     prev_bucket = bucket;
-                    count = 0;
                 }
 
                 if bucket_done {
                     break;
                 }
 
-                let doc_idx = indices[sample];
-                indices_bytes.extend_from_slice(&doc_idx.to_ne_bytes());
+                keys.push(indices[sample]);
+
                 let center = centers_cpu.get(bucket as usize)?;
                 let residual = (embeddings[sample].get(0) - &center)?;
                 let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
                 residuals_bytes.extend(&residual_quantized);
-                count += 1;
             }
             tmpfiles.push(writer.finish()?);
             writes_total += now.elapsed().as_millis();
@@ -267,11 +330,12 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
                 let entry = result?;
                 let center = centers_cpu.get(entry.value as usize)?;
                 let center_bytes = center.to_f32_bytes()?;
+                let compressed_keys = compress_keys(&entry.keys);
                 db.add_bucket(
                     entry.value,
                     next_generation,
                     &center_bytes,
-                    &entry.tags,
+                    &compressed_keys,
                     &entry.data,
                 )?;
             }
@@ -310,8 +374,8 @@ pub fn fulltext_search(
     q: &String,
     top_k: usize,
     sql_filter: Option<&str>,
-) -> Result<Vec<(f32, u32)>> {
-    let mut fts_idxs = vec![];
+) -> Result<Vec<(f32, u32, String)>> {
+    let mut fts_matches = vec![];
 
     let mut last_is_space = false;
     for c in q.chars() {
@@ -329,7 +393,8 @@ pub fn fulltext_search(
 
     let sql = if q.len() > 0 {
         format!(
-            "SELECT document.rowid,bm25(document_fts) AS score
+            "SELECT document.rowid, snippet(document_fts,-1, '<em>','</em>','...',15),
+            bm25(document_fts) AS score
             FROM document,document_fts
             WHERE document.rowid = document_fts.rowid
             AND document_fts MATCH ?1 {filter}
@@ -338,7 +403,7 @@ pub fn fulltext_search(
         )
     } else {
         format!(
-            "SELECT rowid,0.0
+            "SELECT rowid,\"\",0.0
             FROM document
             WHERE ?1 = ?1 {filter}
             ORDER BY date DESC
@@ -353,17 +418,20 @@ pub fn fulltext_search(
     };
 
     let mut query = db.query(&sql)?;
-    let results = query.query_map((&q, top_k), |row| Ok((
-        row.get::<_, u32>(0)?,
-        row.get::<_, f32>(1)?,
-    )))?;
+    let results = query.query_map((&q, top_k), |row| {
+        Ok((
+            row.get::<_, u32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f32>(2)?
+        ))
+    })?;
     for result in results {
-        let (rowid, score) = result?;
+        let (rowid, snippet, score) = result?;
         let score2 = bm25_to_cosine_approx(score);
-        fts_idxs.push((score2, rowid));
+        fts_matches.push((score2, rowid, snippet));
     }
-    info!("full text found {} matches", fts_idxs.len());
-    Ok(fts_idxs)
+    info!("full text found {} matches", fts_matches.len());
+    Ok(fts_matches)
 }
 
 pub fn reciprocal_rank_fusion(list1: &[u32], list2: &[u32], k: f64) -> Vec<u32> {
@@ -484,7 +552,7 @@ pub fn match_centroids(
     threshold: f32,
     top_k: usize,
     sql_filter: Option<&str>,
-) -> Result<Vec<(f32, u32)>> {
+) -> Result<Vec<(f32, u32, u32)>> {
     let max_generation = db
         .query("SELECT MAX(generation) FROM indexed_chunk")?
         .query_row((), |row| Ok(row.get::<_, u32>(0)?))
@@ -550,14 +618,14 @@ pub fn match_centroids(
         let now = std::time::Instant::now();
 
         for i in topk_clusters {
-            let (document_indices, document_embeddings) = bucket_query
+            let (keys_compressed, document_embeddings) = bucket_query
                 .query_row((max_generation, cluster_ids[i as usize]), |row| {
                     Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })?;
 
             match centers.get(i as usize) {
                 Some(center) => {
-                    let document_indices = u8_to_vec_u32(&document_indices);
+                    let document_indices = decompress_keys(&keys_compressed)?;
 
                     //let residuals = Tensor::from_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?.dequantize(4)?.inv_compand()?;
                     let residuals = Tensor::from_companded_q4_bytes(
@@ -611,7 +679,8 @@ pub fn match_centroids(
           FROM indexed_chunk AS i
           WHERE i.chunkid = c.rowid
             AND i.generation = ?1
-        )",
+        )
+        ORDER BY d.rowid",
     )?;
 
     let results = unindexed_chunks_query.query_map((max_generation,), |row| {
@@ -625,7 +694,8 @@ pub fn match_centroids(
         let (m, _) = embeddings.dims2()?;
         all_document_embeddings.push(embeddings);
         for _ in 0..m {
-            all.push((id, count));
+            let key = (id, 0);
+            all.push((key, count));
             count += 1;
         }
         num_unindexed += m;
@@ -670,22 +740,51 @@ pub fn match_centroids(
     );
 
     let now = std::time::Instant::now();
-    let mut current = vec![0.0f32; n];
+    let mut scores = vec![0.0f32; n];
+    let mut sub_scores = vec![0.0f32; n];
+    scores.copy_from_slice(&missing_similarities);
+    sub_scores.copy_from_slice(&missing_similarities);
 
     let mut unique_docs = 0;
     let mut prev_idx = u32::MAX;
     let mut all_scored = vec![];
 
+    let mut prev_sub_idx = u32::MAX;
+    let mut max_sub_score = -1.0f32;
+    let mut i_max_sub_score = 0;
+
+    let scaler = 1.0f32 / n as f32;
     for i in 0.. {
+
+        let ((idx, sub_idx), pos) = all[i];
+
         let is_last = i == all.len() - 1;
-        let (idx, pos) = all[i];
-        if i > 0 && (prev_idx != idx || is_last) {
-            unique_docs += 1;
-            let sum: f32 = current.iter().copied().sum();
-            let score = sum / (n as f32);
-            if score > cutoff {
-                all_scored.push((prev_idx, score));
+
+        let idx_change = prev_idx != idx;
+        let sub_idx_change = idx_change || prev_sub_idx != sub_idx;
+
+        if i > 0 {
+
+            if sub_idx_change || is_last {
+                let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
+                if sub_score > max_sub_score {
+                    max_sub_score = sub_score;
+                    i_max_sub_score = prev_sub_idx;
+                }
+                sub_scores.copy_from_slice(&missing_similarities);
             }
+
+            if idx_change || is_last {
+                unique_docs += 1;
+                let score = scaler * (scores.iter().copied().sum::<f32>());
+                if score > cutoff {
+                    all_scored.push((prev_idx, score, i_max_sub_score));
+                }
+                max_sub_score = -1.0f32;
+                i_max_sub_score = 0;
+                scores.copy_from_slice(&missing_similarities);
+            }
+
         }
 
         if is_last {
@@ -693,12 +792,13 @@ pub fn match_centroids(
         }
 
         let row = row_at(pos);
-        if prev_idx != idx {
-            current.copy_from_slice(&missing_similarities);
-        }
-        vmax_inplace(&mut current, row);
+        vmax_inplace(&mut scores, row);
+        vmax_inplace(&mut sub_scores, row);
 
+        assert!(i == 0 || prev_idx <= idx);
+        assert!(i == 0 || (prev_idx != idx || prev_sub_idx <= sub_idx));
         prev_idx = idx;
+        prev_sub_idx = sub_idx;
     }
     debug!(
         "scoring {} documents into {} candidates took {} ms.",
@@ -708,22 +808,22 @@ pub fn match_centroids(
     );
 
     let now = std::time::Instant::now();
-    db.execute("CREATE TEMPORARY TABLE temp2(rowid INTEGER PRIMARY KEY, score FLOAT)")?;
-    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2)")?;
+    db.execute("CREATE TEMPORARY TABLE temp2(rowid INTEGER PRIMARY KEY, score FLOAT, sub_idx INTEGER)")?;
+    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
 
-    for (idx, score) in all_scored.iter() {
-        let _ = insert_temp_query.execute((idx, score));
+    for (idx, score, sub_idx) in all_scored.iter() {
+        let _ = insert_temp_query.execute((idx, score, sub_idx));
     }
 
     let sql = format!(
-        "SELECT score,document.rowid
+        "SELECT score,document.rowid,sub_idx
         FROM document,temp2
         WHERE document.rowid = temp2.rowid
         {}
         ORDER BY score DESC
         LIMIT ?1",
         match sql_filter {
-            Some(filter) => format!("AND {filter}"),
+            Some(filter) => format!("WHERE {filter}"),
             _ => String::new(),
         }
     );
@@ -731,7 +831,11 @@ pub fn match_centroids(
     let mut scored_documents_query = db.query(&sql)?;
     let results = scored_documents_query
         .query_map((top_k,), |row| {
-            Ok((row.get::<_, f32>(0)?, row.get::<_, u32>(1)?))
+            Ok((
+                row.get::<_, f32>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, u32>(2)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     db.execute("DROP TABLE temp2")?;
@@ -757,7 +861,7 @@ fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
 }
 
 pub struct Gatherer<'a> {
-    documents: Box<dyn Iterator<Item = (String, String)> + 'a>,
+    documents: Box<dyn Iterator<Item = (String, String, String)> + 'a>,
     embedder: &'a Embedder,
 }
 
@@ -765,7 +869,11 @@ impl<'a> Gatherer<'a> {
     fn new(stmt: &'a mut Statement, embedder: &'a Embedder) -> Self {
         let documents = Box::new(
             stmt.query_map((), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                ))
             })
             .unwrap()
             .map(Result::unwrap),
@@ -779,13 +887,13 @@ impl<'a> Gatherer<'a> {
 }
 
 impl<'a> Iterator for Gatherer<'a> {
-    type Item = (String, Tensor);
+    type Item = (String, Tensor, Vec<u32>);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.documents.next() {
-            Some((hash, body)) => {
+            Some((hash, body, lens)) => {
                 let now = std::time::Instant::now();
-                let embeddings = self.embedder.embed(&body).unwrap();
+                let (embeddings, offsets) = self.embedder.embed(&body).unwrap();
                 let embeddings = embeddings
                     .squeeze(0)
                     .unwrap()
@@ -798,31 +906,69 @@ impl<'a> Iterator for Gatherer<'a> {
                     now.elapsed().as_millis(),
                     ((m as f64) / dt).round()
                 );
-                Some((hash, embeddings))
+
+                let mut lengths: Vec<usize> = lens
+                    .split(',')
+                    .filter_map(|s| s.parse::<usize>().ok())
+                    .collect();
+                for i in 1..lengths.len() {
+                    lengths[i] += lengths[i - 1];
+                }
+
+                let mut i = 0;
+                let mut j = 0;
+
+                let i_end = offsets.len();
+                let j_end = lengths.len();
+                let mut count: u32 = 0;
+                let mut done = false;
+                let mut flush = false;
+                let mut counts = vec!();
+
+                while !done {
+
+                    let o = if i < offsets.len() {
+                        offsets[i].1
+                    } else {
+                        std::usize::MAX
+                    };
+
+                    let l = if j < lengths.len() {
+                        lengths[j]
+                    } else {
+                        std::usize::MAX
+                    };
+
+                    if o <= l {
+                        i += 1;
+                        count += 1;
+                    } else {
+                        j += 1;
+                        flush = true;
+                    }
+
+                    done = i == i_end && j == j_end;
+
+                    if flush || done {
+                        counts.push(count);
+                        count = 0;
+                        flush = false;
+                    }
+
+                }
+                assert!(count == 0);
+                assert!(counts.iter().sum::<u32>() == offsets.len() as u32);
+                Some((hash, embeddings, counts))
             }
             None => None,
         }
     }
 }
 
-fn u8_to_vec_u32(bytes: &[u8]) -> Vec<u32> {
-    let u32_size = size_of::<u32>();
-
-    assert!(bytes.len() % u32_size == 0);
-    let total_u32s = bytes.len() / u32_size;
-
-    let mut u32s = Vec::with_capacity(total_u32s);
-    for chunk in bytes.chunks_exact(u32_size) {
-        let arr: [u8; 4] = chunk.try_into().unwrap();
-        u32s.push(u32::from_ne_bytes(arr));
-    }
-    u32s
-}
-
 pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
     let sql = format!(
         "SELECT
-        document.hash,document.body
+        document.hash,document.body,document.lens
         FROM document
         LEFT JOIN chunk ON document.hash = chunk.hash
         WHERE chunk.hash IS NULL
@@ -837,16 +983,22 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
 
     let embedding_iter = Gatherer::new(&mut query, embedder);
     let mut count = 0;
-    for (hash, embeddings) in embedding_iter {
-        debug!(
-            "got embedding for chunk with hash {} {:?}",
+    for (hash, embeddings, counts) in embedding_iter {
+        info!(
+            "got embedding for chunk with hash {} {:?} {:?}",
             hash,
-            embeddings.dims2()?
+            embeddings.dims2()?,
+            counts,
         );
 
         let bytes = embeddings.stretch_rows()?.quantize(8)?.to_q8_bytes()?;
+        let counts = counts
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
-        match db.add_chunk(&hash, "xtr-base-en", &bytes) {
+        match db.add_chunk(&hash, "xtr-base-en", &bytes, &counts) {
             Ok(()) => {
                 count += 1;
             }
@@ -958,7 +1110,7 @@ pub fn search(
     top_k: usize,
     use_fulltext: bool,
     sql_filter: Option<&str>,
-) -> Result<Vec<(f32, String, String)>> {
+) -> Result<Vec<(f32, String, String, u32)>> {
     let now = std::time::Instant::now();
 
     let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -969,11 +1121,17 @@ pub fn search(
         [].to_vec()
     };
 
+    let mut fts_snippets: HashMap<u32, String> = HashMap::new();
+    for (_score, idx, snippet) in &fts_matches {
+        fts_snippets.insert(*idx, snippet.clone());
+    }
+
     let sem_matches = if q.len() > 3 {
         let qe = match cache.get(&q) {
             Some(existing) => existing,
             None => {
-                let qe = embedder.embed(&q)?.get(0)?;
+                let (qe, _) = embedder.embed(&q)?;
+                let qe = qe.get(0)?;
                 cache.put(&q, &qe);
                 qe
             }
@@ -990,18 +1148,20 @@ pub fn search(
     };
 
     let mut scores: HashMap<u32, f32> = HashMap::new();
-    for (score, idx) in &sem_matches {
+    let mut offsets: HashMap<u32, u32> = HashMap::new();
+    for (score, idx, offset) in &sem_matches {
         scores.insert(*idx, *score);
+        offsets.insert(*idx, *offset);
     }
-    for (score, idx) in &fts_matches {
+    for (score, idx, _snippet) in &fts_matches {
         scores.insert(*idx, *score);
     }
 
-    let fts_idxs: Vec<u32> = fts_matches.iter().map(|&(_, idx)| idx).collect();
-    let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
+    let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx, _)| idx).collect();
     info!("semantic search found {} matches", sem_idxs.len());
 
     let mut fused = if use_fulltext {
+        let fts_idxs: Vec<u32> = fts_matches.iter().map(|&(_, idx, _)| idx).collect();
         reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
     } else {
         sem_idxs
@@ -1016,13 +1176,21 @@ pub fn search(
             None => 0.0f32,
         };
         let (metadata, body) = body_query.query_row((idx,), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
         })?;
-        results.push((score, metadata, body));
+
+        let body_idx = match offsets.get(&idx) {
+            Some(offset) => *offset,
+            None => 0u32
+        };
+        results.push((score, metadata, body, body_idx));
     }
 
     let mut max = -1.0f32;
-    for (score, _metadata, _body) in results.iter_mut().rev() {
+    for (score, _, _, _) in results.iter_mut().rev() {
         max = max.max(*score);
         *score = max;
     }
@@ -1046,15 +1214,16 @@ pub fn score_query_sentences(
             existing
         }
         None => {
-            let qe = embedder.embed(&q)?.get(0)?;
-            cache.put(&q, &qe);
+            let (qe, _offsets) = embedder.embed(&q)?;
+            let qe = qe.get(0)?;
             qe
         }
     };
     let mut sizes = vec![];
     let mut ses = vec![];
     for s in sentences.iter() {
-        let se = embedder.embed(&s)?.get(0)?;
+        let (se, _offsets) = embedder.embed(&s)?;
+        let se = se.get(0)?;
         let split = split_tensor(&se);
         sizes.push(split.len());
         ses.extend(split);
@@ -1081,6 +1250,52 @@ pub fn score_query_sentences(
         now.elapsed().as_millis()
     );
     Ok(scores)
+}
+
+/*
+pub fn split_by_codepoints<'a>(s: &'a str, lengths: &[usize]) -> Result<Vec<&'a str>, String> {
+    // Precompute byte indices of every char boundary: [0, b1, b2, ..., s.len()]
+    let mut boundaries: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+    boundaries.push(s.len());
+    let char_len = boundaries.len() - 1;
+
+    let sum_chars: usize = lengths.iter().copied().sum();
+    if sum_chars != char_len {
+        return Err(format!("lengths sum ({}) != char count ({})", sum_chars, char_len));
+    }
+
+    let mut parts = Vec::with_capacity(lengths.len());
+    let mut pos = 0usize; // index into `boundaries` (in chars)
+
+    for &chunk_chars in lengths {
+        let start_byte = boundaries[pos];
+        let end_pos = pos + chunk_chars;
+        let end_byte = boundaries[end_pos];
+        // Slicing on these byte indices is always valid by construction.
+        parts.push(&s[start_byte..end_byte]);
+        pos = end_pos;
+    }
+
+    Ok(parts)
+}
+*/
+#[test]
+fn test_compress_decompress_keys_roundtrip() {
+    let test_cases = vec![
+        vec![],
+        vec![(1, 1)],
+        vec![(1, 1), (1, 3), (2, 0), (2, 1)],
+        vec![(10, 0), (10, 1), (10, 2), (11, 0)],
+        vec![(1, 2), (1, 2), (1, 2), (2, 2)],
+        vec![(0, 0)],
+        vec![],
+    ];
+
+    for original in test_cases {
+        let compressed = compress_keys(&original);
+        let decompressed = decompress_keys(&compressed).unwrap();
+        assert_eq!(original, decompressed);
+    }
 }
 
 #[cfg(test)]

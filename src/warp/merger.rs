@@ -4,7 +4,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use tempfile::NamedTempFile;
 
 //
-// Writer: constructs mergeable files using NamedTempFile
+// Writer
 //
 pub struct Writer {
     file: NamedTempFile,
@@ -18,23 +18,18 @@ impl Writer {
         Ok(Self { file, writer })
     }
 
-    pub fn write_record(
-        &mut self,
-        value: u32,
-        count: u32,
-        tags: &[u8],
-        data: &[u8],
-    ) -> io::Result<()> {
-        if tags.len() != count as usize * 4 || data.len() != count as usize * 64 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "mismatched lengths",
-            ));
+    pub fn write_record(&mut self, value: u32, keys: &[(u32, u32)], data: &[u8]) -> io::Result<()> {
+        let count = keys.len() as u32;
+        if data.len() != count as usize * 64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "data length must be count * 64"));
         }
 
         self.writer.write_all(&value.to_ne_bytes())?;
         self.writer.write_all(&count.to_ne_bytes())?;
-        self.writer.write_all(tags)?;
+        for &(major, minor) in keys {
+            self.writer.write_all(&major.to_ne_bytes())?;
+            self.writer.write_all(&minor.to_ne_bytes())?;
+        }
         self.writer.write_all(data)?;
         Ok(())
     }
@@ -46,11 +41,11 @@ impl Writer {
 }
 
 //
-// Merger: performs in-place n-way merge from tempfiles, emits merged records
+// Merger
 //
 pub struct MergedEntry {
     pub value: u32,
-    pub tags: Vec<u8>,
+    pub keys: Vec<(u32, u32)>,
     pub data: Vec<u8>,
 }
 
@@ -69,10 +64,7 @@ impl Merger {
         let mut heap = BinaryHeap::new();
         for (i, reader) in readers.iter_mut().enumerate() {
             if let Some(record) = read_record(reader)? {
-                heap.push(HeapEntry {
-                    record,
-                    source_index: i,
-                });
+                heap.push(HeapEntry { record, source: i });
             }
         }
 
@@ -85,7 +77,8 @@ impl Iterator for Merger {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.heap.pop()?;
-        let mut combined_tags = current.record.tags;
+
+        let mut combined_keys = current.record.keys;
         let mut combined_data = current.record.data;
 
         while let Some(next) = self.heap.peek() {
@@ -93,52 +86,56 @@ impl Iterator for Merger {
                 break;
             }
 
-            let HeapEntry {
-                record,
-                source_index,
-            } = self.heap.pop().unwrap();
-            combined_tags.extend(record.tags);
-            combined_data.extend(record.data);
+            let next = self.heap.pop().unwrap();
+            combined_keys.extend(next.record.keys);
+            combined_data.extend(next.record.data);
 
-            match read_record(&mut self.readers[source_index]) {
-                Ok(Some(following)) => self.heap.push(HeapEntry {
-                    record: following,
-                    source_index,
-                }),
-                Ok(None) => (),
+            if let Some(record) = match read_record(&mut self.readers[next.source]) {
+                Ok(Some(r)) => Some(r),
+                Ok(None) => None,
                 Err(e) => return Some(Err(e)),
+            } {
+                self.heap.push(HeapEntry { record, source: next.source });
             }
         }
 
-        match read_record(&mut self.readers[current.source_index]) {
-            Ok(Some(next_record)) => self.heap.push(HeapEntry {
-                record: next_record,
-                source_index: current.source_index,
-            }),
-            Ok(None) => (),
+        if let Some(record) = match read_record(&mut self.readers[current.source]) {
+            Ok(Some(r)) => Some(r),
+            Ok(None) => None,
             Err(e) => return Some(Err(e)),
+        } {
+            self.heap.push(HeapEntry { record, source: current.source });
         }
+
+        // Sort keys and align data rows
+        let mut keyed_data: Vec<_> = combined_keys
+            .into_iter()
+            .zip(combined_data.chunks_exact(64).map(|c| c.to_vec()))
+            .collect();
+
+        keyed_data.sort_by_key(|(k, _)| *k);
+        let (sorted_keys, sorted_data): (Vec<_>, Vec<_>) = keyed_data.into_iter().unzip();
 
         Some(Ok(MergedEntry {
             value: current.record.value,
-            tags: combined_tags,
-            data: combined_data,
+            keys: sorted_keys,
+            data: sorted_data.concat(),
         }))
     }
 }
 
 //
-// Internal record and heap management
+// Internal Record Reading
 //
 struct Record {
     value: u32,
-    tags: Vec<u8>,
+    keys: Vec<(u32, u32)>,
     data: Vec<u8>,
 }
 
 struct HeapEntry {
     record: Record,
-    source_index: usize,
+    source: usize,
 }
 
 impl Ord for HeapEntry {
@@ -169,13 +166,19 @@ fn read_record(reader: &mut BufReader<File>) -> io::Result<Option<Record>> {
     reader.read_exact(&mut buf4)?;
     let count = u32::from_ne_bytes(buf4);
 
-    let mut tags = vec![0u8; count as usize * 4];
-    reader.read_exact(&mut tags)?;
+    let mut keys = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let mut major = [0u8; 4];
+        let mut minor = [0u8; 4];
+        reader.read_exact(&mut major)?;
+        reader.read_exact(&mut minor)?;
+        keys.push((u32::from_ne_bytes(major), u32::from_ne_bytes(minor)));
+    }
 
     let mut data = vec![0u8; count as usize * 64];
     reader.read_exact(&mut data)?;
 
-    Ok(Some(Record { value, tags, data }))
+    Ok(Some(Record { value, keys, data }))
 }
 
 //
@@ -186,26 +189,85 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_writer_and_merger_with_named_tempfiles() -> io::Result<()> {
+    fn test_writer_merger_sorted_keys() -> io::Result<()> {
         let mut w1 = Writer::new()?;
-        let tags1 = [100u32.to_ne_bytes(), 101u32.to_ne_bytes()].concat();
-        let data1 = vec![0xAA; 2 * 64];
-        w1.write_record(10, 2, &tags1, &data1)?;
+        let keys1 = vec![(2, 3), (5, 1)];
+        let data1 = vec![1u8; 128];
+        w1.write_record(42, &keys1, &data1)?;
         let tf1 = w1.finish()?;
 
         let mut w2 = Writer::new()?;
-        let tags2 = 200u32.to_ne_bytes().to_vec();
-        let data2 = vec![0xBB; 64];
-        w2.write_record(10, 1, &tags2, &data2)?;
+        let keys2 = vec![(1, 9)];
+        let data2 = vec![2u8; 64];
+        w2.write_record(42, &keys2, &data2)?;
         let tf2 = w2.finish()?;
 
         let merger = Merger::from_tempfiles(vec![tf1, tf2])?;
-        let result: Vec<_> = merger.collect::<Result<_, _>>()?;
+        let entries: Vec<_> = merger.collect::<Result<_, _>>()?;
 
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].value, 10);
-        assert_eq!(result[0].tags.len(), 3 * 4);
-        assert_eq!(result[0].data.len(), 3 * 64);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.value, 42);
+        assert_eq!(entry.keys, vec![(1, 9), (2, 3), (5, 1)]);
+        assert_eq!(entry.data.len(), 192);
+        assert_eq!(entry.data[..64], vec![2u8; 64][..]); // key (1,9) should still match data from w2
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_key_sorting_preserves_data_alignment() -> io::Result<()> {
+        let mut w1 = Writer::new()?;
+        let keys1 = vec![(2, 5), (1, 1)];
+        let data1 = [b'A'; 64].into_iter().chain([b'B'; 64]).collect::<Vec<_>>();
+        w1.write_record(100, &keys1, &data1)?;
+        let tf1 = w1.finish()?;
+
+        let mut w2 = Writer::new()?;
+        let keys2 = vec![(3, 0)];
+        let data2 = vec![b'C'; 64];
+        w2.write_record(100, &keys2, &data2)?;
+        let tf2 = w2.finish()?;
+
+        let merger = Merger::from_tempfiles(vec![tf1, tf2])?;
+        let merged: Vec<_> = merger.collect::<Result<_, _>>()?;
+        assert_eq!(merged.len(), 1);
+
+        let m = &merged[0];
+        assert_eq!(m.value, 100);
+        assert_eq!(m.keys, vec![(1, 1), (2, 5), (3, 0)]);
+
+        let rows: Vec<&[u8]> = m.data.chunks_exact(64).collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![b'B'; 64].as_slice()); // (1,1)
+        assert_eq!(rows[1], vec![b'A'; 64].as_slice()); // (2,5)
+        assert_eq!(rows[2], vec![b'C'; 64].as_slice()); // (3,0)
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_merger_with_duplicate_keys() -> io::Result<()> {
+        let mut w = Writer::new()?;
+        let keys = vec![(1, 2), (1, 2), (2, 0)];
+        let data = vec![b'A'; 64]
+            .into_iter()
+            .chain(vec![b'B'; 64])
+            .chain(vec![b'C'; 64])
+            .collect::<Vec<_>>();
+        w.write_record(7, &keys, &data)?;
+        let tf = w.finish()?;
+
+        let merger = Merger::from_tempfiles(vec![tf])?;
+        let entries: Vec<_> = merger.collect::<Result<_, _>>()?;
+        let e = &entries[0];
+
+        assert_eq!(e.keys, vec![(1, 2), (1, 2), (2, 0)]);
+        assert_eq!(e.data.len(), 3 * 64);
+        assert_eq!(&e.data[0..64], vec![b'A'; 64].as_slice());
+        assert_eq!(&e.data[64..128], vec![b'B'; 64].as_slice());
+        assert_eq!(&e.data[128..], vec![b'C'; 64].as_slice());
+
         Ok(())
     }
 }

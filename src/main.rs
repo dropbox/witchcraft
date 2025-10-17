@@ -1,10 +1,12 @@
 use anyhow::Result;
 use csv;
 use log::{Level, LevelFilter, Metadata, Record};
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use text_splitter::TextSplitter;
 use uuid::Uuid;
 
 mod histogram;
@@ -40,6 +42,16 @@ struct CorpusMetaData {
     key: String,
 }
 
+fn split_doc(body: String) -> Vec<String> {
+    let max_characters = 300;
+    let splitter = TextSplitter::new(max_characters);
+    splitter
+        .chunks(&body)
+        .map(|body| format!("{body}\n").to_string())
+        .collect()
+}
+
+
 pub fn read_csv(db: &mut DB, csvname: std::path::PathBuf) -> Result<()> {
     println!("register documents from CSV...");
 
@@ -54,8 +66,12 @@ pub fn read_csv(db: &mut DB, csvname: std::path::PathBuf) -> Result<()> {
         let metadata = CorpusMetaData { key: record.name };
         let metadata = serde_json::to_string(&metadata)?;
         let body = record.body;
+
+        let bodies = split_doc(body.clone());
+        let lens = bodies.iter().map(|b| b.chars().count()).collect();
+        let body = bodies.join("");
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-        db.add_doc(&uuid, None, &metadata, &body).unwrap();
+        db.add_doc(&uuid, None, &metadata, &body, Some(lens)).unwrap();
     }
 
     Ok(())
@@ -86,39 +102,36 @@ pub fn bulk_search(
         let record: (String, String) = result?;
         let key = record.0;
         let question = record.1;
+        let top_k = 100;
 
-        println!("\nSearching for: {}", question);
+        info!("searching for: {}", question);
         let now = std::time::Instant::now();
         let fts_matches = if use_fulltext {
-            warp::fulltext_search(&db, &question, 100, None)?
+            warp::fulltext_search(&db, &question, top_k, None)?
         } else {
             [].to_vec()
         };
 
         let sem_matches = if use_semantic {
             let now = std::time::Instant::now();
-            let qe = embedder.embed(&question)?.get(0)?;
+            let (qe, _offsets) = embedder.embed(&question)?;
+            let qe = qe.get(0)?;
             qe.device().synchronize().unwrap();
             let embedder_latency_ms = now.elapsed().as_millis() as u32;
             embedder_histogram.record(embedder_latency_ms);
-            println!("embedder took {} ms.", now.elapsed().as_millis());
-            warp::match_centroids(&db, &qe, 0.0, 100, None).unwrap()
+            debug!("embedder took {} ms.", now.elapsed().as_millis());
+            warp::match_centroids(&db, &qe, 0.0, top_k, None).unwrap()
         } else {
             [].to_vec()
         };
-        let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
-        if use_semantic {
-            println!("semantic search found {} matches", sem_idxs.len());
-        }
-
-        let fts_idxs: Vec<u32> = fts_matches.iter().map(|&(_, idx)| idx).collect();
-        let fused = if use_fulltext && use_semantic {
+        let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx, _)| idx).collect();
+        let mut fused = if use_fulltext {
+            let fts_idxs: Vec<u32> = fts_matches.iter().map(|&(_, idx, _)| idx).collect();
             warp::reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
-        } else if use_fulltext {
-            fts_idxs
         } else {
             sem_idxs
         };
+        fused.truncate(top_k);
 
         let mut metadatas = vec![];
         for idx in fused {
@@ -127,7 +140,7 @@ pub fn bulk_search(
         }
         let total_ms = now.elapsed().as_millis();
         histogram.record(total_ms.try_into().unwrap());
-        println!("search took {} ms in total", now.elapsed().as_millis());
+        debug!("search took {} ms in total", now.elapsed().as_millis());
 
         write!(writer, "{}\t", key).unwrap();
         for metadata in &metadatas {
@@ -169,8 +182,9 @@ fn main() -> Result<()> {
         let use_fulltext = args[1] == "hybrid";
         let results =
             warp::search(&db, &embedder, &mut cache, &q, 0.75, 10, use_fulltext, None).unwrap();
-        for (score, filename, body) in results {
-            println!("{} : {} : {}", score, filename, body);
+        for (score, _metadata, body, body_idx) in results {
+            println!("{score}: {body} @ {body_idx}");
+            println!("=============================================");
         }
     } else if args.len() >= 4
         && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv")

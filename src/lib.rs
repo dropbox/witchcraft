@@ -148,6 +148,7 @@ enum Job {
         date: Option<Timestamp>,
         metadata: String,
         body: String,
+        lengths: Option<Vec<usize>>,
     },
     Remove {
         uuid: Uuid,
@@ -226,7 +227,8 @@ impl Indexer {
                             date,
                             metadata,
                             body,
-                        } => match db.add_doc(&uuid, date, &metadata, &body) {
+                            lengths,
+                        } => match db.add_doc(&uuid, date, &metadata, &body, lengths) {
                             Ok(()) => {}
                             Err(v) => {
                                 warn!("add_doc failed! {}", v);
@@ -293,13 +295,14 @@ impl Indexer {
             .expect("Indexer not initialized. Call `Indexer::init_global()` first.")
     }
 
-    pub fn add(&self, uuid: Uuid, date: Option<Timestamp>, metadata: String, body: String) {
+    pub fn add(&self, uuid: Uuid, date: Option<Timestamp>, metadata: String, body: String, lengths: Option<Vec<usize>>) {
         if accepting_commands() {
             let _ = self.tx.send(Job::Add {
                 uuid,
                 date,
                 metadata,
                 body,
+                lengths,
             });
         }
     }
@@ -364,7 +367,7 @@ impl WarpInner {
         threshold: f32,
         top_k: usize,
         sql_filter: &String,
-    ) -> Vec<(f32, String, String)> {
+    ) -> Vec<(f32, String, String, u32)> {
         let filter = if !sql_filter.is_empty() {
             Some(sql_filter.as_str())
         } else {
@@ -434,7 +437,7 @@ pub struct SearchTask {
 }
 
 impl<'env> ScopedTask<'env> for SearchTask {
-    type Output = Vec<(f32, String, String)>;
+    type Output = Vec<(f32, String, String, u32)>;
     type JsValue = Object<'env>;
 
     fn compute(&mut self) -> Result<Self::Output> {
@@ -447,11 +450,12 @@ impl<'env> ScopedTask<'env> for SearchTask {
 
     fn resolve(&mut self, env: &'env Env, out: Self::Output) -> Result<Self::JsValue> {
         let mut outer: Array<'env> = env.create_array(out.len() as u32)?;
-        for (i, (score, metadata, body)) in out.into_iter().enumerate() {
+        for (i, (score, metadata, body, idx)) in out.into_iter().enumerate() {
             let mut obj = Object::new(env)?;
             obj.set("score", score as f64)?;
             obj.set("metadata", metadata)?;
             obj.set("body", body)?;
+            obj.set("idx", idx)?;
             outer.set(i as u32, obj)?;
         }
         outer.coerce_to_object()
@@ -533,10 +537,17 @@ impl Warp {
     }
 
     #[napi]
-    pub fn add(&self, uuid: String, date: String, metadata: String, body: String) {
+    pub fn add(&self, uuid: String, date: String, metadata: String, body: String, lengths: Vec<u32>) {
         let uuid = Uuid::parse_str(&uuid).unwrap();
         let date = Timestamp::parse(date.as_str());
-        Indexer::global().add(uuid, date, metadata, body);
+
+        let lengths = if !lengths.is_empty() {
+            Some(lengths.iter().map(|len| *len as usize).collect())
+        } else {
+            None
+        };
+
+        Indexer::global().add(uuid, date, metadata, body, lengths);
     }
 
     #[napi]
