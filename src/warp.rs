@@ -20,6 +20,11 @@ pub mod assets;
 mod packops;
 use packops::TensorPackOps;
 
+mod haarops;
+pub use haarops::TensorHaarOps;
+
+pub mod rans64;
+
 mod merger;
 
 use anyhow::Result;
@@ -223,9 +228,7 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
             Some(result) => {
                 let (id, chunkid, embeddings, counts) = result?;
 
-                let t = Tensor::from_q8_bytes(&embeddings, EMBEDDING_DIM, &Device::Cpu)?
-                    .dequantize(8)?
-                    .l2_normalize()?;
+                let t = Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
                 let split = split_tensor(&t);
                 let m = split.len();
 
@@ -715,9 +718,7 @@ pub fn match_centroids(
     })?;
     for result in results {
         let (id, embeddings) = result?;
-        let embeddings = Tensor::from_q8_bytes(&embeddings, EMBEDDING_DIM, &Device::Cpu)?
-            .dequantize(8)?
-            .l2_normalize()?;
+        let embeddings = Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
         let (m, _) = embeddings.dims2()?;
         all_document_embeddings.push(embeddings);
         for _ in 0..m {
@@ -993,6 +994,49 @@ impl<'a> Iterator for Gatherer<'a> {
     }
 }
 
+#[cfg(debug_assertions)]
+fn rowwise_cosine_min(a: &Tensor, b: &Tensor) -> Result<f32> {
+    let (rows, cols) = a.dims2()?;
+    assert_eq!(b.dims2()?, (rows, cols));
+
+    let dot = (a * b)?.sum(1)?;
+    let norm_a = a.sqr()?.sum(1)?.sqrt()?;
+    let norm_b = b.sqr()?.sum(1)?.sqrt()?;
+    let denom = (&norm_a * &norm_b)?;
+    let cos = (&dot / &denom)?;
+    Ok(cos.min_all()?.to_scalar::<f32>()?)
+}
+
+#[cfg(debug_assertions)]
+fn stretch_rows(a: &Tensor) -> Result<Tensor> {
+    let device = a.device();
+    let (m, n) = a.dims2()?;
+
+    let mut scaled_rows = Vec::with_capacity(m);
+
+    for i in 0..m {
+        let row = a.get(i)?;
+        let v = row.to_vec1::<f32>()?;
+
+        let mut max = std::f32::MIN;
+        for x in &v {
+            let a = (*x).abs();
+            max = if a > max { a } else { max };
+        }
+        let range = max + 1e-6;
+        let scale = 1.0 / range;
+
+        let mut v2 = Vec::with_capacity(n);
+        for i in 0..n {
+            v2.push(scale * v[i]);
+        }
+
+        scaled_rows.push(Tensor::from_vec(v2, n, &device)?);
+    }
+
+    Ok(Tensor::stack(&scaled_rows, 0)?)
+}
+
 pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
     let sql = format!(
         "SELECT
@@ -1019,7 +1063,27 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
             counts,
         );
 
-        let bytes = embeddings.stretch_rows()?.quantize(8)?.to_q8_bytes()?;
+        let now = std::time::Instant::now();
+        let bytes = embeddings.embeddings_to_packed()?;
+        let (rows, cols) = embeddings.dims2()?;
+        let pct = 100.0 * (bytes.len() as f32) / ((rows * cols) as f32);
+        let bpe = 8.0 * (bytes.len() as f32) / ((rows * cols) as f32);
+        debug!(
+            "compressing to {pct:.2}% {bpe:.2}bpe took {} ms.",
+            now.elapsed().as_millis()
+        );
+
+        #[cfg(debug_assertions)]
+        {
+            let t = Tensor::embeddings_from_packed(&bytes, EMBEDDING_DIM, &Device::Cpu)?;
+            let min_acc = rowwise_cosine_min(&embeddings, &t)?;
+
+            let n = bpe.ceil() as u32;
+            let qn = stretch_rows(&embeddings)?.quantize(n)?.dequantize(n)?;
+            let min_qn_acc = rowwise_cosine_min(&embeddings, &qn)?;
+            println!("haar reconstruction accuracy={min_acc} compare at q{n}_acc={min_qn_acc}");
+        }
+
         let counts = counts
             .iter()
             .map(|c| c.to_string())
@@ -1067,7 +1131,7 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     let mut all_embeddings = vec![];
     debug!("read embeddings...");
     for embeddings in kmeans_query.query_map((), |row| Ok(row.get::<_, Vec<u8>>(0)?))? {
-        let t = Tensor::from_q8_bytes(&embeddings?, EMBEDDING_DIM, &Device::Cpu)?;
+        let t = Tensor::embeddings_from_packed(&embeddings?, EMBEDDING_DIM, &Device::Cpu)?;
         let (m, _) = t.dims2()?;
         let k = ((m as f32).sqrt().ceil()) as usize;
         let subset_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
@@ -1077,10 +1141,7 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
         }
         total_embeddings += m;
     }
-    let matrix = Tensor::stack(&all_embeddings, 0)?
-        .to_device(&device)?
-        .dequantize(8)?
-        .l2_normalize()?;
+    let matrix = Tensor::stack(&all_embeddings, 0)?.to_device(&device)?;
 
     let now = std::time::Instant::now();
     let log2_k = (16.0 * (total_embeddings as f64).sqrt()).log(2.0).floor() as u32;
