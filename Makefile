@@ -1,8 +1,8 @@
 env/bin/activate:
-	python3 -m venv env
+	uv venv env
 
 env/bin/transformers-cli: env/bin/activate
-	(source env/bin/activate; pip install -r requirements.txt)
+	(source env/bin/activate; uv pip install -r requirements.txt)
 
 assets:
 	mkdir -p assets
