@@ -1,14 +1,14 @@
-env/bin/activate:
+env/pyvenv.cfg:
 	uv venv env
 
-env/bin/transformers-cli: env/bin/activate
-	(source env/bin/activate; uv pip install -r requirements.txt)
+env/bin/transformers-cli: env/pyvenv.cfg
+	(source env/*/activate; uv pip install -r requirements.txt)
 
 assets:
 	mkdir -p assets
 
 assets/config.json.zst assets/tokenizer.json.zst xtr.safetensors assets/xtr.safetensors.zst: env/bin/transformers-cli
-	(source env/bin/activate; python downloadweights.py)
+	(source env/*/activate; python downloadweights.py)
 
 assets/xtr.gguf.zst: xtr.safetensors
 	cargo run --release --bin quantize-tool xtr.safetensors assets/xtr.gguf.zst
