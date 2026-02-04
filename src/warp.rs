@@ -3,11 +3,26 @@ use once_cell::sync::Lazy;
 use rusqlite::Statement;
 use std::collections::HashMap;
 use std::sync::RwLock;
-//mod t5;
-//use t5 as t5_encoder;
-
+// Conditionally compile T5 encoder based on features
+#[cfg(feature = "t5-quantized")]
 mod quantized_t5;
+#[cfg(feature = "t5-quantized")]
 use quantized_t5 as t5_encoder;
+
+#[cfg(feature = "t5-openvino")]
+mod openvino_t5;
+#[cfg(feature = "t5-openvino")]
+use openvino_t5 as t5_encoder;
+
+// Compile-time checks for mutual exclusivity
+#[cfg(not(any(
+    feature = "t5-quantized",
+    feature = "t5-openvino"
+)))]
+compile_error!("Must enable exactly one T5 backend: t5-quantized or t5-openvino");
+
+#[cfg(all(feature = "t5-quantized", feature = "t5-openvino"))]
+compile_error!("Cannot enable both t5-quantized and t5-openvino");
 
 mod db;
 pub use db::DB;
@@ -984,7 +999,7 @@ impl<'a> Iterator for Gatherer<'a> {
                     .unwrap();
                 let (m, _n) = embeddings.dims2().unwrap();
                 let dt = now.elapsed().as_secs_f64();
-                debug!(
+                info!(
                     "embedder took {} ms ({} rows/s).",
                     now.elapsed().as_millis(),
                     ((m as f64) / dt).round()

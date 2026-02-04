@@ -48,8 +48,6 @@ impl T5ModelBuilder {
     /// Build the T5 encoder model using OpenVINO with INT4 quantization.
     pub fn build_encoder(&self, device: &Device, assets: &PathBuf) -> Result<T5EncoderModel> {
         // Decompress model files from embedded assets
-        //info!("[INFO] Using embedded INT4 model (98.9% accuracy, 6.38x compression)");
-
         let xml_bytes = MODEL_INT4_XML.bytes(assets)
             .map_err(|_| anyhow!("failed to get decompressed bytes for INT4 MODEL_XML"))?;
         let bin_bytes = MODEL_INT4_BIN.bytes(assets)
@@ -93,7 +91,6 @@ impl T5ModelBuilder {
             let precision = "f32".to_string();
             core.set_property(&ov_device, &RwPropertyKey::HintInferencePrecision, &precision)
                 .map_err(|e| anyhow!("failed to set GPU precision hint: {:?}", e))?;
-            info!("[INFO] GPU inference precision: {} (prevents INT4 NaN)", precision);
         }
 
         // Compile the model for the target device
@@ -219,9 +216,9 @@ impl T5EncoderModel {
         let has_nan = output_data.iter().any(|x| x.is_nan());
         let has_inf = output_data.iter().any(|x| x.is_infinite());
         if has_nan || has_inf {
-            warn!("[WARNING] OpenVINO output contains NaN={} Inf={}", has_nan, has_inf);
-            warn!("[WARNING] First 10 values: {:?}", &output_data[..10.min(output_data.len())]);
-            warn!("[WARNING] Last 10 values: {:?}", &output_data[output_data.len().saturating_sub(10)..]);
+            warn!("OpenVINO output contains NaN={} Inf={}", has_nan, has_inf);
+            warn!("First 10 values: {:?}", &output_data[..10.min(output_data.len())]);
+            warn!("Last 10 values: {:?}", &output_data[output_data.len().saturating_sub(10)..]);
 
             // Find which rows have NaN
             let embedding_dim = output_dims[2];
@@ -234,26 +231,26 @@ impl T5EncoderModel {
                     nan_rows.push(row);
                 }
             }
-            warn!("[WARNING] Rows with NaN (total {} out of {}): {:?}", nan_rows.len(), num_tokens, nan_rows);
-            warn!("[WARNING] Input dimensions: batch={}, seq_len={}", batch_size, seq_len);
-            warn!("[WARNING] Output dimensions: {:?}", output_dims);
+            warn!("Rows with NaN (total {} out of {}): {:?}", nan_rows.len(), num_tokens, nan_rows);
+            warn!("Input dimensions: batch={}, seq_len={}", batch_size, seq_len);
+            warn!("Output dimensions: {:?}", output_dims);
 
             // Show input tokens at NaN positions
-            warn!("[WARNING] Input token IDs (first 20): {:?}", &input_data[..20.min(input_data.len())]);
-            warn!("[WARNING] Input token IDs (last 20): {:?}", &input_data[input_data.len().saturating_sub(20)..]);
+            warn!("Input token IDs (first 20): {:?}", &input_data[..20.min(input_data.len())]);
+            warn!("Input token IDs (last 20): {:?}", &input_data[input_data.len().saturating_sub(20)..]);
             if nan_rows.len() <= 10 {
-                warn!("[WARNING] Token IDs at NaN row positions:");
+                warn!("Token IDs at NaN row positions:");
                 for &row_idx in &nan_rows {
                     if row_idx < input_data.len() {
-                        warn!("[WARNING]   Row {}: token_id={}", row_idx, input_data[row_idx]);
+                        warn!("  Row {}: token_id={}", row_idx, input_data[row_idx]);
                     }
                 }
             }
 
             // Check if last row has NaN
             if nan_rows.contains(&(num_tokens - 1)) {
-                warn!("[WARNING] LAST ROW (index {}) HAS NaN!", num_tokens - 1);
-                warn!("[WARNING] This suggests an off-by-one error or padding issue");
+                warn!("LAST ROW (index {}) HAS NaN!", num_tokens - 1);
+                warn!("This suggests an off-by-one error or padding issue");
             }
 
             assert!(false);

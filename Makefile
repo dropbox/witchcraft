@@ -49,6 +49,6 @@ test: download
 	genhtml lcov.info
 
 nfcorpus: build
-	cargo run --release --features accelerate --bin warp-cli readcsv datasets/nfcorpus.tsv
-	cargo run --release --features accelerate --bin warp-cli embed
-	cargo run --release --features accelerate --bin warp-cli index
+	cargo run --release --features accelerate,t5-quantized  --bin warp-cli readcsv datasets/nfcorpus.tsv
+	cargo run --release --features accelerate,t5-quantized --bin warp-cli embed
+	cargo run --release --features accelerate,t5-quantized --bin warp-cli index

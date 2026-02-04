@@ -1,6 +1,6 @@
 rm -rf output.txt
 
-export RUN="cargo run --bin warp-cli --release --features accelerate"
+export RUN="cargo run --bin warp-cli --release --features accelerate,t5-quantized"
 
 cargo build --release --features accelerate
 

@@ -14,6 +14,27 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn new(device: &Device, assets: &std::path::PathBuf) -> Result<Self> {
+        // On Windows, add assets directory to PATH early if it contains OpenVINO DLLs
+        // This must happen before any OpenVINO code loads
+        #[cfg(all(target_os = "windows", feature = "t5-openvino"))]
+        {
+            let dll_file = assets.join("openvino_c.dll");
+            if dll_file.exists() {
+                // Get absolute path
+                let abs_assets = assets.canonicalize().unwrap_or_else(|_| assets.clone());
+                if let Some(assets_str) = abs_assets.to_str() {
+                    // Add to PATH environment variable at the front
+                    if let Ok(current_path) = std::env::var("PATH") {
+                        let new_path = format!("{};{}", assets_str, current_path);
+                        unsafe {
+                            std::env::set_var("PATH", new_path);
+                        }
+                        log::info!("[INFO] Added assets directory to PATH for OpenVINO DLLs: {}", assets_str);
+                    }
+                }
+            }
+        }
+
         let (builder, tokenizer) = t5_encoder::T5ModelBuilder::load(assets)?;
         let model = builder.build_encoder(&device, assets)?;
         Ok(Self { tokenizer, model })

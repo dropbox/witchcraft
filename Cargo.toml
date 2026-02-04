@@ -16,11 +16,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-accelerate-src = { version = "0.3.2", optional = true }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev="0.9.2-alpha.2", optional=true }
-metal = { version = "0.27.0", features = ["mps"], optional = true }
-ug-metal = { version = "0.4.0", optional = true }
-libc = { version = "0.2.147", optional = true }
+openvino = { version = "0.9", features = ["runtime-linking"], optional = true }
 anyhow = "*"
 serde = "*"
 serde_json = "*"
@@ -58,13 +54,21 @@ test-log = { version = "0.2.16", features = ["trace", "color"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { git = "https://github.com/huggingface/candle", rev="0.9.2-alpha.2", features = ["metal"] }
 candle-nn = { git = "https://github.com/huggingface/candle", rev="0.9.2-alpha.2", features = ["metal"] }
+accelerate-src = { version = "0.3.2", optional = true }
+candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev="0.9.2-alpha.2", optional=true }
+metal = { version = "0.27.0", features = ["mps"], optional = true }
+ug-metal = { version = "0.4.0", optional = true }
+libc = { version = "0.2.147", optional = true }
 
 [build-dependencies]
 napi-build = "2.2.3"
 
 [features]
-default = []
+#default = ["t5-quantized"]
+#default = ["t5-openvino"]
 napi = ["dep:napi", "dep:napi-derive"]
+t5-quantized = []
+t5-openvino = ["dep:openvino"]
 embed-assets = []
 progress = ["dep:indicatif"]
 accelerate = ["dep:libc", "dep:accelerate-src"]

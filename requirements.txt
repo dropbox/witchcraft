@@ -1,4 +1,7 @@
 torch
 transformers
 huggingface_hub
+safetensors
 zstandard
+openvino==2025.4.1
+pytrec_eval

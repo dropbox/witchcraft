@@ -527,7 +527,6 @@ struct T5Stack {
     block: Vec<T5Block>,
     shared: Arc<Embedding>,
     final_layer_norm: T5LayerNorm,
-    final_projection: QMatMul,
 }
 
 impl T5Stack {
@@ -540,12 +539,10 @@ impl T5Stack {
             cfg.layer_norm_epsilon,
             vb.pp("final_layer_norm"),
         )?;
-        let final_projection = QMatMul::new(768, 128, vb.pp("linear"))?;
         Ok(Self {
             block,
             shared: shared.clone(),
             final_layer_norm,
-            final_projection,
         })
     }
 
@@ -564,14 +561,14 @@ impl T5Stack {
                 encoder_hidden_states,
             )?
         }
-        let t5_output = self.final_layer_norm.forward(&hidden_states);
-        self.final_projection.forward(&t5_output.unwrap())
+        self.final_layer_norm.forward(&hidden_states)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct T5EncoderModel {
     encoder: T5Stack,
+    final_projection: QMatMul,
     device: Device,
 }
 
@@ -585,14 +582,17 @@ impl T5EncoderModel {
         let shared = Embedding::new(cfg.vocab_size, cfg.d_model, shared_vb)?;
         let shared = Arc::new(shared);
         let encoder = T5Stack::load(vb.pp("encoder"), &shared, cfg)?;
+        let final_projection = QMatMul::new(768, 128, vb.pp("linear"))?;
         Ok(Self {
             encoder,
+            final_projection,
             device: vb.device().clone(),
         })
     }
 
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.encoder.forward(input_ids, None)
+        let encoder_output = self.encoder.forward(input_ids, None)?;
+        self.final_projection.forward(&encoder_output)
     }
 
     pub fn device(&self) -> &Device {
