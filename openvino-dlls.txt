@@ -1,0 +1,7 @@
+openvino.dll
+openvino_c.dll
+openvino_intel_cpu_plugin.dll
+openvino_ir_frontend.dll
+tbb12.dll
+tbbbind_2_5.dll
+tbbmalloc.dll
