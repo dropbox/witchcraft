@@ -12,17 +12,21 @@ const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 chara
 
 pub struct DB {
     db_fn: PathBuf,
-    connection: Connection,
+    connection: Option<Connection>,
     remove_on_shutdown: bool,
 }
 
 impl DB {
+    fn conn(&self) -> &Connection {
+        self.connection.as_ref().expect("Connection should exist")
+    }
+
     pub fn new_reader(db_fn: PathBuf) -> SQLResult<Self> {
         let connection =
             Connection::open_with_flags(db_fn.clone(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self {
             db_fn: db_fn,
-            connection: connection,
+            connection: Some(connection),
             remove_on_shutdown: false,
         })
     }
@@ -147,7 +151,7 @@ impl DB {
         connection.execute(query, ())?;
         Ok(Self {
             db_fn: db_fn,
-            connection: connection,
+            connection: Some(connection),
             remove_on_shutdown: false,
         })
     }
@@ -180,7 +184,7 @@ impl DB {
         }
 
         let delete_sql = format!("DELETE FROM document WHERE {filter_sql}");
-        let mut statement = self.connection.prepare(&delete_sql)?;
+        let mut statement = self.conn().prepare(&delete_sql)?;
         let param_refs: Vec<&dyn rusqlite::ToSql> = params
             .iter()
             .map(|param| param.as_ref() as &dyn rusqlite::ToSql)
@@ -190,15 +194,32 @@ impl DB {
     }
 
     pub fn shutdown(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            match connection.close() {
+                Ok(_) => {
+                },
+                Err((conn, e)) => {
+                    error!("failed to close db connection: {e}");
+                    // Drop the returned connection explicitly
+                    drop(conn);
+                }
+            };
+        }
+
         if self.remove_on_shutdown {
+            // Remove main database file
             match std::fs::remove_file(&self.db_fn) {
                 Ok(()) => {
                     self.remove_on_shutdown = false;
                 }
                 Err(v) => {
-                    warn!("unable to remove database file {v}");
+                    warn!("unable to remove database file {}: {v}", self.db_fn.display());
                 }
             };
+
+            // Also remove WAL and SHM files if they exist
+            let _ = std::fs::remove_file(self.db_fn.with_extension("wal"));
+            let _ = std::fs::remove_file(self.db_fn.with_extension("shm"));
         }
     }
 
@@ -207,7 +228,7 @@ impl DB {
     }
 
     pub fn execute(self: &Self, sql: &str) -> SQLResult<()> {
-        match self.connection.execute(sql, ()) {
+        match self.conn().execute(sql, ()) {
             Ok(_v) => Ok(()),
             Err(v) => {
                 error!("failed to execute SQL {v}");
@@ -217,21 +238,21 @@ impl DB {
     }
 
     pub fn query(self: &Self, sql: &str) -> SQLResult<Statement<'_>> {
-        self.connection.prepare(&sql)
+        self.conn().prepare(&sql)
     }
 
     pub fn begin_transaction(&self) -> SQLResult<()> {
-        self.connection.execute("BEGIN", ())?;
+        self.conn().execute("BEGIN", ())?;
         Ok(())
     }
 
     pub fn commit_transaction(&self) -> SQLResult<()> {
-        self.connection.execute("COMMIT", ())?;
+        self.conn().execute("COMMIT", ())?;
         Ok(())
     }
 
     pub fn rollback_transaction(&self) -> SQLResult<()> {
-        self.connection.execute("ROLLBACK", ())?;
+        self.conn().execute("ROLLBACK", ())?;
         Ok(())
     }
 
@@ -267,7 +288,7 @@ impl DB {
 
         let date = date.unwrap_or_else(Timestamp::now_utc);
 
-        self.connection.execute(
+        self.conn().execute(
             "INSERT INTO document VALUES(?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(uuid) DO UPDATE SET
                 date = ?2, metadata = ?3, hash = ?4, body = ?5, lens = ?6",
@@ -285,7 +306,7 @@ impl DB {
     }
 
     pub fn remove_doc(self: &mut Self, uuid: &Uuid) -> SQLResult<()> {
-        self.connection
+        self.conn()
             .execute("DELETE FROM document WHERE uuid = ?1", (uuid.to_string(),))?;
         Ok(())
     }
@@ -297,7 +318,7 @@ impl DB {
         embeddings: &Vec<u8>,
         counts: &str,
     ) -> SQLResult<()> {
-        self.connection.execute(
+        self.conn().execute(
             "INSERT OR IGNORE INTO chunk VALUES(?1, ?2, ?3, ?4)",
             (&hash, &model, embeddings, counts),
         )?;
@@ -312,7 +333,7 @@ impl DB {
         indices: &Vec<u8>,
         residuals: &Vec<u8>,
     ) -> SQLResult<()> {
-        self.connection.execute(
+        self.conn().execute(
             "INSERT OR REPLACE INTO bucket VALUES(?1, ?2, ?3, ?4, ?5)",
             (id, generation, center, indices, residuals),
         )?;
@@ -320,10 +341,25 @@ impl DB {
     }
 
     pub fn add_indexed_chunk(self: &Self, chunkid: u32, generation: u32) -> SQLResult<()> {
-        self.connection.execute(
+        self.conn().execute(
             "INSERT OR REPLACE INTO indexed_chunk VALUES(?1, ?2)",
             (chunkid, generation),
         )?;
         Ok(())
+    }
+}
+
+impl Drop for DB {
+    fn drop(&mut self) {
+        // If connection is still present, close it
+        if let Some(connection) = self.connection.take() {
+            match connection.close() {
+                Ok(_) => {},
+                Err((conn, e)) => {
+                    error!("failed to close db connection in Drop: {e}");
+                    drop(conn);
+                }
+            };
+        }
     }
 }

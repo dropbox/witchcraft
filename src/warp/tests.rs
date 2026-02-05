@@ -59,7 +59,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path: PathBuf = dir.path().join("warp");
         let mut db = DB::new(path.clone()).unwrap();
-        let reader_db = DB::new_reader(path.clone()).unwrap();
+        let mut reader_db = DB::new_reader(path.clone()).unwrap();
 
         let device = warp::make_device();
         let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
@@ -120,6 +120,8 @@ mod tests {
             None,
         )
         .unwrap();
+        // Close reader_db before trying to delete database files
+        reader_db.shutdown();
         db.clear();
         db.shutdown();
 
