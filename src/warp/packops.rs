@@ -2,9 +2,8 @@ use anyhow::Result;
 use candle_core::{Device, Tensor};
 use log::warn;
 
-use super::haarops::haar_inverse_mirror_edge;
+use super::haarops::{haar_forward_mirror_edge, haar_inverse_mirror_edge};
 use super::rans64;
-use super::TensorHaarOps;
 
 const MAX_WINDOW_ROWS: usize = 1024;
 const RANS_BITS: u32 = 12;
@@ -111,8 +110,6 @@ pub trait TensorPackOps {
     fn inv_compand(&self) -> Result<Tensor>;
     fn quantize(&self, bits: u32) -> Result<Tensor>;
     fn dequantize(&self, bits: u32) -> Result<Tensor>;
-    fn sort_by_column_sum(&self) -> Result<(Tensor, Vec<usize>)>;
-
     fn embeddings_to_packed(&self) -> Result<Vec<u8>>;
     fn embeddings_from_packed(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
 
@@ -175,24 +172,6 @@ impl TensorPackOps for Tensor {
         Ok(((self - zp)? * scale2)?)
     }
 
-    fn sort_by_column_sum(&self) -> Result<(Tensor, Vec<usize>)> {
-        let (_, cols) = self.dims2()?;
-        let sums: Vec<f32> = self.sum(0)?.to_vec1()?;
-
-        let mut perm: Vec<usize> = (0..cols).collect();
-        perm.sort_by(|&a, &b| sums[a].partial_cmp(&sums[b]).unwrap());
-
-        let mut inv_perm = vec![0usize; cols];
-        for (new_pos, &orig_col) in perm.iter().enumerate() {
-            inv_perm[orig_col] = new_pos;
-        }
-
-        let idx_i64: Vec<i64> = perm.iter().map(|&i| i as i64).collect();
-        let idx_t = Tensor::from_vec(idx_i64, (cols,), self.device())?;
-        let sorted = self.index_select(&idx_t, 1)?;
-        Ok((sorted, inv_perm))
-    }
-
     fn embeddings_to_packed(&self) -> Result<Vec<u8>> {
         let (rows, cols) = self.dims2()?;
         assert!(cols <= 255, "column count must fit in u8");
@@ -200,25 +179,61 @@ impl TensorPackOps for Tensor {
         let mut bytes = Vec::with_capacity(rows * cols);
         bytes.extend_from_slice(&(rows as u16).to_ne_bytes());
 
+        let all_data = self.flatten_all()?.to_vec1::<f32>()?;
+
         for (offset, win_rows) in (0..rows)
             .step_by(MAX_WINDOW_ROWS)
             .map(|r| (r, (rows - r).min(MAX_WINDOW_ROWS)))
         {
             assert!(win_rows > 0);
-            let chunk = self.narrow(0, offset, win_rows)?;
-            let (sorted, idxs) = chunk.sort_by_column_sum()?;
 
-            for i in idxs {
-                bytes.push(i as u8);
+            // Extract window into raw buffer
+            let mut raw = all_data[offset * cols..(offset + win_rows) * cols].to_vec();
+
+            // Sort columns by sum (compute sums, build permutation, apply)
+            let mut col_sums = vec![0.0f32; cols];
+            for r in 0..win_rows {
+                for c in 0..cols {
+                    col_sums[c] += raw[r * cols + c];
+                }
+            }
+            let mut perm: Vec<usize> = (0..cols).collect();
+            perm.sort_by(|&a, &b| col_sums[a].partial_cmp(&col_sums[b]).unwrap());
+
+            let mut inv_perm = vec![0usize; cols];
+            for (new_pos, &orig_col) in perm.iter().enumerate() {
+                inv_perm[orig_col] = new_pos;
+            }
+            for i in &inv_perm {
+                bytes.push(*i as u8);
             }
 
-            let haar = sorted
-                .t()?
-                .haar_forward_tensor_cols()?
-                .t()?
-                .haar_forward_tensor_cols()?;
+            // Apply column permutation in place
+            let mut row_buf = vec![0.0f32; cols];
+            for r in 0..win_rows {
+                let row_start = r * cols;
+                for c in 0..cols {
+                    row_buf[c] = raw[row_start + perm[c]];
+                }
+                raw[row_start..row_start + cols].copy_from_slice(&row_buf);
+            }
 
-            let mut raw = haar.flatten_all()?.to_vec1::<f32>()?;
+            // Haar forward on each row (contiguous)
+            for r in 0..win_rows {
+                haar_forward_mirror_edge(&mut raw[r * cols..(r + 1) * cols]);
+            }
+
+            // Haar forward on each column (strided, temp buffer)
+            let mut col_buf = vec![0.0f32; win_rows];
+            for c in 0..cols {
+                for r in 0..win_rows {
+                    col_buf[r] = raw[r * cols + c];
+                }
+                haar_forward_mirror_edge(&mut col_buf);
+                for r in 0..win_rows {
+                    raw[r * cols + c] = col_buf[r];
+                }
+            }
             let mut abs_max = 0.00001f32;
             for x in &raw {
                 let a = x.abs();

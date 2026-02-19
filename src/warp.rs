@@ -36,7 +36,6 @@ mod packops;
 use packops::TensorPackOps;
 
 mod haarops;
-pub use haarops::TensorHaarOps;
 
 pub mod rans64;
 
