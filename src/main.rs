@@ -115,10 +115,8 @@ pub fn bulk_search(
             let now = std::time::Instant::now();
             let (qe, _offsets) = embedder.embed(&question)?;
             let qe = qe.get(0)?;
-            qe.device().synchronize().unwrap();
             let embedder_latency_ms = now.elapsed().as_millis() as u32;
             embedder_histogram.record(embedder_latency_ms);
-            debug!("embedder took {} ms.", now.elapsed().as_millis());
             warp::match_centroids(&db, &qe, 0.0, top_k, None).unwrap()
         } else {
             vec![]

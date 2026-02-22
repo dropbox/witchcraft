@@ -743,33 +743,41 @@ pub fn match_centroids(
 
     let now = std::time::Instant::now();
     let mut num_unindexed = 0;
-    let mut unindexed_chunks_query = db.query(
-        "
-        SELECT d.rowid, c.embeddings
-        FROM document AS d
-        JOIN chunk AS c ON c.hash = d.hash
-        WHERE NOT EXISTS (
-          SELECT 1
-          FROM indexed_chunk AS i
-          WHERE i.chunkid = c.rowid
-        )
-        ORDER BY d.rowid",
-    )?;
 
-    let results = unindexed_chunks_query.query_map((), |row| {
-        Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    for result in results {
-        let (id, embeddings) = result?;
-        let embeddings = Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
-        let (m, _) = embeddings.dims2()?;
-        all_document_embeddings.push(embeddings);
-        for _ in 0..m {
-            let key = (id, 0);
-            all.push((key, count));
-            count += 1;
+    // Check if there are any unindexed chunks before running expensive query
+    let unindexed_count: u32 = db
+        .query("SELECT COUNT(*) FROM chunk AS c WHERE NOT EXISTS (SELECT 1 FROM indexed_chunk AS i WHERE i.chunkid = c.rowid)")?
+        .query_row((), |row| row.get(0))?;
+
+    if unindexed_count > 0 {
+        let mut unindexed_chunks_query = db.query(
+            "
+            SELECT d.rowid, c.embeddings
+            FROM document AS d
+            JOIN chunk AS c ON c.hash = d.hash
+            WHERE NOT EXISTS (
+              SELECT 1
+              FROM indexed_chunk AS i
+              WHERE i.chunkid = c.rowid
+            )
+            ORDER BY d.rowid",
+        )?;
+
+        let results = unindexed_chunks_query.query_map((), |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for result in results {
+            let (id, embeddings) = result?;
+            let embeddings = Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
+            let (m, _) = embeddings.dims2()?;
+            all_document_embeddings.push(embeddings);
+            for _ in 0..m {
+                let key = (id, 0);
+                all.push((key, count));
+                count += 1;
+            }
+            num_unindexed += m;
         }
-        num_unindexed += m;
     }
     debug!(
         "reading {} unindexed embeddings took {} ms.",
