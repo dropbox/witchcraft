@@ -625,6 +625,8 @@ pub fn match_centroids(
     top_k: usize,
     sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<Vec<(f32, u32, u32)>> {
+    let total_start = std::time::Instant::now();
+    let setup_start = std::time::Instant::now();
     let cache_version: u64 = db
         .query("SELECT IFNULL(MAX(id), 0) + COUNT(*) FROM bucket")?
         .query_row((), |row| Ok(row.get::<_, u64>(0)?))
@@ -644,6 +646,7 @@ pub fn match_centroids(
 
     let (cluster_ids, sizes, centers, centers_matrix) =
         get_centers(&db, &device, cache_version)?;
+    debug!("setup and get_centers took {} ms.", setup_start.elapsed().as_millis());
 
     if centers.len() > 0 {
         let now = std::time::Instant::now();
@@ -690,16 +693,26 @@ pub fn match_centroids(
         let now = std::time::Instant::now();
         let table: [f32; 16] = packops::make_q4_dequant_table()?;
 
+        let mut db_read_time = 0u128;
+        let mut decompress_time = 0u128;
+        let mut dequant_time = 0u128;
+        let mut add_centroid_time = 0u128;
+
         for i in topk_clusters {
+            let db_start = std::time::Instant::now();
             let (keys_compressed, document_embeddings) = bucket_query
                 .query_row((cluster_ids[i as usize],), |row| {
                     Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })?;
+            db_read_time += db_start.elapsed().as_millis();
 
             match centers.get(i as usize) {
                 Some(center) => {
+                    let decompress_start = std::time::Instant::now();
                     let document_indices = decompress_keys(&keys_compressed)?;
+                    decompress_time += decompress_start.elapsed().as_millis();
 
+                    let dequant_start = std::time::Instant::now();
                     //let residuals = Tensor::from_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?.dequantize(4)?.inv_compand()?;
                     let residuals = Tensor::from_companded_q4_bytes(
                         &document_embeddings,
@@ -707,8 +720,12 @@ pub fn match_centroids(
                         &table,
                         &Device::Cpu,
                     )?;
+                    dequant_time += dequant_start.elapsed().as_millis();
+
+                    let add_start = std::time::Instant::now();
                     let embeddings = residuals.broadcast_add(&center)?;
                     all_document_embeddings.push(embeddings);
+                    add_centroid_time += add_start.elapsed().as_millis();
 
                     let (m, _) = residuals.dims2()?;
                     for j in 0..m {
@@ -722,9 +739,13 @@ pub fn match_centroids(
             }
         }
         debug!(
-            "reading in {} indexed embeddings took {} ms.",
+            "reading {} indexed embeddings took {} ms (DB: {}ms, decompress keys: {}ms, dequant: {}ms, add centroids: {}ms).",
             count,
-            now.elapsed().as_millis()
+            now.elapsed().as_millis(),
+            db_read_time,
+            decompress_time,
+            dequant_time,
+            add_centroid_time
         );
     } else {
         for _ in 0..m {
@@ -950,6 +971,7 @@ pub fn match_centroids(
         "DB operations took {} ms total",
         now.elapsed().as_millis()
     );
+    debug!("match_centroids internal total: {} ms.", total_start.elapsed().as_millis());
     Ok(results)
 }
 
