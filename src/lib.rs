@@ -55,7 +55,7 @@ mod napi;
 pub use types::{SqlCondition, SqlLogic, SqlOperator, SqlStatement, SqlStatementType};
 
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Storage, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
 
@@ -107,66 +107,18 @@ pub mod progress {
 
 fn matmul_argmax_batched(t: &Tensor, centers_t: &Tensor, batch_size: usize) -> Result<Tensor> {
     let (m, _n) = t.dims2()?;
-    let k = centers_t.dim(1)?;
     let device = t.device();
 
     let mut assignments = Vec::with_capacity(m);
 
-    if device.is_cpu() {
-        // CPU path: chunk centroids so each sim tile fits in L3, copy into a
-        // pre-allocated buffer (avoids repeated mallocs), then scan with a
-        // plain argmax loop.  k_chunk=512 keeps the [n, k_chunk] B matrix
-        // (~256 KB) in L2 per core while the 2 MB sim tile fits in L3.
-        let k_chunk = (2 * 1024 * 1024 / (batch_size * 4)).max(1).min(k);
-        let mut sim_buf = vec![0f32; batch_size * k_chunk];
-
-        for start in (0..m).step_by(batch_size) {
-            let end = (start + batch_size).min(m);
-            let batch_len = end - start;
-            let batch = t.narrow(0, start, batch_len)?;
-
-            let mut best_vals = vec![f32::NEG_INFINITY; batch_len];
-            let mut best_idxs = vec![0u32; batch_len];
-
-            for k_start in (0..k).step_by(k_chunk) {
-                let k_len = k_chunk.min(k - k_start);
-                let chunk = centers_t.narrow(1, k_start, k_len)?;
-                let sim = batch.matmul(&chunk)?;
-
-                {
-                    let (sim_storage, sim_layout) = sim.storage_and_layout();
-                    let src: &[f32] = match &*sim_storage {
-                        Storage::Cpu(cpu_s) => {
-                            let all = cpu_s.as_slice::<f32>()?;
-                            let off = sim_layout.start_offset();
-                            &all[off..off + batch_len * k_len]
-                        }
-                        _ => unreachable!("device.is_cpu() but storage is not Cpu"),
-                    };
-                    sim_buf[..batch_len * k_len].copy_from_slice(src);
-                }
-
-                for (row, tile) in sim_buf[..batch_len * k_len].chunks_exact(k_len).enumerate() {
-                    let bv = &mut best_vals[row];
-                    let bi = &mut best_idxs[row];
-                    for (j, &v) in tile.iter().enumerate() {
-                        if v > *bv { *bv = v; *bi = (k_start + j) as u32; }
-                    }
-                }
-            }
-
-            assignments.extend_from_slice(&best_idxs);
-        }
-    } else {
-        // GPU path (Metal/CUDA): let the device do the matmul and argmax.
-        // centers_t may arrive on CPU (kmeans always runs on CPU), so move it.
-        let centers_t = centers_t.to_device(device)?;
-        for start in (0..m).step_by(batch_size) {
-            let end = (start + batch_size).min(m);
-            let batch = t.narrow(0, start, end - start)?;
-            let sim = batch.matmul(&centers_t)?;
-            assignments.extend(sim.argmax(D::Minus1)?.to_vec1::<u32>()?);
-        }
+    for start in (0..m).step_by(batch_size) {
+        let end = (start + batch_size).min(m);
+        let batch_len = end - start;
+        let batch = t.narrow(0, start, batch_len)?;
+        let sim = batch.matmul(centers_t)?;
+        let batch_assignments = sim.argmax(D::Minus1)?;
+        let batch_assignments = batch_assignments.to_vec1::<u32>()?;
+        assignments.extend(batch_assignments);
     }
 
     Ok(Tensor::from_vec(assignments, m, device)?)
