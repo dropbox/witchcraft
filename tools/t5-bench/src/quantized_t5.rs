@@ -5,21 +5,25 @@ use candle_nn::Activation;
 use candle_transformers::models::t5::{
     deserialize_feed_forward_proj_activation, ActivationWithOptionalGating,
 };
+#[cfg(not(feature = "fused-gelu"))]
 use candle_core::quantized::QMatMul;
+#[cfg(feature = "fused-gelu")]
+use crate::fused_matmul::MatMul as QMatMul;
 use candle_transformers::quantized_nn::Embedding;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
 use std::sync::Arc;
 
+#[cfg(not(feature = "fused-gelu"))]
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
-    let device = vb.device();
     let ws = vb.get((out_d, in_d), "weight")?;
-    if matches!(device, Device::Cpu) {
-        let tensor = ws.dequantize(device)?;
-        Ok(QMatMul::Tensor(tensor))
-    } else {
-        QMatMul::from_arc(ws)
-    }
+    QMatMul::from_arc(ws)
+}
+
+#[cfg(feature = "fused-gelu")]
+fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
+    let ws = vb.get((out_d, in_d), "weight")?;
+    Ok(QMatMul::from_qtensor(ws))
 }
 
 fn default_relative_attention_max_distance() -> usize {
@@ -139,11 +143,24 @@ impl T5DenseGatedActDense {
 
 impl Module for T5DenseGatedActDense {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let hidden_gelu = self.act.forward(&self.wi_0.forward(xs)?)?;
-        let hidden_linear = self.wi_1.forward(xs)?;
-        let xs = hidden_gelu.broadcast_mul(&hidden_linear)?;
-        let xs = self.wo.forward(&xs)?;
-        Ok(xs)
+        #[cfg(feature = "fused-gelu")]
+        let hidden = match self.act {
+            Activation::NewGelu | Activation::GeluPytorchTanh => {
+                crate::fused_matmul::forward_gated_gelu(&self.wi_0, &self.wi_1, xs)?
+            }
+            _ => {
+                let hidden_act = self.act.forward(&self.wi_0.forward(xs)?)?;
+                let hidden_linear = self.wi_1.forward(xs)?;
+                hidden_act.broadcast_mul(&hidden_linear)?
+            }
+        };
+        #[cfg(not(feature = "fused-gelu"))]
+        let hidden = {
+            let hidden_act = self.act.forward(&self.wi_0.forward(xs)?)?;
+            let hidden_linear = self.wi_1.forward(xs)?;
+            hidden_act.broadcast_mul(&hidden_linear)?
+        };
+        self.wo.forward(&hidden)
     }
 }
 

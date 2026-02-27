@@ -37,7 +37,11 @@ win: download
 	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features embed-assets
 
 macintel: download
-	RUSTFLAGS='-C target-feature=+avx2,+fma' cargo build --release --target x86_64-apple-darwin --features t5-openvino,accelerate
+	RUSTFLAGS='-C target-feature=+avx2,+fma' cargo build --release --target x86_64-apple-darwin --features t5-quantized,accelerate
+
+macintelasan: download
+	rustup override set nightly
+	RUSTFLAGS="-Z sanitizer=address -C target-feature=+avx2,+fma" cargo build -Z build-std --release --target x86_64-apple-darwin --features t5-openvino,accelerate
 
 run: build
 	node index.js

@@ -8,6 +8,8 @@ use std::sync::RwLock;
 mod quantized_t5;
 #[cfg(feature = "t5-quantized")]
 use quantized_t5 as t5_encoder;
+#[cfg(feature = "fused-gelu")]
+mod fused_matmul;
 
 #[cfg(feature = "t5-openvino")]
 mod openvino_t5;
