@@ -21,13 +21,26 @@ use candle_nn::Activation;
 use candle_transformers::models::t5::{
     deserialize_feed_forward_proj_activation, ActivationWithOptionalGating,
 };
-use candle_transformers::models::with_tracing::QMatMul;
+use candle_core::quantized::QMatMul;
 use candle_transformers::quantized_nn::Embedding;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
+
+/// On CPU, dequantize QMatMul weights to F32 at load time for ~2x faster
+/// BLAS-based GEMM. On GPU (Metal), keep Q4K weights for memory efficiency.
+fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
+    let device = vb.device();
+    let ws = vb.get((out_d, in_d), "weight")?;
+    if matches!(device, Device::Cpu) {
+        let tensor = ws.dequantize(device)?;
+        Ok(QMatMul::Tensor(tensor))
+    } else {
+        QMatMul::from_arc(ws)
+    }
+}
 
 fn default_relative_attention_max_distance() -> usize {
     128
@@ -149,8 +162,8 @@ struct T5DenseActDense {
 
 impl T5DenseActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
-        let wi = QMatMul::new(cfg.d_model, cfg.d_ff, vb.pp("wi"))?;
-        let wo = QMatMul::new(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
+        let wi = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi"))?;
+        let wo = new_qmm(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
         Ok(Self {
             wi,
             wo,
@@ -178,9 +191,9 @@ struct T5DenseGatedActDense {
 
 impl T5DenseGatedActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
-        let wi_0 = QMatMul::new(cfg.d_model, cfg.d_ff, vb.pp("wi_0"))?;
-        let wi_1 = QMatMul::new(cfg.d_model, cfg.d_ff, vb.pp("wi_1"))?;
-        let wo = QMatMul::new(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
+        let wi_0 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_0"))?;
+        let wi_1 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_1"))?;
+        let wo = new_qmm(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
         Ok(Self {
             wi_0,
             wi_1,
@@ -259,10 +272,10 @@ struct T5Attention {
 impl T5Attention {
     fn load(has_relative_attention_bias: bool, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let inner_dim = cfg.num_heads * cfg.d_kv;
-        let q = QMatMul::new(cfg.d_model, inner_dim, vb.pp("q"))?;
-        let k = QMatMul::new(cfg.d_model, inner_dim, vb.pp("k"))?;
-        let v = QMatMul::new(cfg.d_model, inner_dim, vb.pp("v"))?;
-        let o = QMatMul::new(inner_dim, cfg.d_model, vb.pp("o"))?;
+        let q = new_qmm(cfg.d_model, inner_dim, vb.pp("q"))?;
+        let k = new_qmm(cfg.d_model, inner_dim, vb.pp("k"))?;
+        let v = new_qmm(cfg.d_model, inner_dim, vb.pp("v"))?;
+        let o = new_qmm(inner_dim, cfg.d_model, vb.pp("o"))?;
         let relative_attention_bias = if has_relative_attention_bias {
             let emb = Embedding::new(
                 cfg.relative_attention_num_buckets,
@@ -582,7 +595,7 @@ impl T5EncoderModel {
         let shared = Embedding::new(cfg.vocab_size, cfg.d_model, shared_vb)?;
         let shared = Arc::new(shared);
         let encoder = T5Stack::load(vb.pp("encoder"), &shared, cfg)?;
-        let final_projection = QMatMul::new(768, 128, vb.pp("linear"))?;
+        let final_projection = new_qmm(768, 128, vb.pp("linear"))?;
         Ok(Self {
             encoder,
             final_projection,
