@@ -10,8 +10,6 @@ mod quantized_t5;
 use quantized_t5 as t5_encoder;
 #[cfg(feature = "fused-gelu")]
 mod fused_matmul;
-#[cfg(feature = "fused-gelu")]
-mod avx_q4k;
 
 #[cfg(feature = "t5-openvino")]
 mod openvino_t5;

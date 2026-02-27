@@ -1,8 +1,6 @@
 mod quantized_t5;
 #[cfg(feature = "fused-gelu")]
 mod fused_matmul;
-#[cfg(feature = "fused-gelu")]
-mod avx_q4k;
 
 use anyhow::Result;
 use candle_core::{Device, Tensor};

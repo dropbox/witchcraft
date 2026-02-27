@@ -19,8 +19,6 @@ serde_json = "*"
 zstd = "0.13.3"
 tempfile = "3.20.0"
 rayon = { version = "1", optional = true }
-half = "2.7"
-byteorder = "1.5"
 
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
 accelerate-src = { version = "0.3.2", optional = true }

@@ -105,27 +105,7 @@ impl CustomOp1 for QTiledOp {
             };
         }
         match self.0.dtype() {
-            GgmlDType::Q4K => {
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx2",
-                    target_feature = "fma"
-                ))]
-                {
-                    crate::avx_q4k::tiled_matmul_q4k(
-                        (m, k, n),
-                        slice,
-                        &data,
-                        &mut dst_storage,
-                    );
-                }
-                #[cfg(not(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx2",
-                    target_feature = "fma"
-                )))]
-                dispatch!(BlockQ4K);
-            }
+            GgmlDType::Q4K => dispatch!(BlockQ4K),
             GgmlDType::Q5K => dispatch!(BlockQ5K),
             GgmlDType::Q6K => dispatch!(BlockQ6K),
             GgmlDType::Q8K => dispatch!(BlockQ8K),
@@ -243,28 +223,7 @@ impl CustomOp1 for QGatedMatMul {
             };
         }
         match self.0.dtype() {
-            GgmlDType::Q4K => {
-                #[cfg(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx2",
-                    target_feature = "fma"
-                ))]
-                {
-                    crate::avx_q4k::fused_gated_gelu_q4k(
-                        (m, k, n),
-                        slice,
-                        &gate_data,
-                        &up_data,
-                        &mut dst_storage,
-                    );
-                }
-                #[cfg(not(all(
-                    target_arch = "x86_64",
-                    target_feature = "avx2",
-                    target_feature = "fma"
-                )))]
-                dispatch!(BlockQ4K);
-            }
+            GgmlDType::Q4K => dispatch!(BlockQ4K),
             GgmlDType::Q5K => dispatch!(BlockQ5K),
             GgmlDType::Q6K => dispatch!(BlockQ6K),
             GgmlDType::Q8K => dispatch!(BlockQ8K),
