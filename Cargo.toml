@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]                     # !Dash
-members = ["tools/quantize-tool"] # !Dash
+members = ["tools/quantize-tool", "tools/t5-bench"] # !Dash
 
 [[bin]]                         # !Dash
 name = "warp-cli"               # !Dash
