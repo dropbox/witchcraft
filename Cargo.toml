@@ -47,7 +47,6 @@ text-splitter = "0.28.0" # !Dash
 lz4_flex = "0.11.5"
 strsim = "0.11.1"
 rayon = { version = "1", optional = true }
-libm = { version = "0.2", optional = true }
 
 [dev-dependencies]
 test-log = { version = "0.2.16", features = ["trace", "color"] }
@@ -73,11 +72,9 @@ napi-build = "2.2.3"
 [features]
 #default = ["t5-quantized"]
 #default = ["t5-openvino"]
-#default = ["t5-bnns"]
 napi = ["dep:napi", "dep:napi-derive"]
 t5-quantized = []
 t5-openvino = ["dep:openvino"]
-t5-bnns = ["dep:libm"]
 embed-assets = []
 progress = ["dep:indicatif"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
