@@ -36,8 +36,11 @@ winmodule:
 win: download
 	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features embed-assets
 
+# ONNX backend for x86 Mac - must build on x86 Mac, not via cross-compilation
+# Requires ONNX Runtime 1.23.0 installed at /tmp/onnxruntime-osx-x86_64-1.23.0/
+# Set ORT_STRATEGY=system ORT_LIB_LOCATION=/tmp/onnxruntime.../lib ORT_PREFER_DYNAMIC_LINK=1
 macintel: download
-	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-openvino,accelerate
+	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-onnx,accelerate
 
 macintelasan: download
 	rustup override set nightly
