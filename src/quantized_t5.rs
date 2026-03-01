@@ -178,6 +178,9 @@ struct T5DenseActDense {
 impl T5DenseActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let wi = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi"))?;
+        #[cfg(feature = "fused-gelu")]
+        let wo = new_qmm_dequant(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
+        #[cfg(not(feature = "fused-gelu"))]
         let wo = new_qmm(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
         Ok(Self {
             wi,
@@ -208,6 +211,9 @@ impl T5DenseGatedActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let wi_0 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_0"))?;
         let wi_1 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_1"))?;
+        #[cfg(feature = "fused-gelu")]
+        let wo = new_qmm_dequant(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
+        #[cfg(not(feature = "fused-gelu"))]
         let wo = new_qmm(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
         Ok(Self {
             wi_0,
