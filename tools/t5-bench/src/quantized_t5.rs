@@ -5,28 +5,28 @@ use candle_nn::Activation;
 use candle_transformers::models::t5::{
     deserialize_feed_forward_proj_activation, ActivationWithOptionalGating,
 };
-#[cfg(not(feature = "fused-gelu"))]
+#[cfg(not(feature = "hybrid-dequant"))]
 use candle_core::quantized::QMatMul;
-#[cfg(feature = "fused-gelu")]
+#[cfg(feature = "hybrid-dequant")]
 use crate::fused_matmul::MatMul as QMatMul;
 use candle_transformers::quantized_nn::Embedding;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
 use std::sync::Arc;
 
-#[cfg(not(feature = "fused-gelu"))]
+#[cfg(not(feature = "hybrid-dequant"))]
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     let ws = vb.get((out_d, in_d), "weight")?;
     QMatMul::from_arc(ws)
 }
 
-#[cfg(feature = "fused-gelu")]
+#[cfg(feature = "hybrid-dequant")]
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     let ws = vb.get((out_d, in_d), "weight")?;
     Ok(QMatMul::from_qtensor(ws))
 }
 
-#[cfg(feature = "fused-gelu")]
+#[cfg(feature = "hybrid-dequant")]
 fn new_qmm_dequant(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     let ws = vb.get((out_d, in_d), "weight")?;
     let tensor = ws.dequantize(vb.device())?;
@@ -108,9 +108,9 @@ struct T5DenseActDense {
 impl T5DenseActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let wi = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi"))?;
-        #[cfg(feature = "fused-gelu")]
+        #[cfg(feature = "hybrid-dequant")]
         let wo = new_qmm_dequant(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
-        #[cfg(not(feature = "fused-gelu"))]
+        #[cfg(not(feature = "hybrid-dequant"))]
         let wo = new_qmm(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
         Ok(Self {
             wi,
@@ -141,9 +141,9 @@ impl T5DenseGatedActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let wi_0 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_0"))?;
         let wi_1 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_1"))?;
-        #[cfg(feature = "fused-gelu")]
+        #[cfg(feature = "hybrid-dequant")]
         let wo = new_qmm_dequant(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
-        #[cfg(not(feature = "fused-gelu"))]
+        #[cfg(not(feature = "hybrid-dequant"))]
         let wo = new_qmm(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
         Ok(Self {
             wi_0,
@@ -156,7 +156,7 @@ impl T5DenseGatedActDense {
 
 impl Module for T5DenseGatedActDense {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "fused-gelu")]
+        #[cfg(feature = "hybrid-dequant")]
         let hidden = match self.act {
             Activation::NewGelu | Activation::GeluPytorchTanh => {
                 crate::fused_matmul::forward_gated_gelu(&self.wi_0, &self.wi_1, xs)?
@@ -167,7 +167,7 @@ impl Module for T5DenseGatedActDense {
                 hidden_act.broadcast_mul(&hidden_linear)?
             }
         };
-        #[cfg(not(feature = "fused-gelu"))]
+        #[cfg(not(feature = "hybrid-dequant"))]
         let hidden = {
             let hidden_act = self.act.forward(&self.wi_0.forward(xs)?)?;
             let hidden_linear = self.wi_1.forward(xs)?;
@@ -214,9 +214,9 @@ impl Module for T5LayerFF {
             Some(dense_act) => dense_act.forward(&ys)?,
             None => self.gated_dense_act.as_ref().unwrap().forward(&ys)?,
         };
-        #[cfg(feature = "fused-gelu")]
+        #[cfg(feature = "hybrid-dequant")]
         let xs = crate::fused_matmul::fast_add(xs, &ys)?;
-        #[cfg(not(feature = "fused-gelu"))]
+        #[cfg(not(feature = "hybrid-dequant"))]
         let xs = (xs + ys)?;
         Ok(xs)
     }
@@ -224,13 +224,13 @@ impl Module for T5LayerFF {
 
 #[derive(Debug, Clone)]
 struct T5Attention {
-    #[cfg(feature = "fused-gelu")]
+    #[cfg(feature = "hybrid-dequant")]
     qkv: QMatMul,
-    #[cfg(not(feature = "fused-gelu"))]
+    #[cfg(not(feature = "hybrid-dequant"))]
     q: QMatMul,
-    #[cfg(not(feature = "fused-gelu"))]
+    #[cfg(not(feature = "hybrid-dequant"))]
     k: QMatMul,
-    #[cfg(not(feature = "fused-gelu"))]
+    #[cfg(not(feature = "hybrid-dequant"))]
     v: QMatMul,
     o: QMatMul,
     n_heads: usize,
@@ -244,7 +244,7 @@ struct T5Attention {
 impl T5Attention {
     fn load(has_relative_attention_bias: bool, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let inner_dim = cfg.num_heads * cfg.d_kv;
-        #[cfg(feature = "fused-gelu")]
+        #[cfg(feature = "hybrid-dequant")]
         let (qkv, o) = {
             let q_w = vb.pp("q").get((inner_dim, cfg.d_model), "weight")?.dequantize(vb.device())?;
             let k_w = vb.pp("k").get((inner_dim, cfg.d_model), "weight")?.dequantize(vb.device())?;
@@ -253,7 +253,7 @@ impl T5Attention {
             let o = new_qmm_dequant(inner_dim, cfg.d_model, vb.pp("o"))?;
             (qkv, o)
         };
-        #[cfg(not(feature = "fused-gelu"))]
+        #[cfg(not(feature = "hybrid-dequant"))]
         let (q, k, v, o) = {
             let q = new_qmm(cfg.d_model, inner_dim, vb.pp("q"))?;
             let k = new_qmm(cfg.d_model, inner_dim, vb.pp("k"))?;
@@ -272,13 +272,13 @@ impl T5Attention {
             None
         };
         Ok(Self {
-            #[cfg(feature = "fused-gelu")]
+            #[cfg(feature = "hybrid-dequant")]
             qkv,
-            #[cfg(not(feature = "fused-gelu"))]
+            #[cfg(not(feature = "hybrid-dequant"))]
             q,
-            #[cfg(not(feature = "fused-gelu"))]
+            #[cfg(not(feature = "hybrid-dequant"))]
             k,
-            #[cfg(not(feature = "fused-gelu"))]
+            #[cfg(not(feature = "hybrid-dequant"))]
             v,
             o,
             n_heads: cfg.num_heads,
@@ -299,7 +299,7 @@ impl T5Attention {
     ) -> Result<(Tensor, Option<Tensor>)> {
         let (b_sz, q_len) = (xs.dim(0)?, xs.dim(1)?);
 
-        #[cfg(feature = "fused-gelu")]
+        #[cfg(feature = "hybrid-dequant")]
         let (q, k, v) = {
             let _ = key_value_states;
             let qkv = self.qkv.forward(xs)?;
@@ -313,7 +313,7 @@ impl T5Attention {
                 qkv.narrow(0, 2, 1)?.squeeze(0)?,
             )
         };
-        #[cfg(not(feature = "fused-gelu"))]
+        #[cfg(not(feature = "hybrid-dequant"))]
         let (q, k, v) = {
             let kv_input = match key_value_states {
                 None => xs,
@@ -342,9 +342,9 @@ impl T5Attention {
 
         let (scores, position_bias) = match position_bias {
             Some(position_bias) => {
-                #[cfg(feature = "fused-gelu")]
+                #[cfg(feature = "hybrid-dequant")]
                 let scores = crate::fused_matmul::fast_add(&scores, position_bias)?;
-                #[cfg(not(feature = "fused-gelu"))]
+                #[cfg(not(feature = "hybrid-dequant"))]
                 let scores = scores.broadcast_add(position_bias)?;
                 (scores, Some(position_bias.clone()))
             }
@@ -393,9 +393,9 @@ impl T5Attention {
                         .permute((2, 0, 1))?
                         .unsqueeze(0)?
                         .contiguous()?;
-                    #[cfg(feature = "fused-gelu")]
+                    #[cfg(feature = "hybrid-dequant")]
                     let scores = crate::fused_matmul::fast_add(&scores, &position_bias)?;
-                    #[cfg(not(feature = "fused-gelu"))]
+                    #[cfg(not(feature = "hybrid-dequant"))]
                     let scores = scores.broadcast_add(&position_bias)?;
                     (scores, Some(position_bias))
                 }
@@ -438,9 +438,9 @@ impl T5LayerSelfAttention {
         let (ys, position_bias) =
             self.self_attention
                 .forward(&normed_xs, position_bias, None, None)?;
-        #[cfg(feature = "fused-gelu")]
+        #[cfg(feature = "hybrid-dequant")]
         let ys = crate::fused_matmul::fast_add(xs, &ys)?;
-        #[cfg(not(feature = "fused-gelu"))]
+        #[cfg(not(feature = "hybrid-dequant"))]
         let ys = (xs + ys)?;
         Ok((ys, position_bias))
     }

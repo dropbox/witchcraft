@@ -28,4 +28,4 @@ libc = { version = "0.2.147", optional = true }
 default = ["ov"]
 ov = ["dep:openvino"]
 accelerate = ["dep:libc", "dep:accelerate-src", "candle-core/accelerate"]
-fused-gelu = ["dep:rayon"]
+hybrid-dequant = ["dep:rayon"]

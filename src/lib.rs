@@ -10,7 +10,7 @@ mod quantized_t5;
 use quantized_t5 as t5_encoder;
 #[cfg(feature = "t5-quantized")]
 mod fast_ops;
-#[cfg(feature = "fused-gelu")]
+#[cfg(feature = "hybrid-dequant")]
 mod fused_matmul;
 
 #[cfg(feature = "t5-openvino")]

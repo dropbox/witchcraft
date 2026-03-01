@@ -37,7 +37,7 @@ win: download
 	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features embed-assets
 
 macintel: download
-	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,accelerate,fused-gelu
+	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,accelerate,hybrid-dequant
 
 macintelasan: download
 	rustup override set nightly

@@ -1,5 +1,5 @@
 mod quantized_t5;
-#[cfg(feature = "fused-gelu")]
+#[cfg(feature = "hybrid-dequant")]
 mod fused_matmul;
 
 use anyhow::Result;

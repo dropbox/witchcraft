@@ -79,7 +79,7 @@ embed-assets = []
 progress = ["dep:indicatif"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
-fused-gelu = ["dep:rayon"]
+hybrid-dequant = ["dep:rayon"]
 
 [dependencies.rusqlite]
 version = "0.35.0"
