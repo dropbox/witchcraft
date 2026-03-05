@@ -1,9 +1,8 @@
-mod quantized_t5;
-
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use std::path::PathBuf;
 use std::time::Instant;
+use warp::quantized_t5;
 
 fn load_tokenizer(assets: &PathBuf) -> Result<tokenizers::Tokenizer> {
     let bytes = std::fs::read(assets.join("tokenizer.json"))?;

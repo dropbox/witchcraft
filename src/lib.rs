@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 // Conditionally compile T5 encoder based on features
 #[cfg(feature = "t5-quantized")]
-mod quantized_t5;
+pub mod quantized_t5;
 #[cfg(feature = "t5-quantized")]
 use quantized_t5 as t5_encoder;
 #[cfg(feature = "t5-quantized")]
