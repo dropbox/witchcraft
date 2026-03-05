@@ -84,7 +84,8 @@ t5-openvino = ["dep:openvino"]
 progress = ["dep:indicatif"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
-hybrid-dequant = ["dep:rayon", "dep:fbgemm-rs"]
+hybrid-dequant = ["dep:rayon"]
+fbgemm = ["hybrid-dequant", "dep:fbgemm-rs"]
 
 [dependencies.rusqlite]
 version = "0.35.0"

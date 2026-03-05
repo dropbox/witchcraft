@@ -2,6 +2,8 @@ mod quantized_t5;
 mod fast_ops;
 #[cfg(feature = "ov")]
 mod openvino_t5;
+#[cfg(feature = "fbgemm")]
+use warp::quantized_t5 as fbgemm_t5;
 
 use anyhow::Result;
 use candle_core::{Device, Tensor};
@@ -100,26 +102,22 @@ fn compare_quantized_backends(
             continue;
         }
 
-        let doc_id = &record[0];
+        let _doc_id = &record[0];
         let text = &record[1];
 
-        // Tokenize
         let encoding = tokenizer.encode(text, true)
             .map_err(|e| anyhow::anyhow!("encoding failed: {e}"))?;
         let ids = encoding.get_ids();
 
-        // Skip empty or very long documents
         if ids.is_empty() || ids.len() > 512 {
             continue;
         }
 
         let input = Tensor::new(ids, &device)?.unsqueeze(0)?;
 
-        // Generate embeddings twice
         let emb1 = model.forward(&input)?;
         let emb2 = model.forward(&input)?;
 
-        // Compare
         let comparison = compare_embeddings(&emb1, &emb2)?;
 
         all_min_sims.push(comparison.min_similarity);
@@ -270,6 +268,108 @@ fn compare_quantized_vs_openvino(
     Ok(())
 }
 
+#[cfg(feature = "fbgemm")]
+fn compare_vanilla_vs_fbgemm(
+    assets: &PathBuf,
+    tokenizer: &Tokenizer,
+    tsv_path: &PathBuf,
+) -> Result<()> {
+    eprintln!("\n=== Comparing Vanilla Candle QMatMul vs fbgemm-rs hybrid-dequant ===");
+
+    let device = Device::Cpu;
+
+    // Load config
+    let cfg_bytes = std::fs::read(assets.join("config.json"))?;
+
+    // Load vanilla model (this crate's quantized_t5 — standard candle QMatMul)
+    let config_v: quantized_t5::Config = serde_json::from_slice(&cfg_bytes)?;
+    let vb_v = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
+        &assets.join("xtr.gguf"),
+        &device,
+    )?;
+    let vanilla_model = quantized_t5::T5EncoderModel::load(vb_v, &config_v)?;
+
+    // Load fbgemm model (warp's quantized_t5 compiled with hybrid-dequant)
+    let config_f: fbgemm_t5::Config = serde_json::from_slice(&cfg_bytes)?;
+    let vb_f = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
+        &assets.join("xtr.gguf"),
+        &device,
+    )?;
+    let fbgemm_model = fbgemm_t5::T5EncoderModel::load(vb_f, &config_f)?;
+
+    eprintln!("Both models loaded, reading dataset from {}", tsv_path.display());
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .has_headers(false)
+        .from_path(tsv_path)?;
+
+    let mut all_min_sims = Vec::new();
+    let mut all_avg_sims = Vec::new();
+    let mut doc_count = 0;
+
+    for result in rdr.records() {
+        let record = result?;
+        if record.len() < 2 {
+            continue;
+        }
+
+        let text = &record[1];
+
+        let encoding = tokenizer.encode(text, true)
+            .map_err(|e| anyhow::anyhow!("encoding failed: {e}"))?;
+        let ids = encoding.get_ids();
+
+        if ids.is_empty() || ids.len() > 512 {
+            continue;
+        }
+
+        let input = Tensor::new(ids, &device)?.unsqueeze(0)?;
+
+        let emb_vanilla = vanilla_model.forward(&input)?;
+        let emb_fbgemm = fbgemm_model.forward(&input)?;
+
+        let comparison = compare_embeddings(&emb_vanilla, &emb_fbgemm)?;
+
+        all_min_sims.push(comparison.min_similarity);
+        all_avg_sims.push(comparison.avg_similarity);
+
+        doc_count += 1;
+
+        if doc_count % 10 == 0 {
+            eprintln!(
+                "  Doc {}: {} tokens, min_sim={:.6}, avg_sim={:.6}",
+                doc_count,
+                comparison.total_vectors,
+                comparison.min_similarity,
+                comparison.avg_similarity
+            );
+        }
+
+        if doc_count >= 50 {
+            break;
+        }
+    }
+
+    let overall_min = all_min_sims.iter().cloned().fold(f32::INFINITY, f32::min);
+    let overall_avg_min = all_min_sims.iter().sum::<f32>() / all_min_sims.len() as f32;
+    let overall_avg = all_avg_sims.iter().sum::<f32>() / all_avg_sims.len() as f32;
+
+    eprintln!("\n=== Results (Vanilla QMatMul vs fbgemm-rs hybrid-dequant) ===");
+    eprintln!("Documents processed: {}", doc_count);
+    eprintln!("Minimum similarity across all vectors: {:.6}", overall_min);
+    eprintln!("Average of minimum similarities per doc: {:.6}", overall_avg_min);
+    eprintln!("Average of average similarities per doc: {:.6}", overall_avg);
+
+    if overall_min < 0.99 {
+        eprintln!("\n  WARNING: Low similarity (<0.99) — fbgemm-rs path may diverge");
+    } else {
+        eprintln!("\n  Excellent similarity (>0.99) — fbgemm-rs matches vanilla");
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let assets = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "assets".into()));
     let tsv_path = PathBuf::from(
@@ -306,6 +406,12 @@ fn main() -> Result<()> {
 
     #[cfg(not(feature = "ov"))]
     eprintln!("\nOpenVINO comparison not available (build with --features ov)");
+
+    #[cfg(feature = "fbgemm")]
+    compare_vanilla_vs_fbgemm(&assets, &tokenizer, &tsv_path)?;
+
+    #[cfg(not(feature = "fbgemm"))]
+    eprintln!("\nfbgemm-rs comparison not available (build with --features fbgemm)");
 
     Ok(())
 }

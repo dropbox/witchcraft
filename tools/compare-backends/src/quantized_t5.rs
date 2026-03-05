@@ -20,18 +20,12 @@ use candle_nn::Activation;
 use candle_transformers::models::t5::{
     deserialize_feed_forward_proj_activation, ActivationWithOptionalGating,
 };
-#[cfg(not(feature = "hybrid-dequant"))]
 use candle_core::quantized::QMatMul;
-#[cfg(feature = "hybrid-dequant")]
-use crate::fused_matmul::MatMul as QMatMul;
 use candle_transformers::quantized_nn::Embedding;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
-use std::io::{Error, ErrorKind};
 use std::sync::Arc;
-use tokenizers::Tokenizer;
 
-#[cfg(not(feature = "hybrid-dequant"))]
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     let device = vb.device();
     let ws = vb.get((out_d, in_d), "weight")?;
@@ -41,19 +35,6 @@ fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     } else {
         QMatMul::from_arc(ws)
     }
-}
-
-#[cfg(feature = "hybrid-dequant")]
-fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
-    let ws = vb.get((out_d, in_d), "weight")?;
-    Ok(QMatMul::from_qtensor(ws))
-}
-
-#[cfg(feature = "hybrid-dequant")]
-fn new_qmm_dequant(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
-    let ws = vb.get((out_d, in_d), "weight")?;
-    let tensor = ws.dequantize(vb.device())?;
-    Ok(QMatMul::from_tensor(tensor))
 }
 
 fn default_relative_attention_max_distance() -> usize {
@@ -177,9 +158,6 @@ struct T5DenseActDense {
 impl T5DenseActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let wi = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi"))?;
-        #[cfg(feature = "hybrid-dequant")]
-        let wo = new_qmm_dequant(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
-        #[cfg(not(feature = "hybrid-dequant"))]
         let wo = new_qmm(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
         Ok(Self {
             wi,
@@ -210,9 +188,6 @@ impl T5DenseGatedActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let wi_0 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_0"))?;
         let wi_1 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_1"))?;
-        #[cfg(feature = "hybrid-dequant")]
-        let wo = new_qmm_dequant(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
-        #[cfg(not(feature = "hybrid-dequant"))]
         let wo = new_qmm(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
         Ok(Self {
             wi_0,
@@ -225,23 +200,9 @@ impl T5DenseGatedActDense {
 
 impl Module for T5DenseGatedActDense {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "hybrid-dequant")]
-        let hidden = match self.act {
-            Activation::NewGelu | Activation::GeluPytorchTanh => {
-                crate::fused_matmul::forward_gated_gelu(&self.wi_0, &self.wi_1, xs)?
-            }
-            _ => {
-                let hidden_act = self.act.forward(&self.wi_0.forward(xs)?)?;
-                let hidden_linear = self.wi_1.forward(xs)?;
-                hidden_act.broadcast_mul(&hidden_linear)?
-            }
-        };
-        #[cfg(not(feature = "hybrid-dequant"))]
-        let hidden = {
-            let hidden_act = self.act.forward(&self.wi_0.forward(xs)?)?;
-            let hidden_linear = self.wi_1.forward(xs)?;
-            hidden_act.broadcast_mul(&hidden_linear)?
-        };
+        let hidden_act = self.act.forward(&self.wi_0.forward(xs)?)?;
+        let hidden_linear = self.wi_1.forward(xs)?;
+        let hidden = hidden_act.broadcast_mul(&hidden_linear)?;
         self.wo.forward(&hidden)
     }
 }
@@ -290,13 +251,8 @@ impl Module for T5LayerFF {
 
 #[derive(Debug, Clone)]
 struct T5Attention {
-    #[cfg(feature = "hybrid-dequant")]
-    qkv: QMatMul,
-    #[cfg(not(feature = "hybrid-dequant"))]
     q: QMatMul,
-    #[cfg(not(feature = "hybrid-dequant"))]
     k: QMatMul,
-    #[cfg(not(feature = "hybrid-dequant"))]
     v: QMatMul,
     o: QMatMul,
     n_heads: usize,
@@ -310,23 +266,10 @@ struct T5Attention {
 impl T5Attention {
     fn load(has_relative_attention_bias: bool, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let inner_dim = cfg.num_heads * cfg.d_kv;
-        #[cfg(feature = "hybrid-dequant")]
-        let (qkv, o) = {
-            let q_w = vb.pp("q").get((inner_dim, cfg.d_model), "weight")?.dequantize(vb.device())?;
-            let k_w = vb.pp("k").get((inner_dim, cfg.d_model), "weight")?.dequantize(vb.device())?;
-            let v_w = vb.pp("v").get((inner_dim, cfg.d_model), "weight")?.dequantize(vb.device())?;
-            let qkv = QMatMul::from_tensor(Tensor::cat(&[&q_w, &k_w, &v_w], 0)?);
-            let o = new_qmm_dequant(inner_dim, cfg.d_model, vb.pp("o"))?;
-            (qkv, o)
-        };
-        #[cfg(not(feature = "hybrid-dequant"))]
-        let (q, k, v, o) = {
-            let q = new_qmm(cfg.d_model, inner_dim, vb.pp("q"))?;
-            let k = new_qmm(cfg.d_model, inner_dim, vb.pp("k"))?;
-            let v = new_qmm(cfg.d_model, inner_dim, vb.pp("v"))?;
-            let o = new_qmm(inner_dim, cfg.d_model, vb.pp("o"))?;
-            (q, k, v, o)
-        };
+        let q = new_qmm(cfg.d_model, inner_dim, vb.pp("q"))?;
+        let k = new_qmm(cfg.d_model, inner_dim, vb.pp("k"))?;
+        let v = new_qmm(cfg.d_model, inner_dim, vb.pp("v"))?;
+        let o = new_qmm(inner_dim, cfg.d_model, vb.pp("o"))?;
         let relative_attention_bias = if has_relative_attention_bias {
             let emb = Embedding::new(
                 cfg.relative_attention_num_buckets,
@@ -338,13 +281,8 @@ impl T5Attention {
             None
         };
         Ok(Self {
-            #[cfg(feature = "hybrid-dequant")]
-            qkv,
-            #[cfg(not(feature = "hybrid-dequant"))]
             q,
-            #[cfg(not(feature = "hybrid-dequant"))]
             k,
-            #[cfg(not(feature = "hybrid-dequant"))]
             v,
             o,
             n_heads: cfg.num_heads,
@@ -365,44 +303,26 @@ impl T5Attention {
     ) -> Result<(Tensor, Option<Tensor>)> {
         let (b_sz, q_len) = (xs.dim(0)?, xs.dim(1)?);
 
-        #[cfg(feature = "hybrid-dequant")]
-        let (q, k, v) = {
-            let _ = key_value_states;
-            let qkv = self.qkv.forward(xs)?;
-            let qkv = qkv
-                .reshape((b_sz, q_len, 3, self.n_heads, self.d_kv))?
-                .permute((2, 0, 3, 1, 4))?
-                .contiguous()?;
-            (
-                qkv.narrow(0, 0, 1)?.squeeze(0)?,
-                qkv.narrow(0, 1, 1)?.squeeze(0)?,
-                qkv.narrow(0, 2, 1)?.squeeze(0)?,
-            )
+        let kv_input = match key_value_states {
+            None => xs,
+            Some(key_value_states) => key_value_states,
         };
-        #[cfg(not(feature = "hybrid-dequant"))]
-        let (q, k, v) = {
-            let kv_input = match key_value_states {
-                None => xs,
-                Some(key_value_states) => key_value_states,
-            };
-            let kv_len = kv_input.dim(1)?;
-            let q = self.q.forward(xs)?;
-            let k = self.k.forward(kv_input)?;
-            let v = self.v.forward(kv_input)?;
-            let q = q
-                .reshape((b_sz, q_len, self.n_heads, self.d_kv))?
-                .transpose(1, 2)?
-                .contiguous()?;
-            let k = k
-                .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
-                .transpose(1, 2)?
-                .contiguous()?;
-            let v = v
-                .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
-                .transpose(1, 2)?
-                .contiguous()?;
-            (q, k, v)
-        };
+        let kv_len = kv_input.dim(1)?;
+        let q = self.q.forward(xs)?;
+        let k = self.k.forward(kv_input)?;
+        let v = self.v.forward(kv_input)?;
+        let q = q
+            .reshape((b_sz, q_len, self.n_heads, self.d_kv))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = k
+            .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v = v
+            .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
+            .transpose(1, 2)?
+            .contiguous()?;
 
         let scores = q.matmul(&k.t()?)?;
         let scores = match mask {

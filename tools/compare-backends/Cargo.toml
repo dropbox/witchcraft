@@ -19,6 +19,9 @@ serde_json = "*"
 openvino = { version = "0.9.1", features = ["runtime-linking"], optional = true }
 tempfile = "*"
 
+# Warp with hybrid-dequant for comparison (fbgemm feature adds fbgemm-rs packed GEMM)
+warp = { path = "../..", default-features = false, features = ["t5-quantized", "fbgemm"], optional = true }
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 candle-core = { git = "https://github.com/huggingface/candle", rev="0.9.2-alpha.2", features = ["metal"] }
 accelerate-src = { version = "0.3.2", optional = true }
@@ -29,3 +32,4 @@ accelerate-src = { version = "0.3.2", optional = true }
 [features]
 accelerate = ["dep:accelerate-src"]
 ov = ["dep:openvino"]
+fbgemm = ["dep:warp"]

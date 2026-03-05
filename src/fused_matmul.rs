@@ -2,12 +2,14 @@
 //!
 //! Provides `MatMul`, a drop-in replacement for candle's `QMatMul` that uses
 //! column-tiled loops for better L1 cache behavior on x86.
-//! Pre-dequantized weights use fbgemm-rs F32 packed GEMM.
+//! Pre-dequantized weights use fbgemm-rs F32 packed GEMM when available,
+//! otherwise plain candle matmul (Accelerate BLAS on macOS).
 
 use candle_core::backend::BackendStorage;
 use candle_core::quantized::k_quants::*;
 use candle_core::quantized::{GgmlDType, GgmlType, QTensor};
 use candle_core::{CpuStorage, CustomOp1, DType, Layout, Module, Result, Shape, Tensor};
+#[cfg(feature = "fbgemm")]
 use fbgemm_rs::PackedMatrix;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -254,8 +256,10 @@ impl CustomOp1 for QGatedMatMul {
 
 // ---- fbgemm-rs F32 GEMM via pre-packed weights ----
 
+#[cfg(feature = "fbgemm")]
 struct FbgemmOp(Arc<PackedMatrix>);
 
+#[cfg(feature = "fbgemm")]
 impl CustomOp1 for FbgemmOp {
     fn name(&self) -> &'static str {
         "fbgemm-matmul"
@@ -302,18 +306,22 @@ impl CustomOp1 for FbgemmOp {
 // ---- MatMul: drop-in replacement for QMatMul ----
 
 /// Drop-in replacement for `candle_core::quantized::QMatMul` that uses
-/// column-tiled matmul for quantized weights and fbgemm-rs F32 packed
-/// GEMM for pre-dequantized weights.
+/// column-tiled matmul for quantized weights. Pre-dequantized weights use
+/// fbgemm-rs packed GEMM when available, otherwise plain candle matmul.
 pub enum MatMul {
     QTensor(Arc<QTensor>),
+    #[cfg(feature = "fbgemm")]
     Packed(Arc<PackedMatrix>),
+    Tensor(Tensor),
 }
 
 impl Clone for MatMul {
     fn clone(&self) -> Self {
         match self {
             Self::QTensor(qt) => Self::QTensor(qt.clone()),
+            #[cfg(feature = "fbgemm")]
             Self::Packed(p) => Self::Packed(p.clone()),
+            Self::Tensor(t) => Self::Tensor(t.clone()),
         }
     }
 }
@@ -322,7 +330,9 @@ impl std::fmt::Debug for MatMul {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::QTensor(qt) => f.debug_tuple("QTensor").field(qt).finish(),
+            #[cfg(feature = "fbgemm")]
             Self::Packed(p) => write!(f, "Packed({}x{})", p.k(), p.n()),
+            Self::Tensor(t) => write!(f, "Tensor({:?})", t.shape()),
         }
     }
 }
@@ -332,16 +342,23 @@ impl MatMul {
         Self::QTensor(qt)
     }
 
-    /// Pre-pack a dequantized [N, K] weight tensor into fbgemm-rs format.
+    /// Store a dequantized [N, K] weight tensor for F32 matmul.
+    /// Uses fbgemm-rs packed GEMM when available, otherwise plain candle matmul.
     pub fn from_tensor(t: Tensor) -> Self {
-        let (n, k) = t.dims2().expect("weight must be 2D for MatMul::from_tensor");
-        let data = t
-            .flatten_all()
-            .and_then(|t| t.to_vec1::<f32>())
-            .expect("weight to f32");
-        // Weight is [N, K] row-major = [K, N] column-major → from_transposed
-        let packed = PackedMatrix::from_transposed(k, n, &data);
-        Self::Packed(Arc::new(packed))
+        #[cfg(feature = "fbgemm")]
+        {
+            let (n, k) = t.dims2().expect("weight must be 2D for MatMul::from_tensor");
+            let data = t
+                .flatten_all()
+                .and_then(|t| t.to_vec1::<f32>())
+                .expect("weight to f32");
+            let packed = PackedMatrix::from_transposed(k, n, &data);
+            Self::Packed(Arc::new(packed))
+        }
+        #[cfg(not(feature = "fbgemm"))]
+        {
+            Self::Tensor(t)
+        }
     }
 }
 
@@ -349,7 +366,9 @@ impl Module for MatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => xs.apply_op1_no_bwd(&QTiledOp(t.clone())),
+            #[cfg(feature = "fbgemm")]
             Self::Packed(p) => xs.apply_op1_no_bwd(&FbgemmOp(p.clone())),
+            Self::Tensor(w) => xs.matmul(&w.t()?),
         }
     }
 }
