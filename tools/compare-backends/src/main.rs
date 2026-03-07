@@ -15,6 +15,7 @@ struct EmbeddingComparison {
     max_similarity: f32,
     avg_similarity: f32,
     total_vectors: usize,
+    filtered_vectors: usize,
 }
 
 fn load_tokenizer(assets: &PathBuf) -> Result<Tokenizer> {
@@ -41,6 +42,8 @@ struct VectorDetail {
     norm_b: f32,
 }
 
+const MIN_NORM: f32 = 1.0;
+
 fn compare_embeddings_detailed(emb1: &Tensor, emb2: &Tensor) -> Result<(EmbeddingComparison, Vec<VectorDetail>)> {
     let emb1 = emb1.squeeze(0)?;
     let emb2 = emb2.squeeze(0)?;
@@ -48,15 +51,30 @@ fn compare_embeddings_detailed(emb1: &Tensor, emb2: &Tensor) -> Result<(Embeddin
 
     let mut similarities = Vec::new();
     let mut details = Vec::new();
+    let mut filtered = 0usize;
 
     for i in 0..seq_len {
         let v1 = emb1.get(i)?;
         let v2 = emb2.get(i)?;
         let norm_a = v1.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
         let norm_b = v2.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        if norm_a < MIN_NORM || norm_b < MIN_NORM {
+            filtered += 1;
+            continue;
+        }
         let sim = compute_similarity(&v1, &v2)?;
         similarities.push(sim);
         details.push(VectorDetail { position: i, similarity: sim, norm_a, norm_b });
+    }
+
+    if similarities.is_empty() {
+        return Ok((EmbeddingComparison {
+            min_similarity: 0.0,
+            max_similarity: 0.0,
+            avg_similarity: 0.0,
+            total_vectors: 0,
+            filtered_vectors: filtered,
+        }, details));
     }
 
     let min_sim = similarities.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -67,7 +85,8 @@ fn compare_embeddings_detailed(emb1: &Tensor, emb2: &Tensor) -> Result<(Embeddin
         min_similarity: min_sim,
         max_similarity: max_sim,
         avg_similarity: avg_sim,
-        total_vectors: seq_len,
+        total_vectors: similarities.len(),
+        filtered_vectors: filtered,
     }, details))
 }
 
@@ -209,6 +228,8 @@ fn compare_quantized_vs_openvino(
     let mut all_min_sims = Vec::new();
     let mut all_avg_sims = Vec::new();
     let mut doc_count = 0;
+    let mut total_filtered = 0usize;
+    let mut total_kept = 0usize;
     let outlier_threshold = 0.92;
 
     // Collect all outliers across docs: (doc_id, token_text, position, sim, norm_q, norm_ov, seq_len)
@@ -258,6 +279,8 @@ fn compare_quantized_vs_openvino(
             }
         }
 
+        total_filtered += comparison.filtered_vectors;
+        total_kept += comparison.total_vectors;
         all_min_sims.push(comparison.min_similarity);
         all_avg_sims.push(comparison.avg_similarity);
 
@@ -265,10 +288,11 @@ fn compare_quantized_vs_openvino(
 
         if doc_count % 10 == 0 {
             eprintln!(
-                "  Doc {} ({}): {} tokens, min_sim={:.6}, avg_sim={:.6}",
+                "  Doc {} ({}): {} tokens ({} filtered), min_sim={:.6}, avg_sim={:.6}",
                 doc_count,
                 doc_id,
                 comparison.total_vectors,
+                comparison.filtered_vectors,
                 comparison.min_similarity,
                 comparison.avg_similarity
             );
@@ -285,6 +309,9 @@ fn compare_quantized_vs_openvino(
 
     eprintln!("\n=== Results (Quantized vs OpenVINO INT4) ===");
     eprintln!("Documents processed: {}", doc_count);
+    eprintln!("Vectors compared: {} (filtered {} low-norm tokens, {:.1}%)",
+        total_kept, total_filtered,
+        100.0 * total_filtered as f64 / (total_kept + total_filtered) as f64);
     eprintln!("Minimum similarity across all vectors: {:.6}", overall_min);
     eprintln!("Average of minimum similarities per doc: {:.6}", overall_avg_min);
     eprintln!("Average of average similarities per doc: {:.6}", overall_avg);
