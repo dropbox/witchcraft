@@ -1009,8 +1009,6 @@ pub fn match_centroids(
         now.elapsed().as_millis()
     );
 
-    let now = std::time::Instant::now();
-    let temp_table_start = std::time::Instant::now();
     db.execute(
         "CREATE TEMPORARY TABLE temp2(rowid INTEGER PRIMARY KEY, score FLOAT, sub_idx INTEGER)",
     )?;
@@ -1019,11 +1017,6 @@ pub fn match_centroids(
     for (idx, score, sub_idx) in all_scored.iter() {
         let _ = insert_temp_query.execute((idx, score, sub_idx));
     }
-    debug!(
-        "creating temp table and inserting {} rows took {} ms",
-        all_scored.len(),
-        temp_table_start.elapsed().as_millis()
-    );
 
     let (filter_sql, filter_params) = build_filter_sql_and_params(sql_filter)?;
     let filter_clause = if !filter_sql.is_empty() {
