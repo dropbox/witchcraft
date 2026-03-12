@@ -1,4 +1,4 @@
-const INV_SQRT2: f32 = 0.707_106_77;
+const INV_SQRT2: f32 = 0.7071067811865475;
 
 #[inline(always)]
 pub(crate) fn haar_forward_mirror_edge(x: &mut [f32]) {
