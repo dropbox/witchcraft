@@ -69,6 +69,14 @@ use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
 
+/// Mode for indexing operations - determines which chunks to process
+enum IndexMode {
+    /// Index all chunks (full rebuild)
+    Full,
+    /// Index only unindexed chunks (incremental update)
+    Incremental,
+}
+
 pub fn make_device() -> Device {
     // Metal only works on Apple Silicon (ARM), not Intel x86_64
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -322,7 +330,7 @@ fn write_buckets(
     db: &DB,
     centers: &Tensor,
     device: &Device,
-    embeddings_sql: &str,
+    mode: IndexMode,
     expected_count: u64,
 ) -> Result<(Vec<tempfile::NamedTempFile>, Vec<u32>, Tensor)> {
     let _priority_mgr = PriorityManager::new();
@@ -334,6 +342,20 @@ fn write_buckets(
     let mut document_indices = Vec::<(u32, u32)>::new();
     let mut all_chunkids = vec![];
     let mut all_embeddings = vec![];
+
+    let embeddings_sql = match mode {
+        IndexMode::Full => {
+            "SELECT document.rowid,chunk.rowid,chunk.embeddings,chunk.counts FROM document,chunk
+            WHERE document.hash = chunk.hash
+            ORDER BY document.rowid"
+        }
+        IndexMode::Incremental => {
+            "SELECT document.rowid,chunk.rowid,chunk.embeddings,chunk.counts FROM document,chunk
+            WHERE document.hash = chunk.hash
+            AND NOT EXISTS (SELECT 1 FROM indexed_chunk WHERE chunkid = chunk.rowid)
+            ORDER BY document.rowid"
+        }
+    };
 
     let mut query = db.query(embeddings_sql)?;
 
@@ -1396,15 +1418,11 @@ pub fn full_index(db: &DB, device: &Device) -> Result<()> {
 
     debug!("write buckets (full)...");
     let now = std::time::Instant::now();
-    let embeddings_sql =
-        "SELECT document.rowid,chunk.rowid,chunk.embeddings,chunk.counts FROM document,chunk
-        WHERE document.hash = chunk.hash
-        ORDER BY document.rowid";
     let (tmpfiles, all_chunkids, centers_cpu) = write_buckets(
         db,
         &centers,
         device,
-        embeddings_sql,
+        IndexMode::Full,
         total_embeddings as u64,
     )?;
     info!(
@@ -1448,16 +1466,11 @@ fn incremental_index(db: &DB, device: &Device) -> Result<()> {
 
     debug!("write buckets (incremental)...");
     let now = std::time::Instant::now();
-    let embeddings_sql =
-        "SELECT document.rowid,chunk.rowid,chunk.embeddings,chunk.counts FROM document,chunk
-        WHERE document.hash = chunk.hash
-        AND NOT EXISTS (SELECT 1 FROM indexed_chunk WHERE chunkid = chunk.rowid)
-        ORDER BY document.rowid";
     let (tmpfiles, all_chunkids, centers_cpu) = write_buckets(
         db,
         &centers,
         device,
-        embeddings_sql,
+        IndexMode::Incremental,
         total_embeddings as u64,
     )?;
     info!(
