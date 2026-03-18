@@ -623,12 +623,7 @@ impl Warp {
     #[napi(constructor)]
     pub fn new(db_name: String, assets: String) -> Self {
         let cwd = std::env::current_dir().unwrap();
-        info!(
-            "warp running db=`{}' assets=`{}' cwd=`{}'",
-            db_name,
-            assets,
-            cwd.display()
-        );
+        info!("warp running");
         let indexer = Indexer::global(db_name.clone(), assets.clone());
         Self {
             db_name,
