@@ -270,7 +270,9 @@ impl CustomOp1 for FbgemmBf16Op {
         let mut dst_shape = src_shape.dims().to_vec();
         let last_k = dst_shape.pop().unwrap();
         if last_k != k {
-            candle_core::bail!("input tensor {layout:?} incompatible with packed bf16 matrix ({k}x{n})")
+            candle_core::bail!(
+                "input tensor {layout:?} incompatible with packed bf16 matrix ({k}x{n})"
+            )
         }
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);

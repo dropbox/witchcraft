@@ -35,7 +35,9 @@ impl T5ModelBuilder {
             let dll_file = assets.join("openvino_c.dll");
             if dll_file.exists() {
                 // Get absolute path
-                let abs_assets = assets.canonicalize().unwrap_or_else(|_| assets.to_path_buf());
+                let abs_assets = assets
+                    .canonicalize()
+                    .unwrap_or_else(|_| assets.to_path_buf());
                 if let Some(assets_str) = abs_assets.to_str() {
                     // Add to PATH environment variable at the front
                     if let Ok(current_path) = std::env::var("PATH") {
@@ -43,9 +45,7 @@ impl T5ModelBuilder {
                         unsafe {
                             std::env::set_var("PATH", new_path);
                         }
-                        log::info!(
-                            "Added assets directory to PATH for OpenVINO DLLs",
-                        );
+                        log::info!("Added assets directory to PATH for OpenVINO DLLs",);
                     }
                 }
             }

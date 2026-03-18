@@ -331,9 +331,8 @@ impl T5Attention {
                 .pp("v")
                 .get((inner_dim, cfg.d_model), "weight")?
                 .dequantize(vb.device())?;
-            let qkv = AttentionWeights::Fused(
-                QMatMul::from_tensor(Tensor::cat(&[&q_w, &k_w, &v_w], 0)?)
-            );
+            let qkv =
+                AttentionWeights::Fused(QMatMul::from_tensor(Tensor::cat(&[&q_w, &k_w, &v_w], 0)?));
             let o = new_qmm_dequant(inner_dim, cfg.d_model, vb.pp("o"))?;
             (qkv, o)
         };
@@ -394,7 +393,11 @@ impl T5Attention {
                     qkv.narrow(0, 2, 1)?.squeeze(0)?,
                 )
             }
-            AttentionWeights::Separate { q: q_mm, k: k_mm, v: v_mm } => {
+            AttentionWeights::Separate {
+                q: q_mm,
+                k: k_mm,
+                v: v_mm,
+            } => {
                 let kv_input = match key_value_states {
                     None => xs,
                     Some(key_value_states) => key_value_states,

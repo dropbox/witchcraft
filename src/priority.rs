@@ -83,11 +83,7 @@ mod platform_impl {
 
                 // Get current QoS class
                 let thread = pthread_self();
-                let _ = pthread_get_qos_class_np(
-                    thread,
-                    &mut original_qos,
-                    &mut original_priority,
-                );
+                let _ = pthread_get_qos_class_np(thread, &mut original_qos, &mut original_priority);
 
                 // Set to UTILITY class for long-running work
                 let _ = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
