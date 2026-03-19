@@ -1,8 +1,49 @@
+# Auto-detect platform and architecture
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Determine features and flags based on platform
+ifeq ($(UNAME_S),Darwin)
+  ifeq ($(UNAME_M),arm64)
+    # Apple Silicon: Metal GPU + Accelerate BLAS
+    CLI_FEATURES := t5-quantized,metal,progress
+    NAPI_FEATURES := t5-quantized,metal,napi
+    RUSTFLAGS_EXTRA :=
+    TARGET := aarch64-apple-darwin
+  else
+    # Intel Mac: CPU-only with FBGEMM + hybrid-dequant
+    CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
+    NAPI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,napi
+    RUSTFLAGS_EXTRA := -C target-feature=+avx2,+fma
+    TARGET := x86_64-apple-darwin
+  endif
+else ifeq ($(UNAME_S),Linux)
+  CLI_FEATURES := t5-quantized,fbgemm,progress
+  NAPI_FEATURES := t5-quantized,fbgemm,napi
+  RUSTFLAGS_EXTRA :=
+  TARGET :=
+endif
+
+# Binary path
+ifdef TARGET
+  CLI_BIN := target/$(TARGET)/release/warp-cli
+  BUILD_TARGET := --target $(TARGET)
+else
+  CLI_BIN := target/release/warp-cli
+  BUILD_TARGET :=
+endif
+
+export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
+
+# === Python environment ===
+
 env/pyvenv.cfg:
 	uv venv env
 
 env/bin/transformers: env/pyvenv.cfg
 	(source env/*/activate; uv pip install -r requirements.txt)
+
+# === Assets / weights ===
 
 assets:
 	mkdir -p assets
@@ -16,53 +57,49 @@ assets/xtr.gguf: xtr.safetensors | assets
 assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml:
 	python quantize-int4.py
 
-download: assets assets/config.json assets/tokenizer.json assets/xtr.gguf assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
+download: assets assets/config.json assets/tokenizer.json assets/xtr.gguf
 
-build: download
-	RUSTFLAGS='-C target-feature=+neon' cargo build --release --target aarch64-apple-darwin --features t5-quantized,metal,accelerate,napi
-	ln -vf target/aarch64-apple-darwin/release/libwarp.dylib target/release/warp.node
+# === Build targets ===
 
-module:
-	cargo build --release --target aarch64-apple-darwin --features t5-quantized,metal,accelerate
-	cargo build --release --target x86_64-apple-darwin --features t5-quantized,accelerate
-	lipo -create target/aarch64-apple-darwin/release/libwarp.dylib target/x86_64-apple-darwin/release/libwarp.dylib -output target/release/warp-macos-universal.node
+warp-cli: download
+	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES) --bin warp-cli
 
-winmodule:
-	cargo xwin build --release --target x86_64-pc-windows-msvc
-	ln -vf target/x86_64-pc-windows-msvc/release/warp.dll target/release/warp-windows.node
-
-win: download
-	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features t5-openvino,fbgemm,napi
-
-macintel: download
+macintel:
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,progress
 
+winintel: download
+	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features t5-openvino,fbgemm,progress
 
-run: build
-	node index.js
+ifdef TARGET
+  LIB_BIN := target/$(TARGET)/release/libwarp.dylib
+else
+  LIB_BIN := target/release/libwarp.dylib
+endif
 
-mcp: download
-	cargo build --release --target aarch64-apple-darwin --features t5-quantized,metal,accelerate,napi
-	ln -vf target/aarch64-apple-darwin/release/libwarp.dylib target/release/warp.node
-	yarn napi build --release --features metal
-	yarn tsc
-	cmcp "node dist/index.js" tools/call name=search 'arguments:={"q": "teenagers and acne" }'
+module:
+	cargo build --release --target aarch64-apple-darwin --features t5-quantized,metal,napi
+	cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,napi
+	lipo -create target/aarch64-apple-darwin/release/libwarp.dylib target/x86_64-apple-darwin/release/libwarp.dylib -output target/release/warp-macos-universal.node
 
 test: download
-	RUST_LOG=debug cargo llvm-cov nextest --release --features napi,t5-quantized,metal,accelerate --lcov --output-path lcov.info # --no-capture
+	RUST_LOG=debug cargo llvm-cov nextest --release --features napi,$(CLI_FEATURES) --lcov --output-path lcov.info
 	genhtml lcov.info
 
 bench:
 	cargo run -p t5-bench --release --features hybrid-dequant,ov
 
-nfcorpus: download
-	rm -rf mydb.sqlite
-	cargo run --release --features metal,t5-quantized,progress  --bin warp-cli readcsv datasets/nfcorpus.tsv
-	cargo run --release --features metal,t5-quantized,progress --bin warp-cli embed
-	cargo run --release --features metal,t5-quantized,progress --bin warp-cli index
+# === Dataset targets ===
 
-nfcorpus-cpu: download
+nfcorpus: warp-cli
 	rm -rf mydb.sqlite
-	cargo run --release --features fbgemm,t5-quantized,progress  --bin warp-cli readcsv datasets/nfcorpus.tsv
-	cargo run --release --features fbgemm,t5-quantized,progress --bin warp-cli embed
-	cargo run --release --features fbgemm,t5-quantized,progress --bin warp-cli index
+	$(CLI_BIN) readcsv datasets/nfcorpus.tsv
+	$(CLI_BIN) embed
+	$(CLI_BIN) index
+
+nfcorpus-score: warp-cli
+	$(CLI_BIN) hybridcsv ~/src/xtr-warp/beir/nfcorpus/questions.test.tsv warp-results.txt
+
+run: build
+	node index.js
+
+.PHONY: download build warp-cli module win test bench nfcorpus nfcorpus-score run
