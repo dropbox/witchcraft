@@ -86,7 +86,7 @@ test: download
 	genhtml lcov.info
 
 bench:
-	cargo run -p t5-bench --release --features hybrid-dequant,ov
+	cargo run -p t5-bench --release --features hybrid-dequant,ov,fbgemm
 
 # === Dataset targets ===
 
@@ -99,7 +99,8 @@ nfcorpus: warp-cli
 nfcorpus-score: warp-cli
 	$(CLI_BIN) hybridcsv ~/src/xtr-warp/beir/nfcorpus/questions.test.tsv warp-results.txt
 
-run: build
-	node index.js
+run: module
+	ln -sf target/release/warp-macos-universal.node warp.node
+	node index.cjs
 
 .PHONY: download build warp-cli module win test bench nfcorpus nfcorpus-score run

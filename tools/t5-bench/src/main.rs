@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{Device, Tensor};
+use candle_core::Tensor;
 use std::path::PathBuf;
 use std::time::Instant;
 use warp::quantized_t5;
@@ -25,7 +25,7 @@ fn make_input(tokenizer: &tokenizers::Tokenizer, base: &str, min_tokens: usize) 
 }
 
 fn bench_candle(assets: &PathBuf, tokenizer: &tokenizers::Tokenizer, sizes: &[usize]) -> Result<()> {
-    let device = Device::Cpu;
+    let device = warp::make_device();
 
     let cfg_bytes = std::fs::read(assets.join("config.json"))?;
     let config: quantized_t5::Config = serde_json::from_slice(&cfg_bytes)?;
