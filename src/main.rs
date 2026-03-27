@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{debug, info};
+use log::debug;
 use log::{Level, LevelFilter, Metadata, Record};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -101,7 +101,7 @@ pub fn bulk_search(
         let question = record.1;
         let top_k = 100;
 
-        info!("searching for: {}", question);
+        debug!("searching for: {}", question);
         let now = std::time::Instant::now();
         let fts_start = std::time::Instant::now();
         let fts_matches = if use_fulltext {
@@ -181,12 +181,6 @@ pub fn bulk_search(
 fn main() -> Result<()> {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Info));
 
-    // Log CPU feature flags
-    #[cfg(target_feature = "avx2")]
-    info!("AVX2 instructions enabled");
-    #[cfg(target_feature = "fma")]
-    info!("FMA instructions enabled");
-
     let args: Vec<String> = env::args().collect();
     let assets = std::path::PathBuf::from("assets");
     let db_name = std::path::PathBuf::from("mydb.sqlite");
@@ -216,7 +210,7 @@ fn main() -> Result<()> {
         let q = &args[2..].join(" ");
         let use_fulltext = args[1] == "hybrid";
         let results =
-            warp::search(&db, &embedder, &mut cache, q, 0.75, 10, use_fulltext, None).unwrap();
+            warp::search(&db, &embedder, &mut cache, q, 0.7, 10, use_fulltext, None).unwrap();
         for (score, _metadata, body, body_idx) in results {
             println!("{score}: {body} @ {body_idx}");
             println!("=============================================");
