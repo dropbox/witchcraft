@@ -1,7 +1,8 @@
 [package]
 name = "warp"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+license = "Apache-2.0"
 
 [workspace]                     # !Dash
 members = ["tools/quantize-tool", "tools/t5-bench", "tools/ov-stress", "tools/compare-backends"] # !Dash
