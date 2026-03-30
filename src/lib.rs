@@ -65,6 +65,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
+type DocPtr = (u32, u32);
 
 /// Mode for indexing operations - determines which chunks to process
 enum IndexMode {
@@ -599,8 +600,8 @@ pub fn fulltext_search(
     Ok(fts_matches)
 }
 
-pub fn reciprocal_rank_fusion(list1: &[u32], list2: &[u32], k: f64) -> Vec<u32> {
-    let mut scores: HashMap<u32, f64> = HashMap::new();
+pub fn reciprocal_rank_fusion(list1: &[DocPtr], list2: &[DocPtr], k: f64) -> Vec<DocPtr> {
+    let mut scores: HashMap<DocPtr, f64> = HashMap::new();
 
     for (rank, &doc_id) in list1.iter().enumerate() {
         let score = 1.0 / (3.0 + k + rank as f64);
@@ -612,9 +613,9 @@ pub fn reciprocal_rank_fusion(list1: &[u32], list2: &[u32], k: f64) -> Vec<u32> 
         *scores.entry(doc_id).or_insert(0.0) += score;
     }
 
-    let mut results: Vec<(u32, f64)> = scores.into_iter().collect();
+    let mut results: Vec<(DocPtr, f64)> = scores.into_iter().collect();
     results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // Sort descending by score
-    let results: Vec<u32> = results.iter().map(|&(idx, _)| idx).collect();
+    let results: Vec<DocPtr> = results.iter().map(|&(idx, _)| idx).collect();
     results
 }
 
@@ -973,12 +974,14 @@ pub fn match_centroids(
     let mut sub_scores = vec![0.0f32; n];
     sub_scores.copy_from_slice(&missing_similarities);
 
-    let mut all_scored = vec![];
+
+    db.execute(
+        "CREATE TEMPORARY TABLE temp2(rowid INTEGER, sub_idx INTEGER, score FLOAT, UNIQUE(rowid, sub_idx))",
+    )?;
+    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
 
     let mut prev_idx = u32::MAX;
     let mut prev_sub_idx = u32::MAX;
-    let mut max_sub_score = -1.0f32;
-    let mut i_max_sub_score = 0;
 
     let scaler = 1.0f32 / n as f32;
     for i in 0.. {
@@ -992,19 +995,10 @@ pub fn match_centroids(
         if i > 0 {
             if sub_idx_change || is_last {
                 let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
-                if sub_score > max_sub_score {
-                    max_sub_score = sub_score;
-                    i_max_sub_score = prev_sub_idx;
+                if sub_score > cutoff {
+                    let _ = insert_temp_query.execute((prev_idx, prev_sub_idx, sub_score));
                 }
                 sub_scores.copy_from_slice(&missing_similarities);
-            }
-
-            if idx_change || is_last {
-                if max_sub_score > cutoff {
-                    all_scored.push((prev_idx, max_sub_score, i_max_sub_score));
-                }
-                max_sub_score = -1.0f32;
-                i_max_sub_score = 0;
             }
         }
 
@@ -1019,20 +1013,6 @@ pub fn match_centroids(
         assert!(i == 0 || (prev_idx != idx || prev_sub_idx <= sub_idx));
         prev_idx = idx;
         prev_sub_idx = sub_idx;
-    }
-    debug!(
-        "scoring into {} candidates took {} ms.",
-        all_scored.len(),
-        now.elapsed().as_millis()
-    );
-
-    db.execute(
-        "CREATE TEMPORARY TABLE temp2(rowid INTEGER PRIMARY KEY, score FLOAT, sub_idx INTEGER)",
-    )?;
-    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
-
-    for (idx, score, sub_idx) in all_scored.iter() {
-        let _ = insert_temp_query.execute((idx, score, sub_idx));
     }
 
     let (filter_sql, filter_params) = build_filter_sql_and_params(sql_filter)?;
@@ -1593,23 +1573,25 @@ pub fn search(
         vec![]
     };
 
-    let mut scores: HashMap<u32, f32> = HashMap::new();
-    let mut offsets: HashMap<u32, u32> = HashMap::new();
+    let mut scores: HashMap<DocPtr, f32> = HashMap::new();
+    let mut offsets: HashMap<DocPtr, u32> = HashMap::new();
 
     for (score, idx, offset) in &fts_matches {
-        scores.insert(*idx, *score);
-        offsets.insert(*idx, *offset);
+        let key = (*idx, *offset);
+        scores.insert(key, *score);
+        offsets.insert(key, *offset);
     }
     for (score, idx, offset) in &sem_matches {
-        scores.insert(*idx, *score);
-        offsets.insert(*idx, *offset);
+        let key = (*idx, *offset);
+        scores.insert(key, *score);
+        offsets.insert(key, *offset);
     }
 
-    let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx, _)| idx).collect();
+    let sem_idxs: Vec<DocPtr> = sem_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
     info!("semantic search found {} matches", sem_idxs.len());
 
     let mut fused = if use_fulltext {
-        let fts_idxs: Vec<u32> = fts_matches.iter().map(|&(_, idx, _)| idx).collect();
+        let fts_idxs: Vec<DocPtr> = fts_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
         reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
     } else {
         sem_idxs
@@ -1617,17 +1599,29 @@ pub fn search(
     fused.truncate(top_k);
 
     let mut results = vec![];
-    let mut body_query = db.query("SELECT metadata,body FROM document WHERE rowid = ?1")?;
-    for idx in fused {
-        let score = match scores.get(&idx) {
+    let mut body_query = db.query("SELECT metadata,body,lens FROM document WHERE rowid = ?1")?;
+    for (idx, sub_idx) in fused {
+        let tuple : DocPtr = (idx, sub_idx);
+        let score = match scores.get(&tuple) {
             Some(score) => *score,
             None => 0.0f32,
         };
         let (metadata, body) = body_query.query_row((idx,), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            let (metadata, body, lens) = (
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?
+            );
+            let lens: Vec<usize> = lens
+                .split(',')
+                .map(|x| x.parse::<usize>().unwrap())
+                .collect();
+            let bodies = split_by_codepoints(&body, &lens);
+            let body = bodies.get(sub_idx as usize).unwrap().to_string();
+            Ok((metadata, body))
         })?;
 
-        let body_idx = match offsets.get(&idx) {
+        let body_idx = match offsets.get(&tuple) {
             Some(offset) => *offset,
             None => 0u32,
         };
