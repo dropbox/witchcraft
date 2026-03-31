@@ -50,6 +50,15 @@ fn update(db_name: &PathBuf, assets: &PathBuf) -> Result<bool> {
     Ok(true)
 }
 
+// ANSI color helpers
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const RESET: &str = "\x1b[0m";
+const CYAN: &str = "\x1b[36m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const MAGENTA: &str = "\x1b[35m";
+
 fn search(db_name: &PathBuf, assets: &PathBuf, q: &str) -> Result<()> {
     let device = warp::make_device();
     let embedder = warp::Embedder::new(&device, assets)?;
@@ -61,9 +70,20 @@ fn search(db_name: &PathBuf, assets: &PathBuf, q: &str) -> Result<()> {
         let title = meta["title"].as_str().unwrap_or("");
         let project = meta["project"].as_str().unwrap_or("");
         let source = meta["source"].as_str().unwrap_or("");
-        println!("[{score:.3}] ({source}) {project} - {title}");
-        let preview: String = body.chars().take(200).collect();
-        println!("  {preview}");
+        let session_id = meta["session_id"].as_str().unwrap_or("");
+        let turn = meta["turn"].as_u64().unwrap_or(0);
+        let path = meta["path"].as_str().unwrap_or("");
+
+        println!("{BOLD}{GREEN}{score:.3}{RESET}  {BOLD}{title}{RESET}");
+        println!("  {CYAN}{project}{RESET}  {DIM}{source}{RESET}");
+        if !session_id.is_empty() {
+            println!("  {MAGENTA}{session_id}{RESET} {DIM}turn {turn}{RESET}");
+        }
+        if !path.is_empty() {
+            println!("  {DIM}{path}{RESET}");
+        }
+        let preview: String = body.chars().take(300).collect();
+        println!("  {YELLOW}{preview}{RESET}");
         println!();
     }
     if results.is_empty() {
