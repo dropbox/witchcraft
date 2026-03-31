@@ -133,11 +133,17 @@ pub fn bulk_search(
         } else {
             vec![]
         };
-        let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx, _)| idx).collect();
+        let sem_idxs: Vec<warp::DocPtr> = sem_matches
+            .iter()
+            .map(|&(_, idx, sub_idx)| (idx, sub_idx))
+            .collect();
 
         let fusion_start = std::time::Instant::now();
         let mut fused = if use_fulltext {
-            let fts_idxs: Vec<u32> = fts_matches.iter().map(|&(_, idx, _)| idx).collect();
+            let fts_idxs: Vec<warp::DocPtr> = fts_matches
+                .iter()
+                .map(|&(_, idx, sub_idx)| (idx, sub_idx))
+                .collect();
             warp::reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
         } else {
             sem_idxs
@@ -150,8 +156,8 @@ pub fn bulk_search(
 
         let metadata_start = std::time::Instant::now();
         let mut metadatas = vec![];
-        for idx in fused {
-            let metadata = metadata_query.query_row((idx,), |row| row.get::<_, String>(0))?;
+        for (idx, _sub_idx) in &fused {
+            let metadata = metadata_query.query_row((*idx,), |row| row.get::<_, String>(0))?;
             metadatas.push(metadata);
         }
         debug!(

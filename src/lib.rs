@@ -57,6 +57,8 @@ pub use types::SqlStatementInternal;
 mod sql_generator;
 use sql_generator::build_filter_sql_and_params;
 
+pub mod claude_code;
+
 #[cfg(feature = "napi")]
 #[allow(dead_code)]
 mod napi;
@@ -65,7 +67,10 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
-type DocPtr = (u32, u32);
+
+/// A document pointer combining document ID and sub-chunk index
+/// Allows precise location of results within subdivided documents
+pub type DocPtr = (u32, u32);
 
 /// Mode for indexing operations - determines which chunks to process
 enum IndexMode {
@@ -1043,6 +1048,10 @@ pub fn match_centroids(
 
         let results = scored_documents_query
             .query_map(param_refs.as_slice(), |row| {
+                info!("have result {} {} {}",
+                    row.get::<_, f32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, u32>(2)?);
                 Ok((
                     row.get::<_, f32>(0)?,
                     row.get::<_, u32>(1)?,
@@ -1612,12 +1621,15 @@ pub fn search(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?
             );
+            info!("lens {lens}");
             let lens: Vec<usize> = lens
                 .split(',')
                 .map(|x| x.parse::<usize>().unwrap())
                 .collect();
             let bodies = split_by_codepoints(&body, &lens);
-            let body = bodies.get(sub_idx as usize).unwrap().to_string();
+            info!("bodies {}", bodies.len());
+            let clamped = (sub_idx as usize).min(bodies.len().saturating_sub(1));
+            let body = bodies[clamped].to_string();
             Ok((metadata, body))
         })?;
 

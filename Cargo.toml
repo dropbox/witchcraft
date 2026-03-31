@@ -11,6 +11,10 @@ members = ["tools/quantize-tool", "tools/t5-bench", "tools/ov-stress", "tools/co
 name = "warp-cli"               # !Dash
 path = "src/main.rs"            # !Dash
 
+[[bin]]                         # !Dash
+name = "claude-index"           # !Dash
+path = "src/claude-index.rs"    # !Dash
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
@@ -44,6 +48,8 @@ uuid = {version = "1.18.1", features = ["v5"] }
 iso8601-timestamp = "0.3.3"
 log = "0.4.28"
 text-splitter = "0.28.0" # !Dash
+regex = "1"                # !Dash
+chrono = "0.4"             # !Dash
 lz4_flex = "0.11.5"
 strsim = "0.11.1"
 rayon = { version = "1", optional = true }
