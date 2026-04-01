@@ -5,6 +5,8 @@ semantic search engine ( https://github.com/jlscheerer/xtr-warp ).
 
 ## Pickbrain: semantic search over your Claude Code history ##
 
+![pickbrain](pickbrain.png)
+
 Included as an example is **pickbrain**, a CLI that indexes your Claude Code
 session transcripts, memory files, and authored documents into a Witchcraft
 database for fast semantic search. Ever wondered "what was that conversation
