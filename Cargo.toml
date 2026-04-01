@@ -12,8 +12,8 @@ name = "warp-cli"               # !Dash
 path = "src/main.rs"            # !Dash
 
 [[bin]]                         # !Dash
-name = "claude-index"           # !Dash
-path = "src/claude-index.rs"    # !Dash
+name = "pickbrain"              # !Dash
+path = "src/pickbrain.rs"       # !Dash
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -1550,7 +1550,7 @@ pub fn search(
     top_k: usize,
     use_fulltext: bool,
     sql_filter: Option<&SqlStatementInternal>,
-) -> Result<Vec<(f32, String, Vec<String>, u32)>> {
+) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
     let now = std::time::Instant::now();
 
     let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1608,18 +1608,19 @@ pub fn search(
     fused.truncate(top_k);
 
     let mut results = vec![];
-    let mut body_query = db.query("SELECT metadata,body,lens FROM document WHERE rowid = ?1")?;
+    let mut body_query = db.query("SELECT metadata,body,lens,date FROM document WHERE rowid = ?1")?;
     for (idx, sub_idx) in fused {
         let tuple : DocPtr = (idx, sub_idx);
         let score = match scores.get(&tuple) {
             Some(score) => *score,
             None => 0.0f32,
         };
-        let (metadata, bodies) = body_query.query_row((idx,), |row| {
-            let (metadata, body, lens) = (
+        let (metadata, bodies, date) = body_query.query_row((idx,), |row| {
+            let (metadata, body, lens, date) = (
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             );
             let lens: Vec<usize> = lens
                 .split(',')
@@ -1629,15 +1630,15 @@ pub fn search(
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect();
-            Ok((metadata, bodies))
+            Ok((metadata, bodies, date))
         })?;
 
         let sub = (sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
-        results.push((score, metadata, bodies, sub));
+        results.push((score, metadata, bodies, sub, date));
     }
 
     let mut max = -1.0f32;
-    for (score, _, _, _) in results.iter_mut().rev() {
+    for (score, _, _, _, _) in results.iter_mut().rev() {
         max = max.max(*score);
         *score = max;
     }

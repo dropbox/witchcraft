@@ -217,7 +217,7 @@ fn main() -> Result<()> {
         let use_fulltext = args[1] == "hybrid";
         let results =
             warp::search(&db, &embedder, &mut cache, q, 0.7, 10, use_fulltext, None).unwrap();
-        for (score, _metadata, bodies, sub_idx) in results {
+        for (score, _metadata, bodies, sub_idx, _date) in results {
             let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
             let body = &bodies[idx];
             println!("{score}: {body} @ {sub_idx}");

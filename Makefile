@@ -65,9 +65,9 @@ warp-cli: download
 	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES) --bin warp-cli
 	ln -sf target/$(TARGET)/release/warp-cli ./warp-cli
 
-claude-index: download
-	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES) --bin claude-index
-	ln -sf target/$(TARGET)/release/claude-index ./claude-index
+pickbrain: download
+	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES) --bin pickbrain
+	ln -sf target/$(TARGET)/release/pickbrain ./pickbrain
 
 macintel:
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,progress
@@ -108,4 +108,4 @@ run: module
 	ln -sf target/release/warp-macos-universal.node warp.node
 	node index.cjs
 
-.PHONY: download build warp-cli claude-index module win test bench nfcorpus nfcorpus-score run
+.PHONY: download build warp-cli pickbrain module win test bench nfcorpus nfcorpus-score run
