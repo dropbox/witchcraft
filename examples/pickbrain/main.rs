@@ -417,7 +417,24 @@ fn search_tui(
                     let items: Vec<ratatui::widgets::ListItem> = results
                         .iter()
                         .map(|r| {
-                            let preview = first_line(&r.bodies[r.match_idx]);
+                            let preview_idx = r
+                                .bodies
+                                .iter()
+                                .position(|b| b.starts_with("[User]"))
+                                .or_else(|| {
+                                    if r.match_idx == 0 && r.bodies.len() > 1 {
+                                        Some(1)
+                                    } else {
+                                        Some(r.match_idx)
+                                    }
+                                })
+                                .unwrap_or(0);
+                            let raw_preview = first_line(&r.bodies[preview_idx]);
+                            let preview = raw_preview
+                                .strip_prefix("[User] ")
+                                .or_else(|| raw_preview.strip_prefix("[Claude] "))
+                                .or_else(|| raw_preview.strip_prefix("[Codex] "))
+                                .unwrap_or(&raw_preview);
                             let mut meta_spans = vec![
                                 Span::styled(
                                     format!("{} ", r.timestamp),
@@ -432,6 +449,20 @@ fn search_tui(
                                 ));
                             }
                             if !r.session_id.is_empty() {
+                                let source_label = if r.source == "codex" {
+                                    "codex"
+                                } else {
+                                    "claude"
+                                };
+                                let short_sid = if r.session_id.len() > 8 {
+                                    &r.session_id[..8]
+                                } else {
+                                    &r.session_id
+                                };
+                                meta_spans.push(Span::styled(
+                                    format!("  {source_label} {short_sid}"),
+                                    Style::default().fg(Color::Magenta),
+                                ));
                                 meta_spans.push(Span::styled(
                                     format!("  turn {}", r.turn),
                                     Style::default().fg(Color::DarkGray),
@@ -485,6 +516,8 @@ fn search_tui(
                         .map(|(_, t)| t.as_slice());
 
                     if let Some(turns) = turns {
+                        let (matched_start, matched_end) =
+                            interaction_turn_range(turns, r.turn as usize);
                         for (i, turn) in turns.iter().enumerate() {
                             let role_style = if turn.role == "user" {
                                 Style::default()
@@ -495,7 +528,7 @@ fn search_tui(
                                     .fg(Color::Cyan)
                                     .add_modifier(Modifier::BOLD)
                             };
-                            let is_matched_turn = i == r.turn as usize;
+                            let is_matched_turn = i >= matched_start && i < matched_end;
                             lines.push(Line::from(vec![
                                 Span::styled(
                                     if turn.role == "user" {
@@ -591,11 +624,12 @@ fn search_tui(
                     let r = &results[selected];
                     if !r.session_id.is_empty() && !r.path.is_empty() {
                         let turns = load_session_turns(&r.path, &r.source);
-                        // Scroll to the matched turn
-                        let target = r.turn as usize;
+                        // Scroll to the matched interaction
+                        let (matched_start, _) =
+                            interaction_turn_range(&turns, r.turn as usize);
                         let mut line_count: u16 = 3; // session header lines
                         for (i, turn) in turns.iter().enumerate() {
-                            if i >= target {
+                            if i >= matched_start {
                                 break;
                             }
                             line_count += 1; // role header
@@ -623,6 +657,14 @@ fn search_tui(
                 }
                 (View::Detail(_), KeyCode::PageUp, _) => {
                     scroll_offset = scroll_offset.saturating_sub(20);
+                }
+                (View::Detail(_), KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                    let half = terminal.size().map(|s| s.height / 2).unwrap_or(10);
+                    scroll_offset = scroll_offset.saturating_add(half);
+                }
+                (View::Detail(_), KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                    let half = terminal.size().map(|s| s.height / 2).unwrap_or(10);
+                    scroll_offset = scroll_offset.saturating_sub(half);
                 }
                 (View::Detail(idx), KeyCode::Char('r'), _) => {
                     let r = &results[*idx];
@@ -694,6 +736,21 @@ fn launch_resume(session_id: &str, jsonl_path: &str, source: &str) -> Result<()>
             .exec();
         Err(err.into())
     }
+}
+
+fn interaction_turn_range(turns: &[SessionTurn], interaction_idx: usize) -> (usize, usize) {
+    let user_starts: Vec<usize> = turns
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.role == "user")
+        .map(|(i, _)| i)
+        .collect();
+    let start = user_starts.get(interaction_idx).copied().unwrap_or(0);
+    let end = user_starts
+        .get(interaction_idx + 1)
+        .copied()
+        .unwrap_or(turns.len());
+    (start, end)
 }
 
 fn first_line(text: &str) -> String {
