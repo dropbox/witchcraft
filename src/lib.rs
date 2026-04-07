@@ -1048,10 +1048,6 @@ pub fn match_centroids(
 
         let results = scored_documents_query
             .query_map(param_refs.as_slice(), |row| {
-                info!("have result {} {} {}",
-                    row.get::<_, f32>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, u32>(2)?);
                 Ok((
                     row.get::<_, f32>(0)?,
                     row.get::<_, u32>(1)?,
