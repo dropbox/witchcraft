@@ -58,9 +58,11 @@ assets/xtr.gguf: xtr.safetensors | assets
 	cargo run -p quantize-tool xtr.safetensors assets/xtr.gguf
 
 assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml:
-	python quantize-int4.py
+	python quantize-openvino.py
 
 download: assets assets/config.json assets/tokenizer.json assets/xtr.gguf
+
+ovdownload: assets/config.json assets/tokenizer.json assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
 
 # === Build targets ===
 
@@ -75,7 +77,7 @@ pickbrain: download
 macintel:
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,progress
 
-winintel: download
+winintel: ovdownload
 	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features t5-openvino,fbgemm,progress
 
 ifdef TARGET
