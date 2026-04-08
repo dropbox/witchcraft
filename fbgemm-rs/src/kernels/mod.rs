@@ -16,15 +16,15 @@ use crate::pack::BLOCK_COL_SIZE;
 /// Layout must match FBGEMM's GemmParams<float> exactly (accessed by fixed offsets in asm).
 #[repr(C)]
 pub struct GemmParams {
-    pub k: u64,              // offset 0
-    pub a: *mut f32,         // offset 8
-    pub b: *const f32,       // offset 16
-    pub beta: f32,           // offset 24
-    pub _pad: u32,           // offset 28 (alignment padding)
-    pub c: *mut f32,         // offset 32
-    pub ldc: u64,            // offset 40  (in bytes)
-    pub b_block_cols: u64,   // offset 48
-    pub lda: u64,            // offset 56  (in bytes, used on aarch64)
+    pub k: u64,            // offset 0
+    pub a: *mut f32,       // offset 8
+    pub b: *const f32,     // offset 16
+    pub beta: f32,         // offset 24
+    pub _pad: u32,         // offset 28 (alignment padding)
+    pub c: *mut f32,       // offset 32
+    pub ldc: u64,          // offset 40  (in bytes)
+    pub b_block_cols: u64, // offset 48
+    pub lda: u64,          // offset 56  (in bytes, used on aarch64)
 }
 
 /// A micro-kernel function pointer: takes GemmParams and processes `kernel_nrows` rows.

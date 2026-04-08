@@ -12,18 +12,18 @@ pub mod partition;
 #[cfg(feature = "quantized")]
 pub mod quantized;
 
-pub use pack::PackedMatrix;
-pub use bf16::PackedMatrixBf16;
 pub use bf16::sgemm_bf16;
 pub use bf16::sgemm_bf16_simple;
-#[cfg(feature = "quantized")]
-pub use quantized::PackedBMatrixI8;
-#[cfg(feature = "quantized")]
-pub use quantized::I8GemmScratch;
+pub use bf16::PackedMatrixBf16;
+pub use pack::PackedMatrix;
 #[cfg(feature = "quantized")]
 pub use quantized::i8gemm_f32;
 #[cfg(feature = "quantized")]
 pub use quantized::i8gemm_f32_with_scratch;
+#[cfg(feature = "quantized")]
+pub use quantized::I8GemmScratch;
+#[cfg(feature = "quantized")]
+pub use quantized::PackedBMatrixI8;
 
 /// Compute C = beta * C + A * B.
 ///
@@ -43,9 +43,13 @@ pub fn sgemm(m: usize, a: &[f32], packed_b: &PackedMatrix, beta: f32, c: &mut [f
     assert_eq!(c.len(), m * n, "c must have length m * n");
 
     #[cfg(feature = "rayon")]
-    { gemm::cblas_gemm_compute_par(m, a, packed_b, beta, c); }
+    {
+        gemm::cblas_gemm_compute_par(m, a, packed_b, beta, c);
+    }
     #[cfg(not(feature = "rayon"))]
-    { gemm::cblas_gemm_compute(m, a, packed_b, beta, c); }
+    {
+        gemm::cblas_gemm_compute(m, a, packed_b, beta, c);
+    }
 }
 
 /// Compute C = A * B (overwriting C).

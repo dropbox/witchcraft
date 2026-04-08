@@ -795,12 +795,19 @@ unsafe fn avx2_bf16_kernel_6x2(gp: *mut GemmParams) {
 }
 
 pub static KERNELS: [Option<KernelFn>; 15] = [
-    None,                         // 0 (unused)
-    Some(avx2_bf16_kernel_1x2),   // 1
-    Some(avx2_bf16_kernel_2x2),   // 2
-    Some(avx2_bf16_kernel_3x2),   // 3
-    Some(avx2_bf16_kernel_4x2),   // 4
-    Some(avx2_bf16_kernel_5x2),   // 5
-    Some(avx2_bf16_kernel_6x2),   // 6
-    None, None, None, None, None, None, None, None,
+    None,                       // 0 (unused)
+    Some(avx2_bf16_kernel_1x2), // 1
+    Some(avx2_bf16_kernel_2x2), // 2
+    Some(avx2_bf16_kernel_3x2), // 3
+    Some(avx2_bf16_kernel_4x2), // 4
+    Some(avx2_bf16_kernel_5x2), // 5
+    Some(avx2_bf16_kernel_6x2), // 6
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
 ];

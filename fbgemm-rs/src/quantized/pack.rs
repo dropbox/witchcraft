@@ -75,12 +75,25 @@ impl PackedBMatrixI8 {
             }
         }
 
-        Self { nrow: k, ncol: n, num_k_blocks, num_n_blocks, col_offsets, data }
+        Self {
+            nrow: k,
+            ncol: n,
+            num_k_blocks,
+            num_n_blocks,
+            col_offsets,
+            data,
+        }
     }
 
-    pub fn k(&self) -> usize { self.nrow }
-    pub fn n(&self) -> usize { self.ncol }
-    pub fn col_offsets(&self) -> &[i32] { &self.col_offsets }
+    pub fn k(&self) -> usize {
+        self.nrow
+    }
+    pub fn n(&self) -> usize {
+        self.ncol
+    }
+    pub fn col_offsets(&self) -> &[i32] {
+        &self.col_offsets
+    }
 
     pub(crate) fn tile(&self, kb: usize, nb: usize) -> &[i8] {
         let tile_size = KCB * NR;
@@ -88,8 +101,12 @@ impl PackedBMatrixI8 {
         &self.data[offset..offset + tile_size]
     }
 
-    pub(crate) fn num_k_blocks(&self) -> usize { self.num_k_blocks }
-    pub(crate) fn num_n_blocks(&self) -> usize { self.num_n_blocks }
+    pub(crate) fn num_k_blocks(&self) -> usize {
+        self.num_k_blocks
+    }
+    pub(crate) fn num_n_blocks(&self) -> usize {
+        self.num_n_blocks
+    }
 }
 
 /// Quantize float32 activations to uint8 with per-tensor affine quantization.
@@ -104,16 +121,23 @@ pub fn quantize_a(src: &[f32], m: usize, k: usize) -> (Vec<u8>, f32, i32, Vec<i3
 /// Like [`quantize_a`] but reuses caller-provided buffers to avoid allocation.
 /// Returns (scale, zero_point).
 pub fn quantize_a_into(
-    src: &[f32], m: usize, k: usize,
-    a_u8: &mut Vec<u8>, row_offsets: &mut Vec<i32>,
+    src: &[f32],
+    m: usize,
+    k: usize,
+    a_u8: &mut Vec<u8>,
+    row_offsets: &mut Vec<i32>,
 ) -> (f32, i32) {
     assert_eq!(src.len(), m * k);
 
     let mut min_val = f32::MAX;
     let mut max_val = f32::MIN;
     for &v in src {
-        if v < min_val { min_val = v; }
-        if v > max_val { max_val = v; }
+        if v < min_val {
+            min_val = v;
+        }
+        if v > max_val {
+            max_val = v;
+        }
     }
 
     a_u8.resize(m * k, 0);
@@ -132,8 +156,7 @@ pub fn quantize_a_into(
     for i in 0..m {
         let mut row_sum = 0i32;
         for ki in 0..k {
-            let q = ((src[i * k + ki] * inv_scale).round() as i32 + zero_point)
-                .clamp(0, 255) as u8;
+            let q = ((src[i * k + ki] * inv_scale).round() as i32 + zero_point).clamp(0, 255) as u8;
             a_u8[i * k + ki] = q;
             row_sum += q as i32;
         }

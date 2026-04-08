@@ -49,8 +49,7 @@ unsafe fn process_row_group(
     kernel_nrows: usize,
     k_ind: usize,
     kb: usize,
-    #[cfg_attr(target_arch = "aarch64", allow(unused))]
-    total_m: usize,
+    #[cfg_attr(target_arch = "aarch64", allow(unused))] total_m: usize,
     beta_: f32,
     a: &[f32],
     k: usize,
@@ -88,13 +87,7 @@ unsafe fn process_row_group(
         if total_m == 1 {
             gp.a = (a.as_ptr() as *mut f32).add(k_ind);
         } else {
-            pack_a(
-                kernel_nrows,
-                kb,
-                &a[m2 * k + k_ind..],
-                k,
-                &mut scratchpad,
-            );
+            pack_a(kernel_nrows, kb, &a[m2 * k + k_ind..], k, &mut scratchpad);
             gp.a = scratchpad.as_mut_ptr();
         }
     }
@@ -137,13 +130,7 @@ unsafe fn process_row_group(
 }
 
 /// Compute C = beta * C + A * packed_B (single-threaded).
-pub fn cblas_gemm_compute(
-    m: usize,
-    a: &[f32],
-    packed_b: &PackedMatrix,
-    beta: f32,
-    c: &mut [f32],
-) {
+pub fn cblas_gemm_compute(m: usize, a: &[f32], packed_b: &PackedMatrix, beta: f32, c: &mut [f32]) {
     let k = packed_b.k();
     let n = packed_b.n();
     let brow = packed_b.block_row_size();
@@ -158,7 +145,17 @@ pub fn cblas_gemm_compute(
         for &(m2, kernel_nrows) in &tasks {
             unsafe {
                 process_row_group(
-                    m2, kernel_nrows, k_ind, kb, m, beta_, a, k, n, packed_b, c_ptr,
+                    m2,
+                    kernel_nrows,
+                    k_ind,
+                    kb,
+                    m,
+                    beta_,
+                    a,
+                    k,
+                    n,
+                    packed_b,
+                    c_ptr,
                     kernels,
                 );
             }
@@ -194,7 +191,17 @@ pub fn cblas_gemm_compute_par(
             // SAFETY: each task writes to rows [m2..m2+kernel_nrows] — disjoint across tasks.
             unsafe {
                 process_row_group(
-                    m2, kernel_nrows, k_ind, kb, m, beta_, a, k, n, packed_b, c_ptr,
+                    m2,
+                    kernel_nrows,
+                    k_ind,
+                    kb,
+                    m,
+                    beta_,
+                    a,
+                    k,
+                    n,
+                    packed_b,
+                    c_ptr,
                     kernels,
                 );
             }

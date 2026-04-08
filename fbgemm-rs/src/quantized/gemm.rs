@@ -20,7 +20,11 @@ pub struct I8GemmScratch {
 
 impl I8GemmScratch {
     pub fn new() -> Self {
-        Self { a_u8: Vec::new(), row_offsets: Vec::new(), c_i32: Vec::new() }
+        Self {
+            a_u8: Vec::new(),
+            row_offsets: Vec::new(),
+            c_i32: Vec::new(),
+        }
     }
 }
 
@@ -44,17 +48,25 @@ impl SimdFlags {
 
     fn use_simd(&self) -> bool {
         #[cfg(target_arch = "x86_64")]
-        { self.avx2 }
+        {
+            self.avx2
+        }
         #[cfg(target_arch = "aarch64")]
-        { self.neon_dotprod }
+        {
+            self.neon_dotprod
+        }
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        { false }
+        {
+            false
+        }
     }
 
     /// Effective zero point: shifted by 128 on the Neon SDOT path.
     fn effective_zp(&self, a_zero_point: i32) -> i32 {
         #[cfg(target_arch = "aarch64")]
-        if self.neon_dotprod { return a_zero_point - 128; }
+        if self.neon_dotprod {
+            return a_zero_point - 128;
+        }
         a_zero_point
     }
 }
@@ -71,7 +83,14 @@ pub fn i8gemm_compute(
     b_scale: f32,
     c_float: &mut [f32],
 ) {
-    i8gemm_compute_with_scratch(m, a_float, packed_b, b_scale, c_float, &mut I8GemmScratch::new());
+    i8gemm_compute_with_scratch(
+        m,
+        a_float,
+        packed_b,
+        b_scale,
+        c_float,
+        &mut I8GemmScratch::new(),
+    );
 }
 
 /// Like [`i8gemm_compute`] but reuses caller-provided scratch buffers.
@@ -87,17 +106,36 @@ pub fn i8gemm_compute_with_scratch(
     let k = packed_b.k();
     let n = packed_b.n();
 
-    let (a_scale, a_zero_point) = quantize_a_into(a_float, m, k, &mut scratch.a_u8, &mut scratch.row_offsets);
+    let (a_scale, a_zero_point) =
+        quantize_a_into(a_float, m, k, &mut scratch.a_u8, &mut scratch.row_offsets);
     scratch.c_i32.resize(m * n, 0);
     scratch.c_i32.fill(0);
     let flags = SimdFlags::detect();
 
     for mb_start in (0..m).step_by(MCB) {
         let mc = std::cmp::min(MCB, m - mb_start);
-        process_m_block(mb_start, mc, &scratch.a_u8, k, n, packed_b, &mut scratch.c_i32, &flags);
+        process_m_block(
+            mb_start,
+            mc,
+            &scratch.a_u8,
+            k,
+            n,
+            packed_b,
+            &mut scratch.c_i32,
+            &flags,
+        );
     }
 
-    dequantize(m, n, &scratch.c_i32, c_float, a_scale, b_scale, flags.effective_zp(a_zero_point), packed_b.col_offsets());
+    dequantize(
+        m,
+        n,
+        &scratch.c_i32,
+        c_float,
+        a_scale,
+        b_scale,
+        flags.effective_zp(a_zero_point),
+        packed_b.col_offsets(),
+    );
 }
 
 /// Parallel version of [`i8gemm_compute`] using rayon.
@@ -112,7 +150,14 @@ pub fn i8gemm_compute_par(
     b_scale: f32,
     c_float: &mut [f32],
 ) {
-    i8gemm_compute_par_with_scratch(m, a_float, packed_b, b_scale, c_float, &mut I8GemmScratch::new());
+    i8gemm_compute_par_with_scratch(
+        m,
+        a_float,
+        packed_b,
+        b_scale,
+        c_float,
+        &mut I8GemmScratch::new(),
+    );
 }
 
 /// Like [`i8gemm_compute_par`] but reuses caller-provided scratch buffers.
@@ -128,7 +173,8 @@ pub fn i8gemm_compute_par_with_scratch(
     let k = packed_b.k();
     let n = packed_b.n();
 
-    let (a_scale, a_zero_point) = quantize_a_into(a_float, m, k, &mut scratch.a_u8, &mut scratch.row_offsets);
+    let (a_scale, a_zero_point) =
+        quantize_a_into(a_float, m, k, &mut scratch.a_u8, &mut scratch.row_offsets);
     scratch.c_i32.resize(m * n, 0);
     scratch.c_i32.fill(0);
     let flags = SimdFlags::detect();
@@ -149,14 +195,33 @@ pub fn i8gemm_compute_par_with_scratch(
             // SAFETY: each M-block writes to rows [mb_start..mb_start+mc] — disjoint.
             unsafe {
                 process_kb_block(
-                    mb_start, mc, kb, k_start, kc, &scratch.a_u8, k, n,
-                    num_n_blocks, packed_b, c_ptr, &flags,
+                    mb_start,
+                    mc,
+                    kb,
+                    k_start,
+                    kc,
+                    &scratch.a_u8,
+                    k,
+                    n,
+                    num_n_blocks,
+                    packed_b,
+                    c_ptr,
+                    &flags,
                 );
             }
         });
     }
 
-    dequantize(m, n, &scratch.c_i32, c_float, a_scale, b_scale, flags.effective_zp(a_zero_point), packed_b.col_offsets());
+    dequantize(
+        m,
+        n,
+        &scratch.c_i32,
+        c_float,
+        a_scale,
+        b_scale,
+        flags.effective_zp(a_zero_point),
+        packed_b.col_offsets(),
+    );
 }
 
 /// Process one M-block across all K-blocks and N-blocks (sequential path).
@@ -180,8 +245,18 @@ fn process_m_block(
         // SAFETY: single-threaded, exclusive access to c_i32.
         unsafe {
             process_kb_block(
-                mb_start, mc, kb, k_start, kc, a_u8, k, n,
-                num_n_blocks, packed_b, c_i32.as_mut_ptr(), flags,
+                mb_start,
+                mc,
+                kb,
+                k_start,
+                kc,
+                a_u8,
+                k,
+                n,
+                num_n_blocks,
+                packed_b,
+                c_i32.as_mut_ptr(),
+                flags,
             );
         }
     }
@@ -228,9 +303,7 @@ unsafe fn process_kb_block(
             #[cfg(target_arch = "x86_64")]
             if flags.avx2 && nc == NR {
                 a_packed.fill(0);
-                avx2::pack_a_tile(
-                    a_u8, i, k_start, kernel_rows, kc, k, &mut a_packed,
-                );
+                avx2::pack_a_tile(a_u8, i, k_start, kernel_rows, kc, k, &mut a_packed);
                 avx2::dispatch_i8_kernel(
                     kernel_rows,
                     a_packed.as_ptr(),
@@ -246,9 +319,7 @@ unsafe fn process_kb_block(
             #[cfg(target_arch = "aarch64")]
             if flags.neon_dotprod && nc == NR {
                 a_packed.fill(0);
-                neon::pack_a_tile(
-                    a_u8, i, k_start, kernel_rows, kc, k, &mut a_packed,
-                );
+                neon::pack_a_tile(a_u8, i, k_start, kernel_rows, kc, k, &mut a_packed);
                 neon::dispatch_i8_kernel(
                     kernel_rows,
                     a_packed.as_ptr(),

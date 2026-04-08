@@ -120,18 +120,105 @@ macro_rules! define_i8_kernel {
 }
 
 // Offsets: row_i * KCB = row_i * 512
-define_i8_kernel!(avx2_i8_kernel_1,  [(0, 0)]);
-define_i8_kernel!(avx2_i8_kernel_2,  [(0, 0), (1, 512)]);
-define_i8_kernel!(avx2_i8_kernel_3,  [(0, 0), (1, 512), (2, 1024)]);
-define_i8_kernel!(avx2_i8_kernel_4,  [(0, 0), (1, 512), (2, 1024), (3, 1536)]);
-define_i8_kernel!(avx2_i8_kernel_5,  [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048)]);
-define_i8_kernel!(avx2_i8_kernel_6,  [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048), (5, 2560)]);
-define_i8_kernel!(avx2_i8_kernel_7,  [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048), (5, 2560), (6, 3072)]);
-define_i8_kernel!(avx2_i8_kernel_8,  [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048), (5, 2560), (6, 3072), (7, 3584)]);
-define_i8_kernel!(avx2_i8_kernel_9,  [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048), (5, 2560), (6, 3072), (7, 3584), (8, 4096)]);
-define_i8_kernel!(avx2_i8_kernel_10, [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048), (5, 2560), (6, 3072), (7, 3584), (8, 4096), (9, 4608)]);
-define_i8_kernel!(avx2_i8_kernel_11, [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048), (5, 2560), (6, 3072), (7, 3584), (8, 4096), (9, 4608), (10, 5120)]);
-define_i8_kernel!(avx2_i8_kernel_12, [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048), (5, 2560), (6, 3072), (7, 3584), (8, 4096), (9, 4608), (10, 5120), (11, 5632)]);
+define_i8_kernel!(avx2_i8_kernel_1, [(0, 0)]);
+define_i8_kernel!(avx2_i8_kernel_2, [(0, 0), (1, 512)]);
+define_i8_kernel!(avx2_i8_kernel_3, [(0, 0), (1, 512), (2, 1024)]);
+define_i8_kernel!(avx2_i8_kernel_4, [(0, 0), (1, 512), (2, 1024), (3, 1536)]);
+define_i8_kernel!(
+    avx2_i8_kernel_5,
+    [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048)]
+);
+define_i8_kernel!(
+    avx2_i8_kernel_6,
+    [(0, 0), (1, 512), (2, 1024), (3, 1536), (4, 2048), (5, 2560)]
+);
+define_i8_kernel!(
+    avx2_i8_kernel_7,
+    [
+        (0, 0),
+        (1, 512),
+        (2, 1024),
+        (3, 1536),
+        (4, 2048),
+        (5, 2560),
+        (6, 3072)
+    ]
+);
+define_i8_kernel!(
+    avx2_i8_kernel_8,
+    [
+        (0, 0),
+        (1, 512),
+        (2, 1024),
+        (3, 1536),
+        (4, 2048),
+        (5, 2560),
+        (6, 3072),
+        (7, 3584)
+    ]
+);
+define_i8_kernel!(
+    avx2_i8_kernel_9,
+    [
+        (0, 0),
+        (1, 512),
+        (2, 1024),
+        (3, 1536),
+        (4, 2048),
+        (5, 2560),
+        (6, 3072),
+        (7, 3584),
+        (8, 4096)
+    ]
+);
+define_i8_kernel!(
+    avx2_i8_kernel_10,
+    [
+        (0, 0),
+        (1, 512),
+        (2, 1024),
+        (3, 1536),
+        (4, 2048),
+        (5, 2560),
+        (6, 3072),
+        (7, 3584),
+        (8, 4096),
+        (9, 4608)
+    ]
+);
+define_i8_kernel!(
+    avx2_i8_kernel_11,
+    [
+        (0, 0),
+        (1, 512),
+        (2, 1024),
+        (3, 1536),
+        (4, 2048),
+        (5, 2560),
+        (6, 3072),
+        (7, 3584),
+        (8, 4096),
+        (9, 4608),
+        (10, 5120)
+    ]
+);
+define_i8_kernel!(
+    avx2_i8_kernel_12,
+    [
+        (0, 0),
+        (1, 512),
+        (2, 1024),
+        (3, 1536),
+        (4, 2048),
+        (5, 2560),
+        (6, 3072),
+        (7, 3584),
+        (8, 4096),
+        (9, 4608),
+        (10, 5120),
+        (11, 5632)
+    ]
+);
 
 /// Pack A tile: copy mc rows × kc columns from quantized A (K stride) into
 /// a KCB-strided scratchpad for the SIMD kernel.
@@ -148,7 +235,6 @@ pub fn pack_a_tile(
     for i in 0..mc {
         let src_offset = (m_start + i) * k + k_start;
         let dst_offset = i * KCB;
-        dst[dst_offset..dst_offset + kc]
-            .copy_from_slice(&a_u8[src_offset..src_offset + kc]);
+        dst[dst_offset..dst_offset + kc].copy_from_slice(&a_u8[src_offset..src_offset + kc]);
     }
 }

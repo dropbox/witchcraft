@@ -176,7 +176,10 @@ fn verify_gemm_bounds(m: usize, a_len: usize, k: usize, n: usize, packed_b: &Pac
     }
     // Allow covered < m only if m == 0 (no tasks)
     if m > 0 {
-        assert_eq!(covered, m, "row groups must cover all {m} rows, covered {covered}");
+        assert_eq!(
+            covered, m,
+            "row groups must cover all {m} rows, covered {covered}"
+        );
     }
 
     for k_ind in (0..k).step_by(brow) {
@@ -280,8 +283,7 @@ unsafe fn process_row_group_inline(
     kernel_nrows: usize,
     k_ind: usize,
     kb: usize,
-    #[cfg_attr(target_arch = "aarch64", allow(unused))]
-    total_m: usize,
+    #[cfg_attr(target_arch = "aarch64", allow(unused))] total_m: usize,
     beta_: f32,
     a: &[f32],
     k: usize,
@@ -328,13 +330,7 @@ unsafe fn process_row_group_inline(
             gp.a = (a.as_ptr() as *mut f32).add(k_ind);
         } else {
             debug_assert!(m2 * k + k_ind + (kernel_nrows - 1) * k + kb <= a.len());
-            pack_a(
-                kernel_nrows,
-                kb,
-                &a[m2 * k + k_ind..],
-                k,
-                &mut scratchpad,
-            );
+            pack_a(kernel_nrows, kb, &a[m2 * k + k_ind..], k, &mut scratchpad);
             gp.a = scratchpad.as_mut_ptr();
         }
     }
@@ -392,13 +388,7 @@ fn have_bf16_kernels() -> bool {
 
 /// Compute C = beta * C + A * packed_B_bf16 (single-threaded).
 #[cfg(not(feature = "rayon"))]
-fn compute_st(
-    m: usize,
-    a: &[f32],
-    packed_b: &PackedMatrixBf16,
-    beta: f32,
-    c: &mut [f32],
-) {
+fn compute_st(m: usize, a: &[f32], packed_b: &PackedMatrixBf16, beta: f32, c: &mut [f32]) {
     let k = packed_b.k();
     let n = packed_b.n();
     let brow = packed_b.block_row_size();
@@ -414,8 +404,18 @@ fn compute_st(
             for &(m2, kernel_nrows) in &tasks {
                 unsafe {
                     process_row_group_inline(
-                        m2, kernel_nrows, k_ind, kb, m, beta_, a, k, n,
-                        packed_b, c_ptr, kernels,
+                        m2,
+                        kernel_nrows,
+                        k_ind,
+                        kb,
+                        m,
+                        beta_,
+                        a,
+                        k,
+                        n,
+                        packed_b,
+                        c_ptr,
+                        kernels,
                     );
                 }
             }
@@ -446,8 +446,18 @@ fn compute_st(
             for &(m2, kernel_nrows) in &tasks {
                 unsafe {
                     process_row_group_fallback(
-                        m2, kernel_nrows, k_ind, kb, m, beta_, a, k, n,
-                        f32_b_ptr, c_ptr, kernels,
+                        m2,
+                        kernel_nrows,
+                        k_ind,
+                        kb,
+                        m,
+                        beta_,
+                        a,
+                        k,
+                        n,
+                        f32_b_ptr,
+                        c_ptr,
+                        kernels,
                     );
                 }
             }
@@ -457,13 +467,7 @@ fn compute_st(
 
 /// Compute C = beta * C + A * packed_B_bf16 (multi-threaded via rayon).
 #[cfg(feature = "rayon")]
-fn compute_par(
-    m: usize,
-    a: &[f32],
-    packed_b: &PackedMatrixBf16,
-    beta: f32,
-    c: &mut [f32],
-) {
+fn compute_par(m: usize, a: &[f32], packed_b: &PackedMatrixBf16, beta: f32, c: &mut [f32]) {
     let k = packed_b.k();
     let n = packed_b.n();
     let brow = packed_b.block_row_size();
@@ -481,8 +485,18 @@ fn compute_par(
                 let packed_b = unsafe { &*(packed_ptr as *const PackedMatrixBf16) };
                 unsafe {
                     process_row_group_inline(
-                        m2, kernel_nrows, k_ind, kb, m, beta_, a, k, n,
-                        packed_b, c_ptr, kernels,
+                        m2,
+                        kernel_nrows,
+                        k_ind,
+                        kb,
+                        m,
+                        beta_,
+                        a,
+                        k,
+                        n,
+                        packed_b,
+                        c_ptr,
+                        kernels,
                     );
                 }
             });
@@ -514,8 +528,18 @@ fn compute_par(
                 let f32_b_ptr = f32_b_ptr as *const f32;
                 unsafe {
                     process_row_group_fallback(
-                        m2, kernel_nrows, k_ind, kb, m, beta_, a, k, n,
-                        f32_b_ptr, c_ptr, kernels,
+                        m2,
+                        kernel_nrows,
+                        k_ind,
+                        kb,
+                        m,
+                        beta_,
+                        a,
+                        k,
+                        n,
+                        f32_b_ptr,
+                        c_ptr,
+                        kernels,
                     );
                 }
             });
@@ -529,8 +553,7 @@ unsafe fn process_row_group_fallback(
     kernel_nrows: usize,
     k_ind: usize,
     kb: usize,
-    #[cfg_attr(target_arch = "aarch64", allow(unused))]
-    total_m: usize,
+    #[cfg_attr(target_arch = "aarch64", allow(unused))] total_m: usize,
     beta_: f32,
     a: &[f32],
     k: usize,
@@ -597,7 +620,11 @@ unsafe fn process_row_group_fallback(
             for j in 0..rem {
                 let src = c_tmp[i * bcol + j];
                 let dst = &mut *c_ptr.add((m2 + i) * ldc + last_blk_col + j);
-                if beta_ == 0.0 { *dst = src; } else { *dst = beta_ * *dst + src; }
+                if beta_ == 0.0 {
+                    *dst = src;
+                } else {
+                    *dst = beta_ * *dst + src;
+                }
             }
         }
     }
@@ -615,9 +642,13 @@ pub fn sgemm_bf16(m: usize, a: &[f32], packed_b: &PackedMatrixBf16, beta: f32, c
     }
 
     #[cfg(feature = "rayon")]
-    { compute_par(m, a, packed_b, beta, c); }
+    {
+        compute_par(m, a, packed_b, beta, c);
+    }
     #[cfg(not(feature = "rayon"))]
-    { compute_st(m, a, packed_b, beta, c); }
+    {
+        compute_st(m, a, packed_b, beta, c);
+    }
 }
 
 /// Compute C = A * B_bf16 (overwriting C).
@@ -635,9 +666,20 @@ mod tests {
     #[test]
     fn test_addr_always_in_bounds() {
         let test_dims: Vec<(usize, usize)> = vec![
-            (1, 1), (1, 16), (1, 17), (16, 1), (16, 16), (16, 17),
-            (15, 15), (512, 16), (512, 17), (513, 16), (513, 32),
-            (1024, 33), (100, 100), (511, 31),
+            (1, 1),
+            (1, 16),
+            (1, 17),
+            (16, 1),
+            (16, 16),
+            (16, 17),
+            (15, 15),
+            (512, 16),
+            (512, 17),
+            (513, 16),
+            (513, 32),
+            (1024, 33),
+            (100, 100),
+            (511, 31),
         ];
         for &(nrow, ncol) in &test_dims {
             let m = PackedMatrixBf16::alloc(nrow, ncol);
@@ -659,8 +701,15 @@ mod tests {
     #[test]
     fn test_b_layout_contiguous_within_kblock() {
         let test_dims: Vec<(usize, usize)> = vec![
-            (1, 16), (1, 32), (1, 33), (512, 16), (512, 48),
-            (513, 16), (513, 33), (1024, 48), (100, 47),
+            (1, 16),
+            (1, 32),
+            (1, 33),
+            (512, 16),
+            (512, 48),
+            (513, 16),
+            (513, 33),
+            (1024, 48),
+            (100, 47),
         ];
         let bcol = BLOCK_COL_SIZE;
         let brow = DEFAULT_BROW;
@@ -738,7 +787,13 @@ mod tests {
             } else {
                 ((back - v) / v).abs()
             };
-            assert!(rel_err < 0.01, "bf16 roundtrip for {}: got {}, err={}", v, back, rel_err);
+            assert!(
+                rel_err < 0.01,
+                "bf16 roundtrip for {}: got {}, err={}",
+                v,
+                back,
+                rel_err
+            );
         }
     }
 
@@ -789,7 +844,10 @@ mod tests {
             assert!(
                 rel_err < 0.02,
                 "mismatch at {}: got {}, expected {}, rel_err={}",
-                i, c[i], c_ref[i], rel_err
+                i,
+                c[i],
+                c_ref[i],
+                rel_err
             );
         }
     }

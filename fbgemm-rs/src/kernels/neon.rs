@@ -1857,12 +1857,19 @@ unsafe fn neon_kernel_6x2(gp: *mut GemmParams) {
 }
 
 pub static KERNELS: [Option<KernelFn>; 15] = [
-    None,                      // 0
-    Some(neon_kernel_1x2),     // 1
-    Some(neon_kernel_2x2),     // 2
-    Some(neon_kernel_3x2),     // 3
-    Some(neon_kernel_4x2),     // 4
-    Some(neon_kernel_5x2),     // 5
-    Some(neon_kernel_6x2),     // 6
-    None, None, None, None, None, None, None, None,
+    None,                  // 0
+    Some(neon_kernel_1x2), // 1
+    Some(neon_kernel_2x2), // 2
+    Some(neon_kernel_3x2), // 3
+    Some(neon_kernel_4x2), // 4
+    Some(neon_kernel_5x2), // 5
+    Some(neon_kernel_6x2), // 6
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
 ];
