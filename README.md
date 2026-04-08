@@ -22,8 +22,8 @@ make warp-cli
 ```
 ## Creating an index: ##
 
-For testing, I have used the BEIR download script from XTR-Warp to download
-nfcorpus and check that we can replicate their results.
+For testing, we used the BEIR download script from XTR-Warp to download
+nfcorpus and check that we could replicate their results.
 For your convenience, nfcorpus.tsv is included here, so you can run:
 ```
 $ ./warp-cli readcsv datasets/nfcorpus.tsv
