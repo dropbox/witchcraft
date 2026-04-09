@@ -29,6 +29,12 @@ use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
 use std::io::Error;
 use std::sync::Arc;
+
+#[cfg(feature = "flash-attention")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "flash-attention")]
+static FA2_KERNELS: OnceLock<crate::triton_kernels::T5Kernels> = OnceLock::new();
 use tokenizers::Tokenizer;
 
 use crate::embed_asset;
@@ -45,6 +51,19 @@ fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
         Ok(QMatMul::Tensor(tensor))
     } else {
         QMatMul::from_arc(ws)
+    }
+}
+
+/// Pre-dequantize to F16 on Metal for FA2 attention path (faster matmul, no per-call cast).
+#[cfg(feature = "flash-attention")]
+fn new_qmm_attn(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
+    let ws = vb.get((out_d, in_d), "weight")?;
+    let device = vb.device();
+    let tensor = ws.dequantize(device)?;
+    if matches!(device, Device::Metal(_)) {
+        Ok(QMatMul::Tensor(tensor.to_dtype(DType::F16)?))
+    } else {
+        Ok(QMatMul::Tensor(tensor))
     }
 }
 
@@ -161,6 +180,25 @@ impl T5LayerNorm {
 
 impl Module for T5LayerNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "flash-attention")]
+        if let Device::Metal(metal_device) = xs.device() {
+            if let Some(kernels) = FA2_KERNELS.get() {
+                let shape = xs.shape();
+                let dim = shape.dims().last().copied().unwrap();
+                let n_rows = xs.elem_count() / dim;
+                let xs_2d = xs.reshape((n_rows, dim))?.contiguous()?;
+                let out = crate::triton_kernels::triton_rms_norm(
+                    metal_device,
+                    &kernels.rms_norm,
+                    &xs_2d,
+                    &self.weight,
+                    self.variance_epsilon as f32,
+                )
+                .map_err(|e| candle_core::Error::Msg(format!("RMS norm: {e}")))?;
+                return Ok(out.reshape(shape)?);
+            }
+        }
+
         let dtype = xs.dtype();
         let xs_f32 = xs.to_dtype(DType::F32)?;
         // variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
@@ -242,12 +280,11 @@ impl Module for T5DenseGatedActDense {
             }
         };
         #[cfg(not(feature = "hybrid-dequant"))]
-        let hidden = {
+        {
             let hidden_act = self.act.forward(&self.wi_0.forward(xs)?)?;
             let hidden_linear = self.wi_1.forward(xs)?;
-            hidden_act.broadcast_mul(&hidden_linear)?
-        };
-        self.wo.forward(&hidden)
+            self.wo.forward(&hidden_act.broadcast_mul(&hidden_linear)?)
+        }
     }
 }
 
@@ -338,7 +375,17 @@ impl T5Attention {
             (qkv, o)
         };
 
-        #[cfg(not(feature = "hybrid-dequant"))]
+        #[cfg(all(not(feature = "hybrid-dequant"), feature = "flash-attention"))]
+        let (qkv, o) = {
+            let q = new_qmm_attn(cfg.d_model, inner_dim, vb.pp("q"))?;
+            let k = new_qmm_attn(cfg.d_model, inner_dim, vb.pp("k"))?;
+            let v = new_qmm_attn(cfg.d_model, inner_dim, vb.pp("v"))?;
+            let qkv = AttentionWeights::Separate { q, k, v };
+            let o = new_qmm_attn(inner_dim, cfg.d_model, vb.pp("o"))?;
+            (qkv, o)
+        };
+
+        #[cfg(all(not(feature = "hybrid-dequant"), not(feature = "flash-attention")))]
         let (qkv, o) = {
             let q = new_qmm(cfg.d_model, inner_dim, vb.pp("q"))?;
             let k = new_qmm(cfg.d_model, inner_dim, vb.pp("k"))?;
@@ -404,9 +451,28 @@ impl T5Attention {
                     Some(key_value_states) => key_value_states,
                 };
                 let kv_len = kv_input.dim(1)?;
-                let q = q_mm.forward(xs)?;
-                let k = k_mm.forward(kv_input)?;
-                let v = v_mm.forward(kv_input)?;
+
+                // FA2 on Metal: weights are F16, cast inputs to match
+                #[cfg(feature = "flash-attention")]
+                let (xs_proj, kv_proj);
+                #[cfg(feature = "flash-attention")]
+                if matches!(xs.device(), Device::Metal(_)) {
+                    xs_proj = xs.to_dtype(DType::F16)?;
+                    kv_proj = if key_value_states.is_none() {
+                        xs_proj.clone()
+                    } else {
+                        kv_input.to_dtype(DType::F16)?
+                    };
+                } else {
+                    xs_proj = xs.clone();
+                    kv_proj = kv_input.clone();
+                }
+                #[cfg(not(feature = "flash-attention"))]
+                let (xs_proj, kv_proj) = (xs.clone(), kv_input.clone());
+
+                let q = q_mm.forward(&xs_proj)?;
+                let k = k_mm.forward(&kv_proj)?;
+                let v = v_mm.forward(&kv_proj)?;
                 let q = q
                     .reshape((b_sz, q_len, self.n_heads, self.d_kv))?
                     .transpose(1, 2)?
@@ -423,29 +489,14 @@ impl T5Attention {
             }
         };
 
-        let scores = q.matmul(&k.t()?)?;
-        let scores = match mask {
-            None => scores,
-            Some(mask) => masked_fill(
-                &scores,
-                &mask
-                    .unsqueeze(0)?
-                    .unsqueeze(0)?
-                    .repeat((b_sz, self.n_heads))?,
-                f32::NEG_INFINITY,
-            )?,
-        };
-
-        let (scores, position_bias) = match position_bias {
-            Some(position_bias) => {
-                let scores = crate::fast_ops::fast_add(&scores, position_bias)?;
-                (scores, Some(position_bias.clone()))
-            }
+        // Compute or propagate position bias (needed before attention for FA2 path)
+        let kv_len = k.dim(2)?;
+        let position_bias = match position_bias {
+            Some(position_bias) => Some(position_bias.clone()),
             None => match &self.relative_attention_bias {
-                None => (scores, None),
+                None => None,
                 Some(relative_attention_bias) => {
-                    // This only handles the bidirectional case.
-                    let kv_len = k.dim(2)?;
+                    // Bidirectional relative position bias
                     let (q_start, q_end) = (0_u32, kv_len as u32);
                     let num_buckets = self.relative_attention_num_buckets as u32 / 2;
                     let max_exact = num_buckets / 2;
@@ -482,15 +533,108 @@ impl T5Attention {
                         })
                         .collect::<Vec<Vec<_>>>();
                     let relative_buckets = Tensor::new(relative_position, q.device())?;
-                    let position_bias = relative_attention_bias
-                        .forward(&relative_buckets)?
-                        .permute((2, 0, 1))?
-                        .unsqueeze(0)?
-                        .contiguous()?;
-                    let scores = crate::fast_ops::fast_add(&scores, &position_bias)?;
-                    (scores, Some(position_bias))
+                    Some(
+                        relative_attention_bias
+                            .forward(&relative_buckets)?
+                            .permute((2, 0, 1))?
+                            .unsqueeze(0)?
+                            .contiguous()?,
+                    )
                 }
             },
+        };
+
+        // Flash Attention 2 path: fused QK^T + bias + softmax + @V
+        // Only for encoder self-attention on Metal (no mask, batch=1)
+        #[cfg(feature = "flash-attention")]
+        if mask.is_none() && b_sz == 1 {
+            if let Device::Metal(metal_device) = q.device() {
+                if let Some(ref bias) = position_bias {
+                    let kernels = FA2_KERNELS.get_or_init(|| {
+                        crate::triton_kernels::T5Kernels::load(metal_device)
+                            .expect("Failed to load FA2 Metal kernels")
+                    });
+
+                    // Q/K/V are already F16 (from F16 weight projections).
+                    // Pad to BM=32-aligned rows so kernel writes don't overflow heads.
+                    const BM: usize = 32;
+                    let padded_seq = (q_len + BM - 1) / BM * BM;
+                    let dev = q.device();
+
+                    let q16 = q.squeeze(0)?.contiguous()?;
+                    let k16 = k.squeeze(0)?.contiguous()?;
+                    let v16 = v.squeeze(0)?.contiguous()?;
+
+                    let (q16, k16, v16) = if q_len < padded_seq {
+                        let pad = |t: Tensor| -> Result<Tensor> {
+                            let pad_rows = padded_seq - q_len;
+                            let zeros = Tensor::zeros(
+                                (self.n_heads, pad_rows, self.d_kv),
+                                DType::F16,
+                                dev,
+                            )?;
+                            Tensor::cat(&[&t, &zeros], 1)?.contiguous()
+                        };
+                        (pad(q16)?, pad(k16)?, pad(v16)?)
+                    } else {
+                        (q16, k16, v16)
+                    };
+
+                    let out = q16.zeros_like()?;
+
+                    // Bias: [1, n_heads, q_len, kv_len] → [n_heads, q_len, kv_len] F32
+                    let bias_3d = bias.squeeze(0)?.contiguous()?;
+
+                    crate::triton_kernels::triton_flash_attention_bias(
+                        metal_device,
+                        &kernels.flash_attention_bias,
+                        &q16,
+                        &k16,
+                        &v16,
+                        &out,
+                        &bias_3d,
+                        self.n_heads,
+                        q_len,
+                        self.d_kv,
+                        1.0,
+                    )
+                    .map_err(|e| candle_core::Error::Msg(format!("FA2 dispatch: {e}")))?;
+
+                    // [n_heads, q_len, d_kv] F16 → [1, q_len, inner_dim] F16
+                    let fa2_out = out.narrow(1, 0, q_len)?;
+                    let attn_output = fa2_out
+                        .transpose(0, 1)?
+                        .contiguous()?
+                        .reshape((1, q_len, self.inner_dim))?;
+                    // O projection in F16, then back to F32 for residual add
+                    let attn_output = self.o.forward(&attn_output)?
+                        .to_dtype(DType::F32)?;
+                    return Ok((attn_output, position_bias));
+                }
+            }
+        }
+
+        // Standard attention path (CPU or fallback)
+        // When flash-attention is enabled, Q/K/V may be F16 — cast to F32 for softmax precision.
+        #[cfg(feature = "flash-attention")]
+        let (q, k, v) = (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?, v.to_dtype(DType::F32)?);
+
+        let scores = q.matmul(&k.t()?)?;
+        let scores = match mask {
+            None => scores,
+            Some(mask) => masked_fill(
+                &scores,
+                &mask
+                    .unsqueeze(0)?
+                    .unsqueeze(0)?
+                    .repeat((b_sz, self.n_heads))?,
+                f32::NEG_INFINITY,
+            )?,
+        };
+
+        let scores = match &position_bias {
+            Some(bias) => crate::fast_ops::fast_add(&scores, bias)?,
+            None => scores,
         };
 
         let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
@@ -498,6 +642,13 @@ impl T5Attention {
         let attn_output = attn_output
             .transpose(1, 2)?
             .reshape((b_sz, q_len, self.inner_dim))?;
+        // When flash-attention is enabled, O has F16 weights — project then cast back to F32.
+        #[cfg(feature = "flash-attention")]
+        let attn_output = {
+            let attn_output = attn_output.to_dtype(DType::F16)?;
+            self.o.forward(&attn_output)?.to_dtype(DType::F32)?
+        };
+        #[cfg(not(feature = "flash-attention"))]
         let attn_output = self.o.forward(&attn_output)?;
         Ok((attn_output, position_bias))
     }

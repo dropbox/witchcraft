@@ -13,6 +13,8 @@ use quantized_t5 as t5_encoder;
 pub mod fast_ops;
 #[cfg(feature = "hybrid-dequant")]
 pub mod fused_matmul;
+#[cfg(feature = "flash-attention")]
+pub mod triton_kernels;
 
 #[cfg(feature = "t5-openvino")]
 mod openvino_t5;

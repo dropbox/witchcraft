@@ -506,6 +506,61 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // run explicitly: cargo nextest run --release --features ... -E 'test(bench_encoder)'
+    fn bench_encoder() -> std::io::Result<()> {
+        use std::time::Instant;
+
+        let device = crate::make_device();
+        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let builder = crate::t5_encoder::T5ModelBuilder::load(&assets).unwrap();
+        let model = builder.0.build_encoder(&device, &assets).unwrap();
+        let tokenizer = builder.1;
+
+        // Build inputs of increasing length by repeating text
+        let base_text = FACTS.join(" ");
+        let lengths = [32, 64, 128, 256, 512];
+        let warmup = 3;
+        let iters = 7;
+
+        for &target_len in &lengths {
+            // Tokenize and truncate/pad to target length
+            let mut text = base_text.clone();
+            loop {
+                let enc = tokenizer.encode(text.as_str(), true).unwrap();
+                if enc.get_ids().len() >= target_len {
+                    let ids: Vec<u32> = enc.get_ids()[..target_len].to_vec();
+                    let input = candle_core::Tensor::new(&ids[..], model.device())
+                        .unwrap()
+                        .unsqueeze(0)
+                        .unwrap();
+
+                    // Warmup
+                    for _ in 0..warmup {
+                        let _ = model.forward(&input).unwrap();
+                    }
+
+                    // Timed runs
+                    let mut times = Vec::with_capacity(iters);
+                    for _ in 0..iters {
+                        let t0 = Instant::now();
+                        let _ = model.forward(&input).unwrap();
+                        times.push(t0.elapsed());
+                    }
+                    times.sort();
+                    let median = times[iters / 2];
+                    eprintln!(
+                        "seq_len={target_len:>4}  median={:.1}ms",
+                        median.as_secs_f64() * 1000.0,
+                    );
+                    break;
+                }
+                text.push_str(&base_text);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_open_corrupted_db() -> std::io::Result<()> {
         use std::io::Write;
         let dir = tempdir().unwrap();
