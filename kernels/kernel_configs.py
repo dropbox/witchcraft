@@ -62,18 +62,22 @@ KERNEL_METADATA = {
     "matmul_fp16_64x64": {
         "alias": "matmul_fp16_64x64",
         "group": "encoder",
+        "d3d12": True,
     },
     "matmul_fp16_128x128": {
         "alias": "matmul_fp16_128x128",
         "group": "encoder",
+        "d3d12": True,
     },
     "residual_add_1024": {
         "alias": "residual_add",
         "group": "encoder",
+        "d3d12": True,
     },
     "rms_norm_f16_1024": {
         "alias": "rms_norm_f16",
         "group": "encoder",
+        "d3d12": True,
     },
     "flash_attention_bias_32x32x64": {
         "alias": "flash_attention_bias",
@@ -83,22 +87,27 @@ KERNEL_METADATA = {
     "gelu_mul_1024": {
         "alias": "gelu_mul",
         "group": "encoder",
+        "d3d12": True,
     },
     "rms_norm_f32_f16_1024": {
         "alias": "rms_norm_f32_f16",
         "group": "encoder",
+        "d3d12": True,
     },
     "residual_add_f16_f32_1024": {
         "alias": "residual_add_f16_f32",
         "group": "encoder",
+        "d3d12": True,
     },
     "matmul_q8_64x64": {
         "alias": "matmul_q8_64x64",
         "group": "encoder",
+        "d3d12": True,
     },
     "rms_norm_1024": {
         "alias": "rms_norm",
         "group": "encoder",
+        "d3d12": True,
     },
     "flash_attention_bias_d64": {
         "alias": "flash_attention_bias_d64",

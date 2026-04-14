@@ -17,6 +17,10 @@ pub mod fused_matmul;
 pub mod triton_kernels;
 #[cfg(feature = "flash-attention")]
 pub mod gpu_t5_encoder;
+#[cfg(feature = "triton-d3d12")]
+pub mod triton_d3d12_kernels;
+#[cfg(feature = "triton-d3d12")]
+pub mod gpu_t5_encoder_d3d12;
 
 #[cfg(feature = "t5-openvino")]
 mod openvino_t5;

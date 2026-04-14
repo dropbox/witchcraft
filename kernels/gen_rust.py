@@ -133,10 +133,42 @@ def gen_d3d12(metadata, metal_kernels, hlsl_extra):
         lines.append("// No D3D12 kernels configured")
         return "\n".join(lines) + "\n"
 
+    # DXIL include_bytes constants
     for name in d3d12_kernels:
         alias = metadata[name]["alias"]
         const_name = f"DXIL_{alias.upper()}"
         lines.append(f'const {const_name}: &[u8] = include_bytes!("../dxil/{name}.dxil");')
+    lines.append("")
+
+    # T5D3D12Kernels struct
+    lines.append("/// Compiled Triton DXIL kernel pipelines for T5 encoder on D3D12.")
+    lines.append("#[allow(dead_code)]")
+    lines.append("pub struct T5D3D12Kernels {")
+    lines.append("    pub(crate) gpu: Arc<Gpu>,")
+    for name in d3d12_kernels:
+        alias = metadata[name]["alias"]
+        lines.append(f"    pub(crate) {alias}: ID3D12PipelineState,")
+    lines.append("}")
+    lines.append("")
+
+    # T5D3D12Kernels::load()
+    all_configs = list(metal_kernels) + list(hlsl_extra)
+    lines.append("impl T5D3D12Kernels {")
+    lines.append("    pub fn load(gpu: &Arc<Gpu>) -> Result<Self> {")
+    lines.append("        let load_pso = |name: &str, dxil: &[u8]| -> Result<ID3D12PipelineState> {")
+    lines.append("            gpu.create_compute_pso(dxil)")
+    lines.append('                .map_err(|e| anyhow::anyhow!("Failed to create PSO for {name}: {e}"))')
+    lines.append("        };")
+    lines.append("")
+    lines.append("        Ok(Self {")
+    lines.append("            gpu: gpu.clone(),")
+    for name in d3d12_kernels:
+        alias = metadata[name]["alias"]
+        const_name = f"DXIL_{alias.upper()}"
+        lines.append(f'            {alias}: load_pso("{name}", {const_name})?,')
+    lines.append("        })")
+    lines.append("    }")
+    lines.append("}")
     lines.append("")
 
     return "\n".join(lines) + "\n"

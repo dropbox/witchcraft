@@ -827,6 +827,8 @@ pub struct T5EncoderModel {
     device: Device,
     #[cfg(feature = "flash-attention")]
     gpu_encoder: Option<crate::gpu_t5_encoder::GpuT5Encoder>,
+    #[cfg(feature = "triton-d3d12")]
+    gpu_encoder_d3d12: Option<crate::gpu_t5_encoder_d3d12::GpuT5EncoderD3D12>,
 }
 
 impl T5EncoderModel {
@@ -846,6 +848,8 @@ impl T5EncoderModel {
             device: vb.device().clone(),
             #[cfg(feature = "flash-attention")]
             gpu_encoder: None,
+            #[cfg(feature = "triton-d3d12")]
+            gpu_encoder_d3d12: None,
         })
     }
 
@@ -896,18 +900,53 @@ impl T5EncoderModel {
         Ok(())
     }
 
+    /// Try to create a D3D12 GPU encoder for Windows GPU acceleration.
+    #[cfg(feature = "triton-d3d12")]
+    pub fn try_init_gpu_encoder_d3d12(
+        &mut self,
+        cfg: &Config,
+        assets: &std::path::Path,
+    ) -> std::result::Result<(), anyhow::Error> {
+        use log::info;
+
+        info!("D3D12 GPU encoder: loading weights...");
+        let now = std::time::Instant::now();
+
+        let model_bytes = MODEL
+            .bytes(assets)
+            .map_err(|e| anyhow::anyhow!("failed to get GGUF bytes: {e:?}"))?;
+        let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
+            model_bytes,
+            &Device::Cpu,
+        )
+        .map_err(|e| anyhow::anyhow!("GGUF VarBuilder: {e}"))?;
+
+        let gpu_enc = crate::gpu_t5_encoder_d3d12::GpuT5EncoderD3D12::new(cfg, vb, 512)?;
+
+        info!("D3D12 GPU encoder: loaded in {}ms", now.elapsed().as_millis());
+        self.gpu_encoder_d3d12 = Some(gpu_enc);
+        Ok(())
+    }
+
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         // GPU encoder path: embedding on CPU → full encoder on GPU → final projection on CPU
         #[cfg(feature = "flash-attention")]
         if let Some(ref gpu_enc) = self.gpu_encoder {
-            // Embedding lookup on CPU
             let input_embeds = self.encoder.shared.as_ref().forward(input_ids)?;
-            // Encoder forward on GPU
             let encoder_output = gpu_enc
                 .forward(&input_embeds)
                 .map_err(|e| candle_core::Error::Msg(format!("GPU encoder: {e}")))?;
-            // Final projection (move to model device first — may be Metal on Apple Silicon)
             let encoder_output = encoder_output.to_device(&self.device)?;
+            return self.final_projection.forward(&encoder_output);
+        }
+
+        // D3D12 GPU encoder path (Windows)
+        #[cfg(feature = "triton-d3d12")]
+        if let Some(ref gpu_enc) = self.gpu_encoder_d3d12 {
+            let input_embeds = self.encoder.shared.as_ref().forward(input_ids)?;
+            let encoder_output = gpu_enc
+                .forward(&input_embeds)
+                .map_err(|e| candle_core::Error::Msg(format!("D3D12 GPU encoder: {e}")))?;
             return self.final_projection.forward(&encoder_output);
         }
 
@@ -957,21 +996,20 @@ impl T5ModelBuilder {
             device,
         )?;
 
-        #[cfg(not(all(feature = "flash-attention", target_arch = "x86_64")))]
-        let enc = T5EncoderModel::load(vb, &self.config)
+        let mut enc = T5EncoderModel::load(vb, &self.config)
             .map_err(|e| Error::other(format!("failed to load T5 encoder: {e}")))?;
 
         // On Intel Macs, use full Triton GPU encoder (candle Metal crashes on Intel GPUs).
-        // On Apple Silicon, candle's Metal backend works correctly — skip the GPU encoder.
         #[cfg(all(feature = "flash-attention", target_arch = "x86_64"))]
-        let enc = {
-            let mut enc = T5EncoderModel::load(vb, &self.config)
-                .map_err(|e| Error::other(format!("failed to load T5 encoder: {e}")))?;
-            if let Err(e) = enc.try_init_gpu_encoder(&self.config, assets) {
-                log::warn!("GPU encoder init failed (falling back to CPU): {e}");
-            }
-            enc
-        };
+        if let Err(e) = enc.try_init_gpu_encoder(&self.config, assets) {
+            log::warn!("GPU encoder init failed (falling back to CPU): {e}");
+        }
+
+        // On Windows, use D3D12 GPU encoder with Triton-compiled DXIL shaders.
+        #[cfg(feature = "triton-d3d12")]
+        if let Err(e) = enc.try_init_gpu_encoder_d3d12(&self.config, assets) {
+            log::warn!("D3D12 GPU encoder init failed (falling back to CPU): {e}");
+        }
 
         Ok(enc)
     }

@@ -21,9 +21,9 @@ anyhow = "*"
 serde = "*"
 serde_json = "*"
 
-candle-core = { git = "https://github.com/huggingface/candle", rev="0.10.1" }
-candle-nn = { git = "https://github.com/huggingface/candle", rev="0.10.1" }
-candle-transformers = { git = "https://github.com/huggingface/candle", rev="0.10.1" }
+candle-core = { path = "/Users/jhansen/src/candle/windows/candle-core" }
+candle-nn = { path = "/Users/jhansen/src/candle/windows/candle-nn" }
+candle-transformers = { path = "/Users/jhansen/src/candle/windows/candle-transformers" }
 
 tokenizers = "*"
 serde_plain = "1.0.2"
@@ -47,6 +47,7 @@ text-splitter = { version = "0.28.0", features = ["markdown"] } # !Dash
 regex = "1"                # !Dash
 chrono = "0.4"             # !Dash
 lz4_flex = "0.11.5"
+half = { version = "2.5.0", features = ["num-traits"] }
 strsim = "0.11.1"
 rayon = { version = "1", optional = true }
 fbgemm-rs = { path = "fbgemm-rs", optional = true, features = ["rayon"] }
@@ -59,24 +60,30 @@ libc = "0.2"
 
 # Apple Silicon (ARM) - enable Metal support
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-candle-core = { git = "https://github.com/huggingface/candle", rev="0.10.1", features = ["metal"] }
-candle-nn = { git = "https://github.com/huggingface/candle", rev="0.10.1", features = ["metal"] }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev="0.10.1", optional=true }
+candle-core = { path = "/Users/jhansen/src/candle/windows/candle-core", features = ["metal"] }
+candle-nn = { path = "/Users/jhansen/src/candle/windows/candle-nn", features = ["metal"] }
+candle-metal-kernels = { path = "/Users/jhansen/src/candle/windows/candle-metal-kernels", optional=true }
 metal = { version = "0.27.0", features = ["mps"], optional = true }
 ug-metal = { version = "0.4.0", optional = true }
 dispatch2 = { version = "0.3", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 libc = { version = "0.2.147", optional = true }
 
-# Intel (x86_64) - no Metal support, use Accelerate only
+# Intel (x86_64) - Metal support (metal_nosimd metallibs, Metal 2.4 scalar fallback)
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
-candle-core = { git = "https://github.com/huggingface/candle", rev="0.10.1", features = [] }
-candle-nn = { git = "https://github.com/huggingface/candle", rev="0.10.1", features = [] }
+candle-core = { path = "/Users/jhansen/src/candle/windows/candle-core", features = ["metal"] }
+candle-nn = { path = "/Users/jhansen/src/candle/windows/candle-nn", features = ["metal"] }
+candle-metal-kernels = { path = "/Users/jhansen/src/candle/windows/candle-metal-kernels", optional=true }
+metal = { version = "0.27.0", features = ["mps"], optional = true }
+ug-metal = { version = "0.4.0", optional = true }
+dispatch2 = { version = "0.3", optional = true }
+objc2-metal = { version = "0.3", optional = true }
 libc = { version = "0.2.147", optional = true }
 
-# Windows - priority management
+# Windows - priority management + D3D12 GPU
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_System_Threading"] }
+candle-d3d12-kernels = { path = "/Users/jhansen/src/candle/windows/candle-d3d12-kernels", optional = true }
 
 [build-dependencies]
 napi-build = "2.2.3"
@@ -91,6 +98,7 @@ embed-assets = []
 progress = ["dep:indicatif"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal", "dep:dispatch2", "dep:objc2-metal"]
 flash-attention = ["metal"]
+triton-d3d12 = ["dep:candle-d3d12-kernels"]
 hybrid-dequant = ["dep:rayon"]
 fbgemm = ["dep:fbgemm-rs"]
 deterministic = []
