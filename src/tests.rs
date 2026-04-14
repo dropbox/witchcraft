@@ -481,6 +481,16 @@ mod tests {
     }
 
     #[test]
+    fn test_bananas() -> std::io::Result<()> {
+        let device = crate::make_device();
+        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let embedder = crate::Embedder::new(&device, &assets).unwrap();
+        let result = embedder.embed("Bananas are berries, but strawberries aren't.");
+        assert!(result.is_ok(), "Failed to embed 'Bananas' text: {:?}", result.err());
+        Ok(())
+    }
+
+    #[test]
     fn test_embedder_without_assets() -> std::io::Result<()> {
         let device = crate::make_device();
         let assets = std::path::PathBuf::from("assets.notfound");

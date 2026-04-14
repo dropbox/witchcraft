@@ -108,18 +108,18 @@ fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> Result<Tensor>
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
-    vocab_size: usize,
-    d_model: usize,
-    d_kv: usize,
-    d_ff: usize,
-    num_layers: usize,
-    num_decoder_layers: Option<usize>,
-    num_heads: usize,
-    relative_attention_num_buckets: usize,
+    pub vocab_size: usize,
+    pub d_model: usize,
+    pub d_kv: usize,
+    pub d_ff: usize,
+    pub num_layers: usize,
+    pub num_decoder_layers: Option<usize>,
+    pub num_heads: usize,
+    pub relative_attention_num_buckets: usize,
     #[serde(default = "default_relative_attention_max_distance")]
-    relative_attention_max_distance: usize,
-    dropout_rate: f64,
-    layer_norm_epsilon: f64,
+    pub relative_attention_max_distance: usize,
+    pub dropout_rate: f64,
+    pub layer_norm_epsilon: f64,
     initializer_factor: f64,
     #[serde(default, deserialize_with = "deserialize_feed_forward_proj_activation")]
     pub feed_forward_proj: ActivationWithOptionalGating,
@@ -821,11 +821,12 @@ impl T5Stack {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct T5EncoderModel {
     encoder: T5Stack,
     final_projection: QMatMul,
     device: Device,
+    #[cfg(feature = "flash-attention")]
+    gpu_encoder: Option<crate::gpu_t5_encoder::GpuT5Encoder>,
 }
 
 impl T5EncoderModel {
@@ -843,10 +844,73 @@ impl T5EncoderModel {
             encoder,
             final_projection,
             device: vb.device().clone(),
+            #[cfg(feature = "flash-attention")]
+            gpu_encoder: None,
         })
     }
 
+    /// Try to create a GPU encoder for Metal acceleration.
+    /// Loads weights from GGUF directly (separate from candle model weights).
+    #[cfg(feature = "flash-attention")]
+    pub fn try_init_gpu_encoder(
+        &mut self,
+        cfg: &Config,
+        assets: &std::path::Path,
+    ) -> std::result::Result<(), anyhow::Error> {
+        use log::{info, warn};
+
+        // Create own Metal device (separate from candle's, which may be CPU)
+        let metal_device = match Device::new_metal(0) {
+            Ok(Device::Metal(md)) => md,
+            _ => {
+                warn!("GPU encoder: no Metal device available");
+                return Ok(());
+            }
+        };
+
+        info!("GPU encoder: loading weights to Metal device...");
+        let now = std::time::Instant::now();
+
+        // Load GGUF weights directly for the GPU encoder
+        let model_bytes = MODEL
+            .bytes(assets)
+            .map_err(|e| anyhow::anyhow!("failed to get GGUF bytes: {e:?}"))?;
+        let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
+            model_bytes,
+            &Device::Cpu,
+        )
+        .map_err(|e| anyhow::anyhow!("GGUF VarBuilder: {e}"))?;
+
+        let gpu_enc = crate::gpu_t5_encoder::GpuT5Encoder::new(
+            &metal_device,
+            cfg,
+            vb,
+            512, // max seq len
+        )?;
+
+        info!(
+            "GPU encoder: loaded in {}ms",
+            now.elapsed().as_millis()
+        );
+        self.gpu_encoder = Some(gpu_enc);
+        Ok(())
+    }
+
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        // GPU encoder path: embedding on CPU → full encoder on GPU → final projection on CPU
+        #[cfg(feature = "flash-attention")]
+        if let Some(ref gpu_enc) = self.gpu_encoder {
+            // Embedding lookup on CPU
+            let input_embeds = self.encoder.shared.as_ref().forward(input_ids)?;
+            // Encoder forward on GPU
+            let encoder_output = gpu_enc
+                .forward(&input_embeds)
+                .map_err(|e| candle_core::Error::Msg(format!("GPU encoder: {e}")))?;
+            // Final projection (move to model device first — may be Metal on Apple Silicon)
+            let encoder_output = encoder_output.to_device(&self.device)?;
+            return self.final_projection.forward(&encoder_output);
+        }
+
         let encoder_output = self.encoder.forward(input_ids, None)?;
         self.final_projection.forward(&encoder_output)
     }
@@ -893,8 +957,21 @@ impl T5ModelBuilder {
             device,
         )?;
 
+        #[cfg(not(all(feature = "flash-attention", target_arch = "x86_64")))]
         let enc = T5EncoderModel::load(vb, &self.config)
             .map_err(|e| Error::other(format!("failed to load T5 encoder: {e}")))?;
+
+        // On Intel Macs, use full Triton GPU encoder (candle Metal crashes on Intel GPUs).
+        // On Apple Silicon, candle's Metal backend works correctly — skip the GPU encoder.
+        #[cfg(all(feature = "flash-attention", target_arch = "x86_64"))]
+        let enc = {
+            let mut enc = T5EncoderModel::load(vb, &self.config)
+                .map_err(|e| Error::other(format!("failed to load T5 encoder: {e}")))?;
+            if let Err(e) = enc.try_init_gpu_encoder(&self.config, assets) {
+                log::warn!("GPU encoder init failed (falling back to CPU): {e}");
+            }
+            enc
+        };
 
         Ok(enc)
     }

@@ -15,6 +15,8 @@ pub mod fast_ops;
 pub mod fused_matmul;
 #[cfg(feature = "flash-attention")]
 pub mod triton_kernels;
+#[cfg(feature = "flash-attention")]
+pub mod gpu_t5_encoder;
 
 #[cfg(feature = "t5-openvino")]
 mod openvino_t5;
@@ -86,6 +88,7 @@ pub type DocPtr = (u32, u32);
 
 pub fn make_device() -> Device {
     // Metal only works on Apple Silicon (ARM), not Intel x86_64
+    // (candle's built-in Metal kernels use AIR builtins unavailable on Intel GPUs)
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         match Device::new_metal(0) {
             Ok(device) => device,

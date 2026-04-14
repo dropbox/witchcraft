@@ -38,7 +38,9 @@ impl Embedder {
         loop {
             let end = (start + max_len).min(n_tokens);
             let input = Tensor::new(&ids[start..end], device)?.unsqueeze(0)?;
+            let fwd_t = std::time::Instant::now();
             let chunk = model.forward(&input)?.squeeze(0)?.to_device(&Device::Cpu)?;
+            log::info!("forward: {} tokens in {}ms", end - start, fwd_t.elapsed().as_millis());
 
             let (m, _n) = chunk.dims2()?;
             for i in 0..m {
@@ -79,14 +81,18 @@ impl Embedder {
         const MIN_NORM: f32 = 1.0;
         let mut filtered_embs = Vec::with_capacity(token_embs.len());
         let mut filtered_offsets = Vec::with_capacity(offsets.len());
+        let mut norms_debug = Vec::new();
         for (emb, offset) in token_embs.into_iter().zip(offsets.into_iter()) {
             let norm = emb.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+            norms_debug.push(norm);
             if norm >= MIN_NORM {
                 filtered_embs.push(emb);
                 filtered_offsets.push(offset);
             }
         }
         if filtered_embs.is_empty() {
+            let first_few: Vec<String> = norms_debug.iter().take(5).map(|n| format!("{n:.4}")).collect();
+            log::warn!("all norms below threshold: n_tokens={} norms={:?} text_len={} text={:.120}", norms_debug.len(), first_few, text.len(), text);
             anyhow::bail!("all token embeddings below minimum norm threshold");
         }
 
