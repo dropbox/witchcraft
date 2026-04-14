@@ -61,10 +61,22 @@ wondered "what was that conversation where I fixed the auth middleware?" —
 pickbrain finds it, and lets you resume the session directly.
 
 ```
+brew tap dropbox/witchcraft https://github.com/dropbox/witchcraft
+brew install pickbrain
+```
+
+Or build from source:
+
+```
 make pickbrain
-./pickbrain auth middleware fix    # search across all sessions (auto-ingests new sessions)
-./pickbrain --session <UUID> auth  # search within one session
-./pickbrain --dump <UUID>          # print full conversation
+```
+
+Then search:
+
+```
+pickbrain auth middleware fix    # search across all sessions (auto-ingests new sessions)
+pickbrain --session <UUID> auth  # search within one session
+pickbrain --dump <UUID>          # print full conversation
 ```
 
 The source lives in `examples/pickbrain/` and demonstrates how to use

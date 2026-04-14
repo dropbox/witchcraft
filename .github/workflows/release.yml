@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            features: t5-quantized,metal,progress,embed-assets
+            rustflags: ''
+            backend: gguf
+            archive: tar.gz
+          - name: macos-intel
+            os: macos-13
+            target: x86_64-apple-darwin
+            features: t5-quantized,fbgemm,hybrid-dequant,progress,embed-assets
+            rustflags: '-C target-feature=+avx2,+fma'
+            backend: gguf
+            archive: tar.gz
+          - name: windows-intel
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: t5-openvino,fbgemm,progress,embed-assets
+            rustflags: ''
+            backend: openvino
+            archive: zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Cache model weights
+        uses: actions/cache@v4
+        id: cache-weights
+        with:
+          path: assets
+          key: weights-${{ matrix.backend }}-${{ hashFiles('downloadweights.py', 'quantize-openvino.py') }}
+
+      - name: Install Python deps
+        if: steps.cache-weights.outputs.cache-hit != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Download weights
+        if: steps.cache-weights.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p assets
+          python downloadweights.py
+
+      - name: Quantize to GGUF
+        if: matrix.backend == 'gguf' && steps.cache-weights.outputs.cache-hit != 'true'
+        run: cargo run --release -p quantize-tool -- xtr.safetensors assets/xtr.gguf
+
+      - name: Quantize to OpenVINO IR
+        if: matrix.backend == 'openvino' && steps.cache-weights.outputs.cache-hit != 'true'
+        run: python quantize-openvino.py
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-${{ matrix.target }}-
+
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: >
+          cargo build --release
+          --target ${{ matrix.target }}
+          --features ${{ matrix.features }}
+          --example pickbrain
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          DIR="pickbrain-${VERSION}-${{ matrix.target }}"
+          mkdir -p "${DIR}/skills/pickbrain" "${DIR}/skills/pickbrain-codex"
+          cp "target/${{ matrix.target }}/release/examples/pickbrain" "${DIR}/"
+          cp skills/pickbrain/SKILL.md "${DIR}/skills/pickbrain/"
+          cp skills/pickbrain-codex/SKILL.md "${DIR}/skills/pickbrain-codex/"
+          tar -czf "${DIR}.tar.gz" "${DIR}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          DIR="pickbrain-${VERSION}-${{ matrix.target }}"
+          mkdir -p "${DIR}/skills/pickbrain" "${DIR}/skills/pickbrain-codex"
+          cp "target/${{ matrix.target }}/release/examples/pickbrain.exe" "${DIR}/"
+          cp skills/pickbrain/SKILL.md "${DIR}/skills/pickbrain/"
+          cp skills/pickbrain-codex/SKILL.md "${DIR}/skills/pickbrain-codex/"
+
+          # Bundle OpenVINO runtime DLLs
+          pip install openvino
+          OVDIR=$(python -c "import openvino, os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs'))")
+          while IFS= read -r dll; do
+            cp "${OVDIR}/${dll}" "${DIR}/" || echo "Warning: ${dll} not found in ${OVDIR}"
+          done < openvino-dlls.txt
+
+          7z a "${DIR}.zip" "${DIR}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: pickbrain-*.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Update formula and create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+
+          # Update formula version and SHA256 hashes
+          sed -i "s/^  version \".*\"/  version \"${VERSION}\"/" Formula/pickbrain.rb
+          for arch in aarch64-apple-darwin x86_64-apple-darwin; do
+            TARBALL="artifacts/pickbrain-${VERSION}-${arch}.tar.gz"
+            if [ -f "${TARBALL}" ]; then
+              HASH=$(sha256sum "${TARBALL}" | awk '{print $1}')
+              sed -i "/${arch}/{ n; s/sha256 \".*\"/sha256 \"${HASH}\"/; }" Formula/pickbrain.rb
+            fi
+          done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/pickbrain.rb
+          git diff --cached --quiet || git commit -m "formula: update pickbrain to ${VERSION}"
+          git push origin HEAD:master
+
+          # Create release with all artifacts
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "pickbrain ${VERSION}" \
+            --notes "$(cat <<'NOTES'
+          Semantic search over Claude Code and Codex conversations.
+
+          ## Install (macOS)
+
+          ```
+          brew tap dropbox/witchcraft https://github.com/dropbox/witchcraft
+          brew install pickbrain
+          ```
+
+          ## Install (Windows)
+
+          Download the zip below, extract, and add the directory to your PATH.
+
+          ## Install skills (all platforms)
+
+          After installing, set up the Claude Code and Codex skills:
+
+          ```
+          mkdir -p ~/.claude/skills/pickbrain ~/.codex/skills/pickbrain
+          cp skills/pickbrain/SKILL.md ~/.claude/skills/pickbrain/
+          cp skills/pickbrain-codex/SKILL.md ~/.codex/skills/pickbrain/
+          ```
+          NOTES
+          )" \
+            artifacts/pickbrain-*
