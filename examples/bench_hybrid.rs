@@ -1,5 +1,5 @@
 use std::time::Instant;
-use warp::Embedder;
+use witchcraft::Embedder;
 use candle_core::Device;
 
 fn main() -> anyhow::Result<()> {
