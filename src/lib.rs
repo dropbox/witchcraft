@@ -31,6 +31,9 @@ compile_error!("hybrid-dequant is incompatible with metal (use accelerate only f
 mod db;
 pub use db::DB;
 
+pub mod layer;
+pub use layer::{Layer, LayerChain, LayerError, LayerStatus};
+
 mod embedder;
 pub use embedder::Embedder;
 
