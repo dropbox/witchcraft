@@ -1,4 +1,268 @@
 #[cfg(test)]
+mod layer_tests {
+    use crate::layer::{LayerError, LayerStatus};
+    use crate::DB;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+    use test_log::test;
+
+    fn make_db() -> (DB, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path: PathBuf = dir.path().join("test.db");
+        let db = DB::new(path).unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_flat_topology_chain() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let a = db.create_layer(Some(root), "overlay-a", None).unwrap();
+        let b = db.create_layer(Some(root), "overlay-b", None).unwrap();
+
+        let chain_a = db.layer_chain(a).unwrap();
+        assert_eq!(chain_a.chain, vec![(a, 0), (root, 1)]);
+
+        let chain_b = db.layer_chain(b).unwrap();
+        assert_eq!(chain_b.chain, vec![(b, 0), (root, 1)]);
+
+        let chain_root = db.layer_chain(root).unwrap();
+        assert_eq!(chain_root.chain, vec![(root, 0)]);
+    }
+
+    #[test]
+    fn test_deep_topology_chain() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let a = db.create_layer(Some(root), "a", None).unwrap();
+        let a1 = db.create_layer(Some(a), "a1", None).unwrap();
+
+        let chain = db.layer_chain(a1).unwrap();
+        assert_eq!(chain.chain, vec![(a1, 0), (a, 1), (root, 2)]);
+    }
+
+    #[test]
+    fn test_seal_layer() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+
+        db.seal_layer(root).unwrap();
+        let layer = db.get_layer(root).unwrap();
+        assert_eq!(layer.status, LayerStatus::Sealed);
+
+        // Sealing again should fail with NotActive
+        assert!(matches!(db.seal_layer(root), Err(LayerError::NotActive(_))));
+    }
+
+    #[test]
+    fn test_seal_nonexistent() {
+        let (db, _dir) = make_db();
+        assert!(matches!(db.seal_layer(999), Err(LayerError::NotFound(999))));
+    }
+
+    #[test]
+    fn test_layer_children() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let a = db.create_layer(Some(root), "a", None).unwrap();
+        let b = db.create_layer(Some(root), "b", None).unwrap();
+
+        let children = db.layer_children(root).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].id, a);
+        assert_eq!(children[1].id, b);
+
+        let leaf_children = db.layer_children(a).unwrap();
+        assert!(leaf_children.is_empty());
+    }
+
+    #[test]
+    fn test_layer_tree() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let _a = db.create_layer(Some(root), "a", None).unwrap();
+        let _b = db.create_layer(Some(root), "b", None).unwrap();
+
+        let tree = db.layer_tree().unwrap();
+        assert_eq!(tree.len(), 3);
+    }
+
+    #[test]
+    fn test_delete_leaf() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let a = db.create_layer(Some(root), "a", None).unwrap();
+
+        db.delete_layer(a).unwrap();
+        let tree = db.layer_tree().unwrap();
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_with_children_fails() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let _a = db.create_layer(Some(root), "a", None).unwrap();
+
+        assert!(matches!(db.delete_layer(root), Err(LayerError::HasChildren(_))));
+    }
+
+    #[test]
+    fn test_compact_reparents_via_compaction() {
+        // reparent_layer is private; verify reparenting works through compact_layers
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let a = db.create_layer(Some(root), "a", None).unwrap();
+        let b = db.create_layer(Some(a), "b", None).unwrap();
+        // b has a child that should be reparented to the compacted layer
+        let c = db.create_layer(Some(b), "c", None).unwrap();
+
+        let compacted = db.compact_layers(b, Some(root)).unwrap();
+
+        // c was reparented to the compacted layer
+        let child = db.get_layer(c).unwrap();
+        assert_eq!(child.parent_id, Some(compacted));
+
+        // Compacted layer's chain goes through root
+        let chain = db.layer_chain(compacted).unwrap();
+        assert_eq!(chain.chain, vec![(compacted, 0), (root, 1)]);
+    }
+
+    #[test]
+    fn test_compact_sub_chain() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let a = db.create_layer(Some(root), "a", None).unwrap();
+        let a1 = db.create_layer(Some(a), "a1", None).unwrap();
+        let a1_child = db.create_layer(Some(a1), "a1-child", None).unwrap();
+
+        let compacted = db.compact_layers(a1, Some(root)).unwrap();
+
+        assert_eq!(db.get_layer(a1).unwrap().status, LayerStatus::Compacted);
+        assert_eq!(db.get_layer(a).unwrap().status, LayerStatus::Compacted);
+
+        let compacted_layer = db.get_layer(compacted).unwrap();
+        assert_eq!(compacted_layer.parent_id, Some(root));
+        assert_eq!(compacted_layer.status, LayerStatus::Active);
+
+        let child = db.get_layer(a1_child).unwrap();
+        assert_eq!(child.parent_id, Some(compacted));
+    }
+
+    #[test]
+    fn test_compact_full_chain_stop_at_none() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let a = db.create_layer(Some(root), "a", None).unwrap();
+        let a1 = db.create_layer(Some(a), "a1", None).unwrap();
+
+        // Compact entire chain (stop_at = None): a1 → a → root
+        let compacted = db.compact_layers(a1, None).unwrap();
+
+        // All three original layers are marked compacted
+        assert_eq!(db.get_layer(a1).unwrap().status, LayerStatus::Compacted);
+        assert_eq!(db.get_layer(a).unwrap().status, LayerStatus::Compacted);
+        assert_eq!(db.get_layer(root).unwrap().status, LayerStatus::Compacted);
+
+        // New layer has no parent (it's the new root)
+        let compacted_layer = db.get_layer(compacted).unwrap();
+        assert_eq!(compacted_layer.parent_id, None);
+    }
+
+    #[test]
+    fn test_compact_single_layer() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+
+        // Compact root alone (stop_at = None, chain = [root])
+        let compacted = db.compact_layers(root, None).unwrap();
+
+        assert_eq!(db.get_layer(root).unwrap().status, LayerStatus::Compacted);
+
+        let compacted_layer = db.get_layer(compacted).unwrap();
+        assert_eq!(compacted_layer.parent_id, None);
+        assert_eq!(compacted_layer.status, LayerStatus::Active);
+    }
+
+    #[test]
+    fn test_clear_removes_layers() {
+        let (mut db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let _a = db.create_layer(Some(root), "a", None).unwrap();
+
+        db.clear();
+        // Recreate after clear (clear sets remove_on_shutdown but also deletes rows)
+        let tree = db.layer_tree().unwrap();
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn test_metadata() {
+        let (db, _dir) = make_db();
+        let meta = r#"{"branch":"feature/foo","commit":"abc123"}"#;
+        let id = db.create_layer(None, "baseline", Some(meta)).unwrap();
+        let layer = db.get_layer(id).unwrap();
+        assert_eq!(layer.metadata.as_deref(), Some(meta));
+    }
+
+    #[test]
+    fn test_nonexistent_layer_chain() {
+        let (db, _dir) = make_db();
+        assert!(matches!(db.layer_chain(999), Err(LayerError::NotFound(999))));
+    }
+
+    #[test]
+    fn test_delete_nonexistent() {
+        let (db, _dir) = make_db();
+        assert!(matches!(db.delete_layer(999), Err(LayerError::NotFound(999))));
+    }
+
+    #[test]
+    fn test_compact_invalid_stop_at() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let a = db.create_layer(Some(root), "a", None).unwrap();
+        let b = db.create_layer(Some(root), "b", None).unwrap();
+
+        // b is not an ancestor of a — should fail
+        assert!(matches!(
+            db.compact_layers(a, Some(b)),
+            Err(LayerError::NotInChain { .. })
+        ));
+    }
+
+    #[test]
+    fn test_compact_self_stop_at() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let a = db.create_layer(Some(root), "a", None).unwrap();
+
+        // compact(a, Some(a)) — zero layers to compact
+        assert!(matches!(
+            db.compact_layers(a, Some(a)),
+            Err(LayerError::NotInChain { .. })
+        ));
+    }
+
+    #[test]
+    fn test_error_variants_are_distinguishable() {
+        let (db, _dir) = make_db();
+        let root = db.create_layer(None, "baseline", None).unwrap();
+        let _child = db.create_layer(Some(root), "child", None).unwrap();
+
+        // HasChildren vs NotFound on delete
+        assert!(matches!(db.delete_layer(root), Err(LayerError::HasChildren(_))));
+        assert!(matches!(db.delete_layer(999), Err(LayerError::NotFound(999))));
+
+        // NotActive vs NotFound on seal
+        let leaf = db.create_layer(Some(root), "leaf", None).unwrap();
+        db.seal_layer(leaf).unwrap();
+        assert!(matches!(db.seal_layer(leaf), Err(LayerError::NotActive(_))));
+        assert!(matches!(db.seal_layer(999), Err(LayerError::NotFound(999))));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::DB;
     use std::path::PathBuf;

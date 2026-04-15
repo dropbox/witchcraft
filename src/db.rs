@@ -1,7 +1,8 @@
+use super::layer::{Layer, LayerChain, LayerError, LayerStatus};
 use super::types::SqlStatementInternal;
 use iso8601_timestamp::Timestamp;
 use log::{error, warn};
-use rusqlite::{params_from_iter, Connection, OpenFlags, Result as SQLResult, Statement};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, Result as SQLResult, Statement};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -143,6 +144,22 @@ impl DB {
         let query =
             "CREATE TABLE IF NOT EXISTS indexed_chunk(chunkid INTEGER PRIMARY KEY NOT NULL)";
         connection.execute(query, ())?;
+
+        // Layer tree for overlay-aware retrieval
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS layer(
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_id   INTEGER REFERENCES layer(id),
+                name        TEXT NOT NULL,
+                metadata    JSON,
+                created_at  TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active', 'sealed', 'compacted'))
+            );
+            CREATE INDEX IF NOT EXISTS layer_parent_index ON layer(parent_id);
+            CREATE INDEX IF NOT EXISTS layer_status_index ON layer(status);",
+        )?;
+
         Ok(Self {
             db_fn,
             connection: Some(connection),
@@ -155,6 +172,7 @@ impl DB {
         self.execute("DELETE FROM chunk")?;
         self.execute("DELETE FROM bucket")?;
         self.execute("DELETE FROM indexed_chunk")?;
+        self.execute("DELETE FROM layer")?;
         self.execute("VACUUM")?;
         Ok(())
     }
@@ -360,6 +378,261 @@ impl DB {
             (chunkid,),
         )?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layer CRUD
+// ---------------------------------------------------------------------------
+impl DB {
+    fn read_layer(row: &rusqlite::Row) -> rusqlite::Result<Layer> {
+        let status_str: String = row.get(5)?;
+        let status: LayerStatus = match status_str.parse() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("unknown layer status '{}': {}", status_str, e);
+                LayerStatus::Active
+            }
+        };
+        Ok(Layer {
+            id: row.get(0)?,
+            parent_id: row.get(1)?,
+            name: row.get(2)?,
+            metadata: row.get(3)?,
+            created_at: row.get(4)?,
+            status,
+        })
+    }
+
+    /// Create a new layer. Returns the layer ID.
+    pub fn create_layer(
+        &self,
+        parent_id: Option<i64>,
+        name: &str,
+        metadata: Option<&str>,
+    ) -> Result<i64, LayerError> {
+        let now = Timestamp::now_utc().to_string();
+        self.conn().execute(
+            "INSERT INTO layer(parent_id, name, metadata, created_at) VALUES(?1, ?2, ?3, ?4)",
+            params![parent_id, name, metadata, now],
+        )?;
+        Ok(self.conn().last_insert_rowid())
+    }
+
+    /// Seal a layer (mark immutable). Advisory — not enforced at the
+    /// SQL level, but the application should check before writing.
+    pub fn seal_layer(&self, layer_id: i64) -> Result<(), LayerError> {
+        let changed = self.conn().execute(
+            "UPDATE layer SET status = 'sealed' WHERE id = ?1 AND status = 'active'",
+            params![layer_id],
+        )?;
+        if changed == 0 {
+            // Distinguish not-found from not-active
+            return match self.get_layer(layer_id) {
+                Ok(_) => Err(LayerError::NotActive(layer_id)),
+                Err(_) => Err(LayerError::NotFound(layer_id)),
+            };
+        }
+        Ok(())
+    }
+
+    /// Get a single layer by ID.
+    pub fn get_layer(&self, layer_id: i64) -> Result<Layer, LayerError> {
+        self.conn()
+            .query_row(
+                "SELECT id, parent_id, name, metadata, created_at, status FROM layer WHERE id = ?1",
+                params![layer_id],
+                Self::read_layer,
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => LayerError::NotFound(layer_id),
+                other => LayerError::Sqlite(other),
+            })
+    }
+
+    /// Walk parent pointers from `layer_id` to root.
+    /// Returns a LayerChain with (layer_id, depth) pairs, depth 0 = the queried layer.
+    pub fn layer_chain(&self, layer_id: i64) -> Result<LayerChain, LayerError> {
+        let mut stmt = self.conn().prepare(
+            "WITH RECURSIVE chain(id, parent_id, depth) AS (
+                SELECT id, parent_id, 0 FROM layer WHERE id = ?1
+                UNION ALL
+                SELECT l.id, l.parent_id, c.depth + 1
+                FROM chain c
+                JOIN layer l ON l.id = c.parent_id
+            )
+            SELECT id, depth FROM chain ORDER BY depth",
+        )?;
+        let chain: Vec<(i64, u32)> = stmt
+            .query_map(params![layer_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if chain.is_empty() {
+            return Err(LayerError::NotFound(layer_id));
+        }
+        Ok(LayerChain { chain })
+    }
+
+    /// Direct children of a layer.
+    pub fn layer_children(&self, layer_id: i64) -> Result<Vec<Layer>, LayerError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, parent_id, name, metadata, created_at, status
+             FROM layer WHERE parent_id = ?1 ORDER BY id",
+        )?;
+        let layers = stmt
+            .query_map(params![layer_id], Self::read_layer)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(layers)
+    }
+
+    /// All layers in the tree.
+    pub fn layer_tree(&self) -> Result<Vec<Layer>, LayerError> {
+        let mut stmt = self.conn().prepare(
+            "SELECT id, parent_id, name, metadata, created_at, status FROM layer ORDER BY id",
+        )?;
+        let layers = stmt
+            .query_map((), Self::read_layer)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(layers)
+    }
+
+    /// Delete a layer. Fails if the layer has children
+    /// (caller must reparent or delete children first).
+    pub fn delete_layer(&self, layer_id: i64) -> Result<(), LayerError> {
+        let child_count: i64 = self.conn().query_row(
+            "SELECT COUNT(*) FROM layer WHERE parent_id = ?1",
+            params![layer_id],
+            |row| row.get(0),
+        )?;
+        if child_count > 0 {
+            return Err(LayerError::HasChildren(layer_id));
+        }
+        let changed = self
+            .conn()
+            .execute("DELETE FROM layer WHERE id = ?1", params![layer_id])?;
+        if changed == 0 {
+            return Err(LayerError::NotFound(layer_id));
+        }
+        Ok(())
+    }
+
+    /// Reparent a layer to a new parent. Private — only used by compact_layers
+    /// to avoid exposing an API that could create cycles.
+    fn reparent_layer(
+        &self,
+        layer_id: i64,
+        new_parent_id: Option<i64>,
+    ) -> Result<(), LayerError> {
+        let changed = self.conn().execute(
+            "UPDATE layer SET parent_id = ?1 WHERE id = ?2",
+            params![new_parent_id, layer_id],
+        )?;
+        if changed == 0 {
+            return Err(LayerError::NotFound(layer_id));
+        }
+        Ok(())
+    }
+
+    /// Compact: merge the chain from `layer_id` up to (but not including)
+    /// `stop_at` into a single new layer. Reparent children of merged layers
+    /// to the new layer. Mark compacted layers as `compacted`.
+    /// Returns the new layer's ID.
+    ///
+    /// Chunk data migration is added in PR 2.
+    pub fn compact_layers(
+        &self,
+        layer_id: i64,
+        stop_at: Option<i64>,
+    ) -> Result<i64, LayerError> {
+        // Walk the chain from layer_id up to stop_at
+        let full_chain = self.layer_chain(layer_id)?;
+
+        // Validate that stop_at is actually in the chain
+        if let Some(stop) = stop_at {
+            if !full_chain.chain.iter().any(|&(id, _)| id == stop) {
+                return Err(LayerError::NotInChain {
+                    stop_at: stop,
+                    layer_id,
+                });
+            }
+        }
+
+        let mut to_compact: Vec<i64> = Vec::new();
+        for &(id, _depth) in &full_chain.chain {
+            if Some(id) == stop_at {
+                break;
+            }
+            to_compact.push(id);
+        }
+        if to_compact.is_empty() {
+            // layer_id == stop_at: nothing to compact
+            return Err(LayerError::NotInChain {
+                stop_at: stop_at.unwrap(),
+                layer_id,
+            });
+        }
+
+        // The new layer's parent is either stop_at or the parent of the
+        // last layer in the compaction chain (the next entry after it
+        // in the depth-ordered chain).
+        let new_parent = stop_at.or_else(|| {
+            let last = *to_compact.last().unwrap();
+            let last_pos = full_chain
+                .chain
+                .iter()
+                .position(|&(id, _)| id == last)
+                .unwrap();
+            full_chain.chain.get(last_pos + 1).map(|&(id, _)| id)
+        });
+
+        self.begin_transaction()
+            .map_err(|e| LayerError::Sqlite(e))?;
+
+        let result = (|| -> Result<i64, LayerError> {
+            // Create the compacted layer
+            let leaf = self.get_layer(layer_id)?;
+            let compacted_id = self.create_layer(
+                new_parent,
+                &format!("compacted:{}", leaf.name),
+                None,
+            )?;
+
+            // Reparent children of all compacted layers to the new layer
+            // (excluding the compacted layers themselves)
+            for &id in &to_compact {
+                let children = self.layer_children(id)?;
+                for child in children {
+                    if !to_compact.contains(&child.id) {
+                        self.reparent_layer(child.id, Some(compacted_id))?;
+                    }
+                }
+            }
+
+            // Mark compacted layers
+            for &id in &to_compact {
+                self.conn().execute(
+                    "UPDATE layer SET status = 'compacted' WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+
+            Ok(compacted_id)
+        })();
+
+        match &result {
+            Ok(_) => {
+                self.commit_transaction()
+                    .map_err(|e| LayerError::Sqlite(e))?;
+            }
+            Err(_) => {
+                if let Err(e) = self.rollback_transaction() {
+                    error!("rollback failed during compact_layers: {e}");
+                }
+            }
+        }
+
+        result
     }
 }
 
