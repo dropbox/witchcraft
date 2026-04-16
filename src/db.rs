@@ -24,6 +24,7 @@ impl DB {
     pub fn new_reader(db_fn: PathBuf) -> SQLResult<Self> {
         let connection =
             Connection::open_with_flags(db_fn.clone(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
         Ok(Self {
             db_fn,
             connection: Some(connection),
@@ -83,6 +84,7 @@ impl DB {
         // Enable WAL mode for better concurrency and performance
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
 
         let query = format!(
             "CREATE TABLE IF NOT EXISTS document(uuid TEXT NOT NULL PRIMARY KEY,
