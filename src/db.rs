@@ -44,7 +44,7 @@ impl DB {
 
     pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
         const APP_ID: i32 = 0x07DB_DA55;
-        const EXPECTED_VERSION: i32 = 7;
+        const EXPECTED_VERSION: i32 = 8;
 
         let mut first_creation = !db_fn.exists();
         let connection = Connection::open(&db_fn)?;
@@ -144,12 +144,18 @@ impl DB {
             END";
         connection.execute(query, ())?;
 
-        let query = "CREATE TABLE IF NOT EXISTS bucket(id INTEGER PRIMARY KEY,
-            center BLOB NOT NULL, indices BLOB NOT NULL, residuals BLOB NOT NULL)";
+        let query = "CREATE TABLE IF NOT EXISTS generation(
+            id INTEGER PRIMARY KEY,
+            level INTEGER NOT NULL,
+            num_embeddings INTEGER NOT NULL,
+            min_chunk_rowid INTEGER NOT NULL,
+            max_chunk_rowid INTEGER NOT NULL,
+            created TEXT NOT NULL)";
         connection.execute(query, ())?;
 
-        let query =
-            "CREATE TABLE IF NOT EXISTS indexed_chunk(chunkid INTEGER PRIMARY KEY NOT NULL)";
+        let query = "CREATE TABLE IF NOT EXISTS bucket(id INTEGER PRIMARY KEY,
+            generation_id INTEGER NOT NULL REFERENCES generation(id),
+            center BLOB NOT NULL, indices BLOB NOT NULL, residuals BLOB NOT NULL)";
         connection.execute(query, ())?;
         Ok(Self {
             db_fn,
@@ -163,7 +169,7 @@ impl DB {
         self.execute("DELETE FROM document")?;
         self.execute("DELETE FROM chunk")?;
         self.execute("DELETE FROM bucket")?;
-        self.execute("DELETE FROM indexed_chunk")?;
+        self.execute("DELETE FROM generation")?;
         self.execute("VACUUM")?;
         Ok(())
     }
@@ -370,23 +376,32 @@ impl DB {
     pub fn add_bucket(
         &self,
         id: u32,
+        generation_id: i64,
         center: &Vec<u8>,
         indices: &Vec<u8>,
         residuals: &Vec<u8>,
     ) -> SQLResult<()> {
         self.conn().execute(
-            "INSERT OR REPLACE INTO bucket VALUES(?1, ?2, ?3, ?4)",
-            (id, center, indices, residuals),
+            "INSERT OR REPLACE INTO bucket VALUES(?1, ?2, ?3, ?4, ?5)",
+            (id, generation_id, center, indices, residuals),
         )?;
         Ok(())
     }
 
-    pub fn add_indexed_chunk(&self, chunkid: u32) -> SQLResult<()> {
+    pub fn add_generation(
+        &self,
+        level: u32,
+        num_embeddings: u64,
+        min_chunk_rowid: i64,
+        max_chunk_rowid: i64,
+    ) -> SQLResult<i64> {
+        let created = iso8601_timestamp::Timestamp::now_utc().to_string();
         self.conn().execute(
-            "INSERT OR REPLACE INTO indexed_chunk VALUES(?1)",
-            (chunkid,),
+            "INSERT INTO generation(level, num_embeddings, min_chunk_rowid, max_chunk_rowid, created)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            (level, num_embeddings as i64, min_chunk_rowid, max_chunk_rowid, &created),
         )?;
-        Ok(())
+        Ok(self.conn().last_insert_rowid())
     }
 }
 
