@@ -978,10 +978,7 @@ pub fn match_centroids(
     let mut doc_scores = vec![0.0f32; n];
     doc_scores.copy_from_slice(&missing_similarities);
 
-    db.execute(
-        "CREATE TEMPORARY TABLE temp2(rowid INTEGER, sub_idx INTEGER, score FLOAT, UNIQUE(rowid, sub_idx))",
-    )?;
-    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
+    let mut scored_results: Vec<(f32, u32, u32)> = Vec::new();
 
     let mut prev_idx = u32::MAX;
     let mut prev_sub_idx = u32::MAX;
@@ -999,7 +996,7 @@ pub fn match_centroids(
             if sub_idx_change || is_last {
                 let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
                 if sub_score > cutoff {
-                    let _ = insert_temp_query.execute((prev_idx, prev_sub_idx, sub_score));
+                    scored_results.push((sub_score, prev_idx, prev_sub_idx));
                 }
                 vmax_inplace(&mut doc_scores, &sub_scores);
                 sub_scores.copy_from_slice(&doc_scores);
@@ -1023,33 +1020,37 @@ pub fn match_centroids(
         prev_sub_idx = sub_idx;
     }
 
+    scored_results.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
     let (filter_sql, filter_params) = build_filter_sql_and_params(sql_filter)?;
-    let filter_clause = if !filter_sql.is_empty() {
-        format!("AND {}", filter_sql)
+
+    let results = if filter_sql.is_empty() {
+        scored_results.truncate(top_k);
+        scored_results
     } else {
-        String::new()
-    };
+        db.execute(
+            "CREATE TEMPORARY TABLE temp2(rowid INTEGER, sub_idx INTEGER, score FLOAT, UNIQUE(rowid, sub_idx))",
+        )?;
+        let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
+        for &(score, rowid, sub_idx) in &scored_results {
+            let _ = insert_temp_query.execute((rowid, sub_idx, score));
+        }
+        drop(insert_temp_query);
 
-    let sql = format!(
-        "SELECT score,document.rowid,sub_idx
-        FROM document,temp2
-        WHERE document.rowid = temp2.rowid
-        {filter_clause}
-        ORDER BY score DESC
-        LIMIT ?",
-    );
-
-    let query_start = std::time::Instant::now();
-    let results_status: Result<Vec<(f32, u32, u32)>> = {
+        let sql = format!(
+            "SELECT score,document.rowid,sub_idx
+            FROM document,temp2
+            WHERE document.rowid = temp2.rowid
+            AND {filter_sql}
+            ORDER BY score DESC
+            LIMIT ?",
+        );
         let mut scored_documents_query = db.query(&sql)?;
-
-        // Build complete params list: filter params, top_k
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = filter_params;
         params.push(Box::new(top_k as i64));
-
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
-        let results = scored_documents_query
+        let filtered = scored_documents_query
             .query_map(param_refs.as_slice(), |row| {
                 Ok((
                     row.get::<_, f32>(0)?,
@@ -1058,21 +1059,9 @@ pub fn match_centroids(
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(results)
-    };
-    debug!(
-        "querying temp table took {} ms",
-        query_start.elapsed().as_millis()
-    );
-
-    db.execute("DROP TABLE temp2")?;
-
-    let results = match results_status {
-        Ok(results) => results,
-        Err(v) => {
-            warn!("scoring query failed {}", v);
-            [].into()
-        }
+        drop(scored_documents_query);
+        db.execute("DROP TABLE temp2")?;
+        filtered
     };
 
     debug!("DB operations took {} ms total", now.elapsed().as_millis());

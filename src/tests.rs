@@ -99,7 +99,7 @@ mod tests {
                         assert!(results.len() == 0);
                     }
                 }
-                for (score, metadata, body, body_idx, _chunk) in results {
+                for (score, metadata, body, body_idx, _date) in results {
                     let uuid = Uuid::parse_str(&metadata).unwrap();
                     let index = uuids.iter().position(|&u| u == uuid).unwrap();
                     println!("i={i} score={score} metadata={metadata} body={body:?} body_idx={body_idx} uuid-index {index}");
@@ -166,7 +166,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            for (_score, _metadata, _body, body_idx, _chunk) in results {
+            for (_score, _metadata, _body, body_idx, _date) in results {
                 assert!(body_idx == pos);
             }
         }
@@ -182,7 +182,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            for (_score, _metadata, _body, body_idx, _chunk) in results {
+            for (_score, _metadata, _body, body_idx, _date) in results {
                 assert!(body_idx == pos);
             }
         }
