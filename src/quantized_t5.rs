@@ -824,6 +824,7 @@ impl T5Stack {
 pub struct T5EncoderModel {
     encoder: T5Stack,
     final_projection: QMatMul,
+    config: Config,
     device: Device,
     #[cfg(feature = "flash-attention")]
     gpu_encoder: Option<crate::gpu_t5_encoder::GpuT5Encoder>,
@@ -845,6 +846,7 @@ impl T5EncoderModel {
         Ok(Self {
             encoder,
             final_projection,
+            config: cfg.clone(),
             device: vb.device().clone(),
             #[cfg(feature = "flash-attention")]
             gpu_encoder: None,
@@ -921,10 +923,19 @@ impl T5EncoderModel {
         )
         .map_err(|e| anyhow::anyhow!("GGUF VarBuilder: {e}"))?;
 
-        let gpu_enc = crate::gpu_t5_encoder_d3d12::GpuT5EncoderD3D12::new(cfg, vb, 512)?;
+        // Max 1024 tokens: keeps the full batched dispatch under the Windows TDR
+        // timeout (~2s) on integrated GPUs. Larger sequences fall back to CPU.
+        let gpu_enc = crate::gpu_t5_encoder_d3d12::GpuT5EncoderD3D12::new(cfg, vb, 1024)?;
 
         info!("D3D12 GPU encoder: loaded in {}ms", now.elapsed().as_millis());
         self.gpu_encoder_d3d12 = Some(gpu_enc);
+
+        // Drop CPU encoder blocks — the GPU handles nearly all inputs.
+        // Keeps shared embedding table and final_layer_norm for the rare CPU fallback.
+        let n_blocks = self.encoder.block.len();
+        self.encoder.block.clear();
+        info!("Dropped {n_blocks} CPU encoder blocks to save memory");
+
         Ok(())
     }
 
@@ -940,17 +951,43 @@ impl T5EncoderModel {
             return self.final_projection.forward(&encoder_output);
         }
 
-        // D3D12 GPU encoder path (Windows)
+        // D3D12 GPU encoder path (Windows) — falls back to CPU for oversized inputs
         #[cfg(feature = "triton-d3d12")]
         if let Some(ref gpu_enc) = self.gpu_encoder_d3d12 {
             let input_embeds = self.encoder.shared.as_ref().forward(input_ids)?;
-            let encoder_output = gpu_enc
-                .forward(&input_embeds)
-                .map_err(|e| candle_core::Error::Msg(format!("D3D12 GPU encoder: {e}")))?;
-            return self.final_projection.forward(&encoder_output);
+            match gpu_enc.forward(&input_embeds) {
+                Ok(encoder_output) => {
+                    return self.final_projection.forward(&encoder_output);
+                }
+                Err(e) => {
+                    log::info!("D3D12 GPU fallback to CPU: {e}");
+                    // GPU encoder blocks were dropped to save memory — run the
+                    // full candle CPU encoder for this oversized input.
+                    return self.cpu_fallback_forward(input_ids);
+                }
+            }
         }
 
         let encoder_output = self.encoder.forward(input_ids, None)?;
+        self.final_projection.forward(&encoder_output)
+    }
+
+    /// One-shot CPU forward for oversized sequences that don't fit the GPU.
+    /// Loads encoder blocks from GGUF on demand, runs forward, drops them.
+    #[cfg(feature = "triton-d3d12")]
+    fn cpu_fallback_forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        let t0 = std::time::Instant::now();
+        let model_bytes = MODEL
+            .bytes(std::path::Path::new("assets"))
+            .or_else(|_| MODEL.bytes(std::path::Path::new(".")))
+            .map_err(|_| candle_core::Error::Msg("CPU fallback: failed to load GGUF".into()))?;
+        let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf_buffer(
+            model_bytes,
+            &Device::Cpu,
+        )?;
+        let tmp_enc = T5Stack::load(vb.pp("encoder"), &self.encoder.shared, &self.config)?;
+        log::info!("CPU fallback: loaded encoder in {}ms", t0.elapsed().as_millis());
+        let encoder_output = tmp_enc.forward(input_ids, None)?;
         self.final_projection.forward(&encoder_output)
     }
 

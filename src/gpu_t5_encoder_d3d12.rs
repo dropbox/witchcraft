@@ -361,7 +361,12 @@ impl GpuT5EncoderD3D12 {
 
         let block_m = 64;
         let padded_seq = cdiv(seq_len, block_m) * block_m;
-        assert!(padded_seq <= self.padded_seq);
+        if padded_seq > self.padded_seq {
+            anyhow::bail!(
+                "seq_len {seq_len} (padded {padded_seq}) exceeds pre-allocated {}, falling back to CPU",
+                self.padded_seq
+            );
+        }
 
         let s = &self.scratch;
         let n_elem = padded_seq * self.d_model;

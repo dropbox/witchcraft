@@ -86,8 +86,8 @@ pickbrain-install: pickbrain
 macintel:
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,progress
 
-winintel: ovdownload
-	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features t5-openvino,fbgemm,progress
+winintel: download
+	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features t5-quantized,triton-d3d12,fbgemm,progress
 
 ifdef TARGET
   LIB_BIN := target/$(TARGET)/release/libwitchcraft.dylib
