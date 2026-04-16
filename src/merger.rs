@@ -9,21 +9,22 @@ use tempfile::NamedTempFile;
 pub struct Writer {
     file: NamedTempFile,
     writer: BufWriter<File>,
+    row_size: usize,
 }
 
 impl Writer {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(row_size: usize) -> io::Result<Self> {
         let file = NamedTempFile::new()?;
         let writer = BufWriter::new(file.reopen()?);
-        Ok(Self { file, writer })
+        Ok(Self { file, writer, row_size })
     }
 
     pub fn write_record(&mut self, value: u32, keys: &[(u32, u32)], data: &[u8]) -> io::Result<()> {
         let count = keys.len() as u32;
-        if data.len() != count as usize * 64 {
+        if data.len() != count as usize * self.row_size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "data length must be count * 64",
+                format!("data length must be count * {}", self.row_size),
             ));
         }
 
@@ -55,10 +56,11 @@ pub struct MergedEntry {
 pub struct Merger {
     heap: BinaryHeap<HeapEntry>,
     readers: Vec<BufReader<File>>,
+    row_size: usize,
 }
 
 impl Merger {
-    pub fn from_tempfiles(tempfiles: Vec<NamedTempFile>) -> io::Result<Self> {
+    pub fn from_tempfiles(tempfiles: Vec<NamedTempFile>, row_size: usize) -> io::Result<Self> {
         let mut readers = Vec::with_capacity(tempfiles.len());
         for tf in tempfiles {
             readers.push(BufReader::new(tf.reopen()?));
@@ -66,12 +68,12 @@ impl Merger {
 
         let mut heap = BinaryHeap::new();
         for (i, reader) in readers.iter_mut().enumerate() {
-            if let Some(record) = read_record(reader)? {
+            if let Some(record) = read_record(reader, row_size)? {
                 heap.push(HeapEntry { record, source: i });
             }
         }
 
-        Ok(Self { heap, readers })
+        Ok(Self { heap, readers, row_size })
     }
 }
 
@@ -93,7 +95,7 @@ impl Iterator for Merger {
             combined_keys.extend(next.record.keys);
             combined_data.extend(next.record.data);
 
-            if let Some(record) = match read_record(&mut self.readers[next.source]) {
+            if let Some(record) = match read_record(&mut self.readers[next.source], self.row_size) {
                 Ok(Some(r)) => Some(r),
                 Ok(None) => None,
                 Err(e) => return Some(Err(e)),
@@ -105,7 +107,7 @@ impl Iterator for Merger {
             }
         }
 
-        if let Some(record) = match read_record(&mut self.readers[current.source]) {
+        if let Some(record) = match read_record(&mut self.readers[current.source], self.row_size) {
             Ok(Some(r)) => Some(r),
             Ok(None) => None,
             Err(e) => return Some(Err(e)),
@@ -119,7 +121,7 @@ impl Iterator for Merger {
         // Sort keys and align data rows
         let mut keyed_data: Vec<_> = combined_keys
             .into_iter()
-            .zip(combined_data.chunks_exact(64).map(|c| c.to_vec()))
+            .zip(combined_data.chunks_exact(self.row_size).map(|c| c.to_vec()))
             .collect();
 
         keyed_data.sort_by_key(|(k, _)| *k);
@@ -164,7 +166,7 @@ impl PartialEq for HeapEntry {
 }
 impl Eq for HeapEntry {}
 
-fn read_record(reader: &mut BufReader<File>) -> io::Result<Option<Record>> {
+fn read_record(reader: &mut BufReader<File>, row_size: usize) -> io::Result<Option<Record>> {
     let mut buf4 = [0u8; 4];
 
     if reader.read_exact(&mut buf4).is_err() {
@@ -184,7 +186,7 @@ fn read_record(reader: &mut BufReader<File>) -> io::Result<Option<Record>> {
         keys.push((u32::from_ne_bytes(major), u32::from_ne_bytes(minor)));
     }
 
-    let mut data = vec![0u8; count as usize * 64];
+    let mut data = vec![0u8; count as usize * row_size];
     reader.read_exact(&mut data)?;
 
     Ok(Some(Record { value, keys, data }))
@@ -199,19 +201,19 @@ mod tests {
 
     #[test]
     fn test_writer_merger_sorted_keys() -> io::Result<()> {
-        let mut w1 = Writer::new()?;
+        let mut w1 = Writer::new(64)?;
         let keys1 = vec![(2, 3), (5, 1)];
         let data1 = vec![1u8; 128];
         w1.write_record(42, &keys1, &data1)?;
         let tf1 = w1.finish()?;
 
-        let mut w2 = Writer::new()?;
+        let mut w2 = Writer::new(64)?;
         let keys2 = vec![(1, 9)];
         let data2 = vec![2u8; 64];
         w2.write_record(42, &keys2, &data2)?;
         let tf2 = w2.finish()?;
 
-        let merger = Merger::from_tempfiles(vec![tf1, tf2])?;
+        let merger = Merger::from_tempfiles(vec![tf1, tf2], 64)?;
         let entries: Vec<_> = merger.collect::<Result<_, _>>()?;
 
         assert_eq!(entries.len(), 1);
@@ -226,19 +228,19 @@ mod tests {
 
     #[test]
     fn test_key_sorting_preserves_data_alignment() -> io::Result<()> {
-        let mut w1 = Writer::new()?;
+        let mut w1 = Writer::new(64)?;
         let keys1 = vec![(2, 5), (1, 1)];
         let data1 = [b'A'; 64].into_iter().chain([b'B'; 64]).collect::<Vec<_>>();
         w1.write_record(100, &keys1, &data1)?;
         let tf1 = w1.finish()?;
 
-        let mut w2 = Writer::new()?;
+        let mut w2 = Writer::new(64)?;
         let keys2 = vec![(3, 0)];
         let data2 = vec![b'C'; 64];
         w2.write_record(100, &keys2, &data2)?;
         let tf2 = w2.finish()?;
 
-        let merger = Merger::from_tempfiles(vec![tf1, tf2])?;
+        let merger = Merger::from_tempfiles(vec![tf1, tf2], 64)?;
         let merged: Vec<_> = merger.collect::<Result<_, _>>()?;
         assert_eq!(merged.len(), 1);
 
@@ -257,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_merger_with_duplicate_keys() -> io::Result<()> {
-        let mut w = Writer::new()?;
+        let mut w = Writer::new(64)?;
         let keys = vec![(1, 2), (1, 2), (2, 0)];
         let data = vec![b'A'; 64]
             .into_iter()
@@ -267,7 +269,7 @@ mod tests {
         w.write_record(7, &keys, &data)?;
         let tf = w.finish()?;
 
-        let merger = Merger::from_tempfiles(vec![tf])?;
+        let merger = Merger::from_tempfiles(vec![tf], 64)?;
         let entries: Vec<_> = merger.collect::<Result<_, _>>()?;
         let e = &entries[0];
 

@@ -65,6 +65,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
+const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 2; // packed 4-bit residuals
 
 /// A document pointer combining document ID and sub-chunk index
 /// Allows precise location of results within subdivided documents
@@ -418,7 +419,7 @@ fn write_buckets(
             mmuls_total += now.elapsed().as_millis();
 
             let now = std::time::Instant::now();
-            let mut writer = merger::Writer::new()?;
+            let mut writer = merger::Writer::new(RESIDUAL_BYTES)?;
 
             let mut pairs: Vec<(usize, u32)> = cluster_assignments
                 .to_vec1::<u32>()?
@@ -485,7 +486,7 @@ fn merge_and_write_buckets(
     centers_cpu: &Tensor,
     id_offset: u32,
 ) -> Result<()> {
-    let mut merger = merger::Merger::from_tempfiles(tmpfiles)?;
+    let mut merger = merger::Merger::from_tempfiles(tmpfiles, RESIDUAL_BYTES)?;
     for result in &mut merger {
         let entry = result?;
         let center = centers_cpu.get(entry.value as usize)?;
