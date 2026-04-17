@@ -51,6 +51,12 @@ To search within a specific session:
 pickbrain --session <session-id> "<query>"
 ```
 
+To filter by git branch:
+
+```bash
+pickbrain --branch <branch-name> "<query>"
+```
+
 To exclude specific sessions from results (comma-separated or repeated):
 
 ```bash
