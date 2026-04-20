@@ -628,15 +628,6 @@ pub fn match_centroids(
 
         let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
 
-        // Scale t_prime by this generation's share of total embeddings
-        let gen_size: usize = gen.sizes.iter().sum();
-        let total_size: usize = generations.iter().flat_map(|g| g.sizes.iter()).sum();
-        let gen_t_prime = if total_size > 0 {
-            ((t_prime as u64 * gen_size as u64) / total_size as u64).max(1000) as usize
-        } else {
-            t_prime
-        };
-
         let mut topk_clusters = Vec::with_capacity(k);
         for i in 0..m {
             let row = sorted_indices.get(i)?;
@@ -649,11 +640,11 @@ pub fn match_centroids(
                 let idx = row[j];
                 topk_clusters.push(idx);
                 cumsum += gen.sizes[idx as usize];
-                if cumsum >= gen_t_prime {
+                if cumsum >= t_prime {
                     break;
                 }
             }
-            if cumsum < gen_t_prime {
+            if cumsum < t_prime {
                 missing[i] = missing[i].max(row_scores_sorted[n_centroids.min(k) - 1]);
             }
         }
