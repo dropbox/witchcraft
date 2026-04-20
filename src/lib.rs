@@ -772,20 +772,24 @@ pub fn match_centroids(
 
     let mut scored_results: Vec<(f32, u32, u32)> = Vec::new();
 
-    let mut prev_idx = u32::MAX;
-    let mut prev_sub_idx = u32::MAX;
+    let mut prev_idx = 0;
+    let mut prev_sub_idx = 0;
 
     let scaler = 1.0f32 / n as f32;
     for i in 0.. {
-        let ((idx, sub_idx), pos) = all[i];
 
-        let is_last = i == all.len() - 1;
-
-        let idx_change = prev_idx != idx;
-        let sub_idx_change = idx_change || prev_sub_idx != sub_idx;
+        let is_beyond_end = i == all.len();
+        let ((idx, sub_idx), pos) = if is_beyond_end {
+            ((u32::MAX, u32::MAX), 0)
+        } else {
+            all[i]
+        };
 
         if i > 0 {
-            if sub_idx_change || is_last {
+            let idx_change = prev_idx != idx;
+            let sub_idx_change = idx_change || prev_sub_idx != sub_idx;
+
+            if sub_idx_change {
                 let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
                 if sub_score > cutoff {
                     scored_results.push((sub_score, prev_idx, prev_sub_idx));
@@ -793,13 +797,13 @@ pub fn match_centroids(
                 vmax_inplace(&mut doc_scores, &sub_scores);
                 sub_scores.copy_from_slice(&doc_scores);
             }
-            if idx_change || is_last {
+            if idx_change {
                 doc_scores.copy_from_slice(&missing_similarities);
                 sub_scores.copy_from_slice(&missing_similarities);
             }
         }
 
-        if is_last {
+        if is_beyond_end {
             break;
         }
 
