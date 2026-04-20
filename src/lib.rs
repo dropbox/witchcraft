@@ -984,32 +984,41 @@ pub fn match_centroids(
     )?;
     let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
 
-    let mut prev_idx = u32::MAX;
-    let mut prev_sub_idx = u32::MAX;
+    let mut prev_idx = 0u32;
+    let mut prev_sub_idx = 0u32;
 
     let scaler = 1.0f32 / n as f32;
-    for i in 0..all.len() {
-        let ((idx, sub_idx), pos) = all[i];
-        let is_last = i == all.len() - 1;
+    for i in 0.. {
 
-        let idx_change = prev_idx != idx;
-        let sub_idx_change = idx_change || prev_sub_idx != sub_idx;
+        let is_beyond_end = i == all.len();
+        let ((idx, sub_idx), pos) = if is_beyond_end {
+            ((u32::MAX, u32::MAX), 0)
+        } else {
+            all[i]
+        };
 
-        // Flush previous sub-document / document scores on boundary change
-        if i > 0 && (sub_idx_change || is_last) {
-            let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
-            if sub_score > cutoff {
-                let _ = insert_temp_query.execute((prev_idx, prev_sub_idx, sub_score));
+        if i > 0 {
+            let idx_change = prev_idx != idx;
+            let sub_idx_change = idx_change || prev_sub_idx != sub_idx;
+
+            if sub_idx_change {
+                let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
+                if sub_score > cutoff {
+                    let _ = insert_temp_query.execute((prev_idx, prev_sub_idx, sub_score));
+                }
+                vmax_inplace(&mut doc_scores, &sub_scores);
+                sub_scores.copy_from_slice(&doc_scores);
             }
-            vmax_inplace(&mut doc_scores, &sub_scores);
-            sub_scores.copy_from_slice(&doc_scores);
-        }
-        if i > 0 && (idx_change || is_last) {
-            doc_scores.copy_from_slice(&missing_similarities);
-            sub_scores.copy_from_slice(&missing_similarities);
+            if idx_change {
+                doc_scores.copy_from_slice(&missing_similarities);
+                sub_scores.copy_from_slice(&missing_similarities);
+            }
         }
 
-        // Accumulate CURRENT element's scores (including the last one)
+        if is_beyond_end {
+            break;
+        }
+
         let row = row_at(pos);
         vmax_inplace(&mut sub_scores, row);
 
@@ -1017,14 +1026,6 @@ pub fn match_centroids(
         assert!(i == 0 || (prev_idx != idx || prev_sub_idx <= sub_idx));
         prev_idx = idx;
         prev_sub_idx = sub_idx;
-    }
-
-    // Flush the final element
-    if !all.is_empty() {
-        let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
-        if sub_score > cutoff {
-            let _ = insert_temp_query.execute((prev_idx, prev_sub_idx, sub_score));
-        }
     }
 
     let (filter_sql, filter_params) = build_filter_sql_and_params(sql_filter)?;
@@ -1321,7 +1322,6 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
                 progress.inc(1);
             }
             Err(v) => {
-                progress.finish();
                 return Err(anyhow::anyhow!("add_chunk failed: {v}"));
             }
         };
