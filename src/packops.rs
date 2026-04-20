@@ -12,11 +12,9 @@ const RANGE: f32 = 29.0;
 ///////////////////////////////////////////////////////////////////////////
 
 pub fn make_q4_dequant_table() -> Result<[f32; 16]> {
-    // Create 0..16 tensor
     let x = Tensor::arange(0f32, 16f32, &Device::Cpu)?;
     let x = x.dequantize(4)?.inv_compand()?;
 
-    // Extract into a fixed array
     let mut table = [0f32; 16];
     for (i, slot) in table.iter_mut().enumerate() {
         *slot = x.get(i)?.to_scalar::<f32>()?;

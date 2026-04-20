@@ -350,6 +350,101 @@ mod tests {
     }
 
     #[test]
+    fn test_cascade() -> std::io::Result<()> {
+        // With test constants L0_CAPACITY=4, LSM_FANOUT=2:
+        // L0 cap=8, L1=16, L2=32, L3=64, ... L7=512
+        // Phase 1: bulk insert all facts → cascades into one high level.
+        // Phase 2: add a few more docs → creates a second, lower level.
+        // This verifies search works across multiple generations at different levels.
+        let dir = tempdir().unwrap();
+        let path: PathBuf = dir.path().join("warp");
+        let mut db = DB::new(path.clone()).unwrap();
+
+        let device = crate::make_device();
+        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let embedder = crate::Embedder::new(&device, &assets).unwrap();
+        let mut cache = crate::EmbeddingsCache::new(4);
+
+        // Phase 1: bulk insert
+        for &body in &FACTS {
+            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
+            db.add_doc(&uuid, None, &uuid.to_string(), body, None)
+                .unwrap();
+        }
+        crate::embed_chunks(&db, &embedder, None).unwrap();
+        crate::index_chunks(&db, &device).unwrap();
+        db.refresh_ft().unwrap();
+
+        // Phase 2: add more docs to create a second level
+        let extra_facts = [
+            "The Amazon rainforest produces about 20% of the world's oxygen.",
+            "A teaspoon of neutron star material would weigh about 6 billion tons.",
+            "Dolphins sleep with one eye open.",
+        ];
+        for body in extra_facts {
+            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
+            db.add_doc(&uuid, None, &uuid.to_string(), body, None)
+                .unwrap();
+        }
+        crate::embed_chunks(&db, &embedder, None).unwrap();
+        crate::index_chunks(&db, &device).unwrap();
+        db.refresh_ft().unwrap();
+
+        // Verify generations span multiple levels
+        let levels: Vec<(u32, usize)> = {
+            let mut level_query = db
+                .query("SELECT level, SUM(num_embeddings) FROM generation GROUP BY level ORDER BY level")
+                .unwrap();
+            level_query
+                .query_map((), |row| Ok((row.get::<_, u32>(0)?, row.get::<_, usize>(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        println!("cascade levels: {:?}", levels);
+        assert!(
+            levels.len() >= 2,
+            "should have at least 2 levels after adding extra docs"
+        );
+
+        // Verify search finds results from both old and new data
+        for (q, _pos) in EASY_QUERIES {
+            let results = crate::search(
+                &db,
+                &embedder,
+                &mut cache,
+                &q.to_string(),
+                THRESHOLD,
+                10,
+                true,
+                None,
+            )
+            .unwrap();
+            assert!(!results.is_empty(), "should find results for '{q}'");
+        }
+
+        let results = crate::search(
+            &db,
+            &embedder,
+            &mut cache,
+            &"dolphins sleeping habits".to_string(),
+            THRESHOLD,
+            10,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !results.is_empty(),
+            "should find new dolphin fact across levels"
+        );
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
     fn test_scoring() -> std::io::Result<()> {
         let device = crate::make_device();
         let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));

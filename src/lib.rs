@@ -66,8 +66,15 @@ use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
 const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 2; // packed 4-bit residuals
-const L0_CAPACITY: usize = 1024; // max unindexed embeddings before flushing to L0
-const LSM_FANOUT: usize = 16; // each layer is 16x the capacity of the previous
+#[cfg(not(test))]
+const L0_CAPACITY: usize = 1024;
+#[cfg(test)]
+const L0_CAPACITY: usize = 4;
+
+#[cfg(not(test))]
+const LSM_FANOUT: usize = 16;
+#[cfg(test)]
+const LSM_FANOUT: usize = 2;
 
 /// A document pointer combining document ID and sub-chunk index
 /// Allows precise location of results within subdivided documents
@@ -678,29 +685,20 @@ pub fn match_centroids(
     }
 
     // Also load any unindexed chunks (documents not yet in any generation)
-    let has_unindexed: bool = {
-        let gen_count: i64 = db
-            .query("SELECT COUNT(*) FROM generation")?
-            .query_row((), |row| row.get(0))?;
-        if gen_count == 0 {
-            let chunk_count: i64 = db
-                .query("SELECT COUNT(*) FROM chunk")?
-                .query_row((), |row| row.get(0))?;
-            chunk_count > 0
-        } else {
-            false
-        }
-    };
+    let max_indexed_rowid: i64 = db
+        .query("SELECT IFNULL(MAX(max_chunk_rowid), 0) FROM generation")?
+        .query_row((), |row| row.get(0))?;
 
     let mut unindexed_embeddings = vec![];
-    if has_unindexed {
+    {
         let mut unindexed_query = db.query(
             "SELECT d.rowid, c.embeddings
              FROM document AS d
              JOIN chunk AS c ON c.hash = d.hash
+             WHERE c.rowid > ?1
              ORDER BY d.rowid",
         )?;
-        let results = unindexed_query.query_map((), |row| {
+        let results = unindexed_query.query_map((max_indexed_rowid,), |row| {
             Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
         })?;
         for result in results {
@@ -1382,30 +1380,7 @@ pub fn full_index(db: &DB, device: &Device) -> Result<()> {
     db.execute("DELETE FROM bucket")?;
     db.execute("DELETE FROM generation")?;
     invalidate_center_cache();
-
-    let min_rowid: i64 = db
-        .query("SELECT MIN(rowid) FROM chunk")?
-        .query_row((), |row| row.get(0))?;
-    let max_rowid: i64 = db
-        .query("SELECT MAX(rowid) FROM chunk")?
-        .query_row((), |row| row.get(0))?;
-    let total = count_chunk_embeddings(db)?;
-    if total == 0 {
-        return Ok(());
-    }
-
-    // Find the level that fits everything
-    let mut level = 0u32;
-    while total > level_capacity(level) {
-        level += 1;
-    }
-
-    db.begin_transaction()?;
-    build_layer(db, device, level, min_rowid, max_rowid)?;
-    db.commit_transaction()?;
-    invalidate_center_cache();
-    db.checkpoint();
-    Ok(())
+    index_chunks(db, device)
 }
 
 pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
