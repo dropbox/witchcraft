@@ -82,17 +82,62 @@ const LSM_FANOUT: usize = 2;
 /// Allows precise location of results within subdivided documents
 pub type DocPtr = (u32, u32);
 
-pub fn make_device() -> Device {
-    // Metal only works on Apple Silicon (ARM), not Intel x86_64
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        match Device::new_metal(0) {
-            Ok(device) => device,
-            Err(v) => {
-                warn!("unable to create metal device: {v}");
-                Device::Cpu
-            }
+/// Check `WITCHCRAFT_FORCE_CPU` for a truthy override. Accepts the usual
+/// truthy strings (`1`, `true`, `yes`, `on`, case-insensitive); any other
+/// value — including unset, empty, or `0`/`false`/`no`/`off` — leaves the
+/// default device-selection behaviour in place.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn force_cpu_from_env() -> bool {
+    match std::env::var("WITCHCRAFT_FORCE_CPU").ok().as_deref() {
+        Some(raw) => {
+            let v = raw.trim().to_ascii_lowercase();
+            !v.is_empty() && !matches!(v.as_str(), "0" | "false" | "no" | "off")
         }
-    } else {
+        None => false,
+    }
+}
+
+/// Probe Metal exactly once per process.
+///
+/// candle-core 0.10.1's `MetalDevice::new` calls
+/// `metal::Device::all().swap_remove(0)` unconditionally. When the OS
+/// returns an empty device list — e.g. inside sandboxed macOS processes
+/// (CI containers, the Claude Code Bash tool) even on M-series machines
+/// with a physical GPU — this panics instead of returning `Err`. Catch the
+/// unwind so the `Device::Cpu` fallback can actually fire. The first probe
+/// may emit a one-shot stderr trace from candle's own panic handler;
+/// memoizing via `OnceLock` keeps that to exactly once per process.
+///
+/// TODO: retire this guard once candle returns `Err` for empty device
+/// lists upstream (huggingface/candle).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn probe_device() -> Device {
+    let result = std::panic::catch_unwind(|| Device::new_metal(0));
+    match result {
+        Ok(Ok(device)) => device,
+        Ok(Err(v)) => {
+            warn!("unable to create metal device: {v}");
+            Device::Cpu
+        }
+        Err(_) => {
+            warn!("metal device init panicked, falling back to CPU");
+            Device::Cpu
+        }
+    }
+}
+
+pub fn make_device() -> Device {
+    // Metal only works on Apple Silicon; every other target is CPU.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        if force_cpu_from_env() {
+            return Device::Cpu;
+        }
+        static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
+        DEVICE.get_or_init(probe_device).clone()
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
         Device::Cpu
     }
 }
