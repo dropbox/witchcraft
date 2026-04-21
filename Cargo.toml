@@ -90,6 +90,7 @@ progress = ["dep:indicatif"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
 hybrid-dequant = ["dep:rayon"]
 fbgemm = ["dep:fbgemm-rs"]
+deterministic = []
 
 [dependencies.rusqlite]
 version = "0.35.0"

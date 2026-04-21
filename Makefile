@@ -36,6 +36,8 @@ else
   BUILD_TARGET :=
 endif
 
+EXTRA_FEATURES :=
+comma := ,
 export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
 
 # === Python environment ===
@@ -67,7 +69,7 @@ ovdownload: assets/config.json assets/tokenizer.json assets/xtr-ov-int4.bin asse
 # === Build targets ===
 
 warp-cli: download
-	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES) --bin warp-cli
+	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES)$(if $(EXTRA_FEATURES),$(comma)$(EXTRA_FEATURES)) --bin warp-cli
 	ln -sf target/$(TARGET)/release/warp-cli ./warp-cli
 
 pickbrain: download
@@ -108,7 +110,8 @@ bench:
 
 # === Dataset targets ===
 
-nfcorpus: warp-cli
+nfcorpus:
+	make warp-cli EXTRA_FEATURES=deterministic
 	rm -rf mydb.sqlite*
 	$(CLI_BIN) readcsv datasets/nfcorpus.tsv
 	$(CLI_BIN) embed
