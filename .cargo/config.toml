@@ -4,3 +4,8 @@
 [target.'cfg(windows)']
 rustflags = ["-C", "target-cpu=haswell"]
 
+# Enable native CPU features on Linux for better performance
+# This will use AVX-512, AVX2, FMA, etc. based on the build machine's CPU
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "target-cpu=native"]
+
