@@ -39,6 +39,9 @@ jobs:
             backend: openvino
             archive: zip
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -110,7 +113,6 @@ jobs:
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
-        shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           DIR="pickbrain-${VERSION}-${{ matrix.target }}"
