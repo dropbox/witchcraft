@@ -1252,7 +1252,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
         let count_sql = format!(
             "SELECT COUNT(*) FROM document
             LEFT JOIN chunk ON document.hash = chunk.hash
-            WHERE chunk.hash IS NULL
+            WHERE chunk.hash IS NULL AND length(document.body) > 0
             {}",
             match limit {
                 Some(limit) => format!("LIMIT {limit}"),
@@ -1269,7 +1269,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
         document.hash,document.body,document.lens
         FROM document
         LEFT JOIN chunk ON document.hash = chunk.hash
-        WHERE chunk.hash IS NULL
+        WHERE chunk.hash IS NULL AND length(document.body) > 0
         ORDER BY document.hash
         {}",
         match limit {

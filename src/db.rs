@@ -33,7 +33,7 @@ impl DB {
 
     pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
         const APP_ID: i32 = 0x07DB_DA55;
-        const EXPECTED_VERSION: i32 = 6;
+        const EXPECTED_VERSION: i32 = 7;
 
         let mut first_creation = !db_fn.exists();
         let connection = Connection::open(&db_fn)?;
@@ -94,9 +94,6 @@ impl DB {
         );
         connection.execute(&query, ())?;
 
-        let query = "CREATE INDEX IF NOT EXISTS document_uuid_index ON document(uuid)";
-        connection.execute(query, ())?;
-
         let query = "CREATE INDEX IF NOT EXISTS document_index ON document(hash)";
         connection.execute(query, ())?;
 
@@ -115,8 +112,6 @@ impl DB {
         );
         connection.execute(&query, ())?;
 
-        let query = "CREATE INDEX IF NOT EXISTS chunk_index ON chunk(hash)";
-        connection.execute(query, ())?;
 
         let query = "CREATE TRIGGER IF NOT EXISTS document_after_delete
             AFTER DELETE ON document
@@ -279,45 +274,63 @@ impl DB {
         body: &str,
         lens: Option<Vec<usize>>,
     ) -> SQLResult<()> {
-        let lens = match lens {
-            Some(lens) => lens,
-            None => [body.chars().count()].to_vec(),
-        };
+        self.add_docs_batch(&[(*uuid, date, metadata, body, lens)])?;
+        Ok(())
+    }
 
-        let total: usize = lens.iter().copied().sum();
-        if total != body.chars().count() {
-            warn!("bad length: [{} vs {}]", total, body.chars().count());
+    /// Batch-add documents in a single transaction. Prepares the statement once
+    /// and reuses it for all inserts. Much faster than individual add_doc calls.
+    pub fn add_docs_batch(
+        &mut self,
+        docs: &[(Uuid, Option<Timestamp>, &str, &str, Option<Vec<usize>>)],
+    ) -> SQLResult<usize> {
+        if docs.is_empty() {
+            return Ok(0);
         }
-
-        let lens = lens
-            .iter()
-            .map(|len| len.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let mut hasher = Sha256::new();
-        hasher.update(body);
-        hasher.update(&lens);
-        let hash = format!("{:x}", hasher.finalize());
-        let hash = &hash[..HASH_CHARS];
-
-        let date = date.unwrap_or_else(Timestamp::now_utc);
-
-        self.conn().execute(
+        self.conn().execute("BEGIN", ())?;
+        let mut stmt = self.conn().prepare(
             "INSERT INTO document VALUES(?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(uuid) DO UPDATE SET
                 date = ?2, metadata = ?3, hash = ?4, body = ?5, lens = ?6",
-            (
+        )?;
+
+        let mut count = 0;
+        for (uuid, date, metadata, body, lens) in docs {
+            let lens = match lens {
+                Some(lens) => lens.clone(),
+                None => vec![body.chars().count()],
+            };
+            let total: usize = lens.iter().copied().sum();
+            if total != body.chars().count() {
+                warn!("bad length: [{} vs {}]", total, body.chars().count());
+            }
+            let lens_str = lens
+                .iter()
+                .map(|len| len.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let mut hasher = Sha256::new();
+            hasher.update(body.as_bytes());
+            hasher.update(lens_str.as_bytes());
+            let hash = format!("{:x}", hasher.finalize());
+            let hash = &hash[..HASH_CHARS];
+
+            let date = date.unwrap_or_else(Timestamp::now_utc);
+            stmt.execute((
                 &uuid.to_string(),
                 date.to_string(),
-                metadata,
-                &hash,
-                &body,
-                &lens,
-            ),
-        )?;
+                *metadata,
+                hash,
+                *body,
+                &lens_str,
+            ))?;
+            count += 1;
+        }
+        drop(stmt);
+        self.conn().execute("COMMIT", ())?;
         self.remove_on_shutdown = false;
-        Ok(())
+        Ok(count)
     }
 
     pub fn remove_doc(&mut self, uuid: &Uuid) -> SQLResult<()> {

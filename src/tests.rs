@@ -456,6 +456,72 @@ mod tests {
             "honey preservation", 0.3, 10, false, None,
         )?;
         assert!(!results.is_empty(), "single-doc search must return the document");
+      
+    #[test]
+    fn test_add_docs_batch() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("batch_test.sqlite");
+        let mut db = DB::new(path)?;
+
+        let docs: Vec<(Uuid, Option<iso8601_timestamp::Timestamp>, &str, &str, Option<Vec<usize>>)> = vec![
+            (Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc1"), None, r#"{"title":"one"}"#, "first document body", None),
+            (Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc2"), None, r#"{"title":"two"}"#, "second document body", None),
+            (Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc3"), None, r#"{"title":"three"}"#, "third document body", None),
+        ];
+
+        let count = db.add_docs_batch(&docs)?;
+        assert_eq!(count, 3);
+
+        // Verify docs exist
+        let row_count: usize = db.query("SELECT COUNT(*) FROM document")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(row_count, 3);
+
+        // Verify add_doc delegates to add_docs_batch correctly
+        let uuid4 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc4");
+        db.add_doc(&uuid4, None, r#"{"title":"four"}"#, "fourth body", None)?;
+        let row_count: usize = db.query("SELECT COUNT(*) FROM document")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(row_count, 4);
+
+        // Verify upsert: re-add doc1 with different body
+        let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc1");
+        db.add_doc(&uuid1, None, r#"{"title":"one-updated"}"#, "updated body", None)?;
+        let row_count: usize = db.query("SELECT COUNT(*) FROM document")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(row_count, 4); // still 4, not 5
+
+        let metadata: String = db.query("SELECT metadata FROM document WHERE uuid = ?1")?
+            .query_row((uuid1.to_string(),), |row| row.get(0))?;
+        assert!(metadata.contains("one-updated"));
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_body_not_embedded() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("empty_body_test.sqlite");
+        let assets = PathBuf::from("assets");
+        let mut db = DB::new(path.clone())?;
+        let device = crate::make_device();
+        let embedder = crate::Embedder::new(&device, &assets)?;
+
+        // Add one doc with empty body and one with real content
+        let uuid_empty = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"empty");
+        let uuid_real = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"real");
+        db.add_doc(&uuid_empty, None, "{}", "", None)?;
+        db.add_doc(&uuid_real, None, "{}", "Octopuses have three hearts", None)?;
+
+        let count = crate::embed_chunks(&db, &embedder, None)?;
+        assert_eq!(count, 1, "only the non-empty doc should be embedded");
+
+        // Verify the chunk table has exactly one entry
+        let chunk_count: usize = db.query("SELECT COUNT(*) FROM chunk")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(chunk_count, 1);
 
         db.clear();
         db.shutdown();
