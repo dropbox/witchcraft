@@ -431,6 +431,34 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test for scoring off-by-one: the last token vector was
+    /// dropped because vmax_inplace was unreachable after the break.
+    /// A single-document corpus exercises this: the one document is both
+    /// the first and last element in the scoring loop.
+    #[test]
+    fn test_single_doc_search() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("single_doc.sqlite");
+        let assets = PathBuf::from("assets");
+        // Use CPU to avoid Metal buffer contention in parallel test runs
+        let device = candle_core::Device::Cpu;
+        let embedder = crate::Embedder::new(&device, &assets)?;
+        let mut cache = crate::EmbeddingsCache::new(4);
+
+        let mut db = DB::new(path.clone())?;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"only-doc");
+        db.add_doc(&uuid, None, &uuid.to_string(), "Honey never spoils", None)?;
+        crate::embed_chunks(&db, &embedder, None)?;
+        crate::index_chunks(&db, &device)?;
+
+        let results = crate::search(
+            &db, &embedder, &mut cache,
+            "honey preservation", 0.3, 10, false, None,
+        )?;
+        assert!(!results.is_empty(), "single-doc search must return the document");
+        Ok(())
+    }
+      
     #[test]
     fn test_add_docs_batch() -> anyhow::Result<()> {
         let dir = tempdir()?;
@@ -501,5 +529,4 @@ mod tests {
         db.shutdown();
         Ok(())
     }
-
 }
