@@ -31,13 +31,6 @@ jobs:
             rustflags: '-C target-feature=+avx2,+fma'
             backend: gguf
             archive: tar.gz
-          - name: windows-intel
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            features: t5-openvino,fbgemm,progress,embed-assets
-            rustflags: ''
-            backend: openvino
-            archive: zip
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -77,10 +70,6 @@ jobs:
         if: matrix.backend == 'gguf' && steps.cache-weights.outputs.cache-hit != 'true'
         run: cargo run --release -p quantize-tool -- xtr.safetensors assets/xtr.gguf
 
-      - name: Quantize to OpenVINO IR
-        if: matrix.backend == 'openvino' && steps.cache-weights.outputs.cache-hit != 'true'
-        run: python quantize-openvino.py
-
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -100,8 +89,7 @@ jobs:
           --features ${{ matrix.features }}
           --example pickbrain
 
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
+      - name: Package
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           DIR="pickbrain-${VERSION}-${{ matrix.target }}"
@@ -110,25 +98,6 @@ jobs:
           cp skills/pickbrain/SKILL.md "${DIR}/skills/pickbrain/"
           cp skills/pickbrain-codex/SKILL.md "${DIR}/skills/pickbrain-codex/"
           tar -czf "${DIR}.tar.gz" "${DIR}"
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          DIR="pickbrain-${VERSION}-${{ matrix.target }}"
-          mkdir -p "${DIR}/skills/pickbrain" "${DIR}/skills/pickbrain-codex"
-          cp "target/${{ matrix.target }}/release/examples/pickbrain.exe" "${DIR}/"
-          cp skills/pickbrain/SKILL.md "${DIR}/skills/pickbrain/"
-          cp skills/pickbrain-codex/SKILL.md "${DIR}/skills/pickbrain-codex/"
-
-          # Bundle OpenVINO runtime DLLs
-          pip install openvino
-          OVDIR=$(python -c "import openvino, os; print(os.path.join(os.path.dirname(openvino.__file__), 'libs'))")
-          while IFS= read -r dll; do
-            cp "${OVDIR}/${dll}" "${DIR}/" || echo "Warning: ${dll} not found in ${OVDIR}"
-          done < openvino-dlls.txt
-
-          7z a "${DIR}.zip" "${DIR}"
 
       - uses: actions/upload-artifact@v4
         with:
