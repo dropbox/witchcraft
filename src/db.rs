@@ -133,15 +133,25 @@ impl DB {
         })
     }
 
-    pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
+    fn integrity_ok(connection: &Connection) -> bool {
+        let status: SQLResult<String> =
+            connection.query_row("PRAGMA quick_check;", [], |row| row.get(0));
+        matches!(status, Ok(text) if text.trim().eq_ignore_ascii_case("ok"))
+    }
+
+    fn open_internal(db_fn: PathBuf, fast: bool) -> SQLResult<Self> {
         let mut first_creation = !db_fn.exists();
         let mut connection = Connection::open(&db_fn)?;
 
+        let db_ok = fast || first_creation || Self::integrity_ok(&connection);
+        let schema_ok = first_creation || Self::schema_matches(&connection);
+
         let mut recreated = false;
-        if !first_creation && !Self::schema_matches(&connection) {
+        if !db_ok || !schema_ok {
             warn!(
-                "warp database {} schema mismatch, recreating!",
-                db_fn.display()
+                "warp database {} {}, recreating!",
+                db_fn.display(),
+                if !db_ok { "corrupted" } else { "schema mismatch" }
             );
             recreated = !first_creation;
             connection.close().map_err(|(_conn, e)| e)?;
@@ -157,6 +167,11 @@ impl DB {
 
         if first_creation {
             Self::create_schema(&connection)?;
+        } else if !fast {
+            connection.execute(
+                "INSERT INTO document_fts(document_fts) VALUES('rebuild')",
+                (),
+            )?;
         }
 
         Ok(Self {
@@ -165,6 +180,17 @@ impl DB {
             remove_on_shutdown: false,
             recreated,
         })
+    }
+
+    /// Open with integrity check and FTS rebuild — safe for in-process use.
+    pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
+        Self::open_internal(db_fn, false)
+    }
+
+    /// Open without integrity check or FTS rebuild — for CLI batch operations
+    /// where startup latency on large databases is prohibitive.
+    pub fn new_fast(db_fn: PathBuf) -> SQLResult<Self> {
+        Self::open_internal(db_fn, true)
     }
 
     fn clear_inner(&mut self) -> SQLResult<()> {
