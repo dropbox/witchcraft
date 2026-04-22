@@ -125,6 +125,7 @@ impl DB {
         let connection =
             Connection::open_with_flags(db_fn.clone(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         connection.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             db_fn,
             connection: Some(connection),
@@ -167,11 +168,6 @@ impl DB {
 
         if first_creation {
             Self::create_schema(&connection)?;
-        } else if !fast {
-            connection.execute(
-                "INSERT INTO document_fts(document_fts) VALUES('rebuild')",
-                (),
-            )?;
         }
 
         Ok(Self {
@@ -182,13 +178,13 @@ impl DB {
         })
     }
 
-    /// Open with integrity check and FTS rebuild — safe for in-process use.
+    /// Open with integrity check — safe for in-process use.
     pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
         Self::open_internal(db_fn, false)
     }
 
-    /// Open without integrity check or FTS rebuild — for CLI batch operations
-    /// where startup latency on large databases is prohibitive.
+    /// Open without integrity check — for CLI batch operations where startup
+    /// latency on large databases is prohibitive.
     pub fn new_fast(db_fn: PathBuf) -> SQLResult<Self> {
         Self::open_internal(db_fn, true)
     }
@@ -199,11 +195,6 @@ impl DB {
         self.execute("DELETE FROM bucket")?;
         self.execute("DELETE FROM generation")?;
         self.execute("VACUUM")?;
-        Ok(())
-    }
-
-    pub fn refresh_ft(&mut self) -> SQLResult<()> {
-        self.execute("INSERT INTO document_fts(document_fts) VALUES('rebuild')")?;
         Ok(())
     }
 
