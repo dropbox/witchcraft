@@ -1185,7 +1185,7 @@ fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(
 fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tensor> {
     let now = std::time::Instant::now();
     let mut k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
-    k = k.max(1);
+    k = k.clamp(1, 2048);
     debug!("total_embeddings={} k={}", total_embeddings, k);
     let (m, _) = matrix.dims2()?;
     if m < k {
