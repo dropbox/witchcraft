@@ -1224,6 +1224,7 @@ fn build_layer(
         level, total_embeddings, min_rowid, max_rowid
     );
     let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
+    drop(matrix); // Free kmeans sample matrix before write_buckets
 
     let (tmpfiles, centers_cpu) =
         write_buckets_for_range(db, &centers, device, total_embeddings as u64, min_rowid, max_rowid)?;
