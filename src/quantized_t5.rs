@@ -438,7 +438,7 @@ impl T5Attention {
 
         let (scores, position_bias) = match position_bias {
             Some(position_bias) => {
-                let scores = crate::fast_ops::fast_add(&scores, position_bias)?;
+                let scores = scores.broadcast_add(position_bias)?;
                 (scores, Some(position_bias.clone()))
             }
             None => match &self.relative_attention_bias {
@@ -487,7 +487,7 @@ impl T5Attention {
                         .permute((2, 0, 1))?
                         .unsqueeze(0)?
                         .contiguous()?;
-                    let scores = crate::fast_ops::fast_add(&scores, &position_bias)?;
+                    let scores = scores.broadcast_add(&position_bias)?;
                     (scores, Some(position_bias))
                 }
             },

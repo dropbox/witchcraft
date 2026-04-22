@@ -2,7 +2,6 @@ use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 #[cfg(feature = "deterministic")]
 use rand::SeedableRng;
-use rusqlite::Statement;
 use std::collections::HashMap;
 use std::sync::RwLock;
 // Conditionally compile T5 encoder based on features
@@ -889,109 +888,6 @@ fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
         .collect()
 }
 
-pub struct Gatherer<'a> {
-    documents: Box<dyn Iterator<Item = (String, String, String)> + 'a>,
-    embedder: &'a Embedder,
-}
-
-impl<'a> Gatherer<'a> {
-    fn new(stmt: &'a mut Statement, embedder: &'a Embedder) -> Self {
-        let documents = Box::new(
-            stmt.query_map((), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap),
-        );
-
-        Self {
-            documents,
-            embedder,
-        }
-    }
-}
-
-impl<'a> Iterator for Gatherer<'a> {
-    type Item = (String, Tensor, Vec<u32>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.documents.next() {
-            Some((hash, body, lens)) => {
-                let now = std::time::Instant::now();
-                let (embeddings, offsets) = self.embedder.embed(&body).unwrap();
-                let embeddings = embeddings
-                    .squeeze(0)
-                    .unwrap()
-                    .to_device(&Device::Cpu)
-                    .unwrap();
-                let (m, _n) = embeddings.dims2().unwrap();
-                let dt = now.elapsed().as_secs_f64();
-                debug!(
-                    "embedder took {} ms ({} rows/s).",
-                    now.elapsed().as_millis(),
-                    ((m as f64) / dt).round()
-                );
-
-                let mut lengths: Vec<usize> = lens
-                    .split(',')
-                    .filter_map(|s| s.parse::<usize>().ok())
-                    .collect();
-                for i in 1..lengths.len() {
-                    lengths[i] += lengths[i - 1];
-                }
-
-                let mut i = 0;
-                let mut j = 0;
-
-                let i_end = offsets.len();
-                let j_end = lengths.len();
-                let mut count: u32 = 0;
-                let mut done = false;
-                let mut flush = false;
-                let mut counts = vec![];
-
-                while !done {
-                    let o = if i < offsets.len() {
-                        offsets[i].1
-                    } else {
-                        usize::MAX
-                    };
-
-                    let l = if j < lengths.len() {
-                        lengths[j]
-                    } else {
-                        usize::MAX
-                    };
-
-                    if o <= l {
-                        i += 1;
-                        count += 1;
-                    } else {
-                        j += 1;
-                        flush = true;
-                    }
-
-                    done = i == i_end && j == j_end;
-
-                    if flush || done {
-                        counts.push(count);
-                        count = 0;
-                        flush = false;
-                    }
-                }
-                assert!(count == 0);
-                assert!(counts.iter().sum::<u32>() == offsets.len() as u32);
-                Some((hash, embeddings, counts))
-            }
-            None => None,
-        }
-    }
-}
-
 #[cfg(debug_assertions)]
 fn rowwise_cosine_min(a: &Tensor, b: &Tensor) -> Result<f32> {
     let (rows, cols) = a.dims2()?;
@@ -1032,20 +928,64 @@ fn stretch_rows(a: &Tensor) -> Result<Tensor> {
     Ok(Tensor::stack(&scaled_rows, 0)?)
 }
 
+/// Map token offsets to sub-document counts using the lens column.
+fn compute_counts(offsets: &[(usize, usize)], lens_str: &str) -> Vec<u32> {
+    let mut lengths: Vec<usize> = lens_str
+        .split(',')
+        .filter_map(|s| s.parse::<usize>().ok())
+        .collect();
+    for i in 1..lengths.len() {
+        lengths[i] += lengths[i - 1];
+    }
+
+    let mut i = 0;
+    let mut j = 0;
+    let i_end = offsets.len();
+    let j_end = lengths.len();
+    let mut count: u32 = 0;
+    let mut done = false;
+    let mut flush = false;
+    let mut counts = vec![];
+
+    while !done {
+        let o = if i < offsets.len() { offsets[i].1 } else { usize::MAX };
+        let l = if j < lengths.len() { lengths[j] } else { usize::MAX };
+
+        if o <= l {
+            i += 1;
+            count += 1;
+        } else {
+            j += 1;
+            flush = true;
+        }
+
+        done = i == i_end && j == j_end;
+
+        if flush || done {
+            counts.push(count);
+            count = 0;
+            flush = false;
+        }
+    }
+    assert!(count == 0);
+    assert!(counts.iter().sum::<u32>() == offsets.len() as u32);
+    counts
+}
+
 pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
     let _priority_mgr = PriorityManager::new();
 
-    // Count total documents to embed for progress reporting
+    let limit_clause = match limit {
+        Some(limit) => format!("LIMIT {limit}"),
+        _ => String::new(),
+    };
+
     let mut progress = {
         let count_sql = format!(
             "SELECT COUNT(*) FROM document
             LEFT JOIN chunk ON document.hash = chunk.hash
             WHERE chunk.hash IS NULL AND length(document.body) > 0
-            {}",
-            match limit {
-                Some(limit) => format!("LIMIT {limit}"),
-                _ => String::new(),
-            }
+            {limit_clause}"
         );
         let mut count_query = db.query(&count_sql)?;
         let total: usize = count_query.query_row((), |row| row.get::<_, usize>(0))?;
@@ -1053,58 +993,55 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
     };
 
     let sql = format!(
-        "SELECT
-        document.hash,document.body,document.lens
+        "SELECT document.hash, document.body, document.lens
         FROM document
         LEFT JOIN chunk ON document.hash = chunk.hash
         WHERE chunk.hash IS NULL AND length(document.body) > 0
         ORDER BY document.hash
-        {}",
-        match limit {
-            Some(limit) => format!("LIMIT {limit}"),
-            _ => String::new(),
-        }
+        {limit_clause}"
     );
     let mut query = db.query(&sql)?;
+    let rows: Vec<(String, String, String)> = query
+        .query_map((), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let embedding_iter = Gatherer::new(&mut query, embedder);
+    let bodies: Vec<&str> = rows.iter().map(|(_, body, _)| body.as_str()).collect();
+    let all_embeddings = embedder.embed_batch(&bodies)?;
+
     let mut count = 0;
-    for (hash, embeddings, counts) in embedding_iter {
-        debug!(
-            "got embedding for chunk with hash {} {:?} {:?}",
-            hash,
-            embeddings.dims2()?,
-            counts,
-        );
+    for ((hash, _body, lens), (embeddings, offsets)) in rows.iter().zip(all_embeddings) {
+        let embeddings = embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
+        let counts = compute_counts(&offsets, lens);
 
-        let now = std::time::Instant::now();
         let bytes = embeddings.embeddings_to_packed()?;
         let (rows, cols) = embeddings.dims2()?;
         let pct = 100.0 * (bytes.len() as f32) / ((rows * cols) as f32);
         let bpe = 8.0 * (bytes.len() as f32) / ((rows * cols) as f32);
-        debug!(
-            "compressing to {pct:.2}% {bpe:.2}bpe took {} ms.",
-            now.elapsed().as_millis()
-        );
+        debug!("compressing to {pct:.2}% {bpe:.2}bpe");
 
         #[cfg(debug_assertions)]
         {
             let t = Tensor::embeddings_from_packed(&bytes, EMBEDDING_DIM, &Device::Cpu)?;
             let min_acc = rowwise_cosine_min(&embeddings, &t)?;
-
             let n = bpe.ceil() as u32;
             let qn = stretch_rows(&embeddings)?.quantize(n)?.dequantize(n)?;
             let min_qn_acc = rowwise_cosine_min(&embeddings, &qn)?;
             println!("haar reconstruction accuracy={min_acc} compare at q{n}_acc={min_qn_acc}");
         }
 
-        let counts = counts
+        let counts_str = counts
             .iter()
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .join(",");
 
-        match db.add_chunk(&hash, "xtr-base-en", &bytes, &counts) {
+        match db.add_chunk(hash, "xtr-base-en", &bytes, &counts_str) {
             Ok(()) => {
                 count += 1;
                 progress.inc(1);
