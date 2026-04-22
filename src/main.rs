@@ -82,7 +82,6 @@ pub fn bulk_search(
     outputname: std::path::PathBuf,
     use_fulltext: bool,
 ) -> Result<()> {
-    db.set_mmap_size(512 * 1024 * 1024)?;
     let file = File::open(csvname)?;
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(b'\t')

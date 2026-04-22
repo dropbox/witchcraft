@@ -350,7 +350,6 @@ impl Indexer {
                             }
                         },
                         Job::Index => {
-                            let _ = db.refresh_ft();
                             loop {
                                 match &embedder {
                                     Some(embedder) => {
