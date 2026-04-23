@@ -1464,9 +1464,8 @@ fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(
     Ok((matrix, total_embeddings))
 }
 
-fn pq_groups_log2_for_level(_level: u32) -> u32 {
-    2
-    //level / 4
+fn pq_groups_log2_for_level(level: u32) -> u32 {
+    level / 3
 }
 
 fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize, level: u32) -> Result<(Vec<Tensor>, usize, usize, u32)> {
