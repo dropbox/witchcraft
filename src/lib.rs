@@ -1011,23 +1011,23 @@ pub fn match_centroids(
         };
         let all_residuals = Tensor::from_vec(dequant_flat, &[q4_count, EMBEDDING_DIM], device)?;
 
-        let query_f16 = query_embeddings.to_dtype(DType::F16)?;
-        let residual_sims =
-            fast_ops::matmul_t(&query_f16, &all_residuals)?.transpose(0, 1)?;
-        let residual_sims = residual_sims.to_device(&Device::Cpu)?;
-        let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
-
-        let mut residual_sims_flat = residual_sims.flatten_all()?.to_vec1::<f32>()?;
+        let mut bias_flat = vec![0.0f32; q4_count * n];
         for (doc_idx, &(gen_idx, cluster_idx)) in
             document_clusters.iter().enumerate().take(q4_count)
         {
             let centroid_scores = &gen_centroid_scores_all[gen_idx];
             for (query_idx, scores) in centroid_scores.iter().enumerate().take(n) {
-                let offset = doc_idx * n + query_idx;
-                residual_sims_flat[offset] += scores[cluster_idx];
+                bias_flat[doc_idx * n + query_idx] = scores[cluster_idx];
             }
         }
-        sim.extend_from_slice(&residual_sims_flat);
+        let bias = Tensor::from_vec(bias_flat, &[q4_count, n], device)?;
+
+        let query_f16 = query_embeddings.to_dtype(DType::F16)?;
+        let residual_sims =
+            fast_ops::matmul_t(&query_f16, &all_residuals)?.transpose(0, 1)?;
+        let combined = (residual_sims.to_dtype(DType::F32)? + bias)?;
+        let combined = combined.to_device(&Device::Cpu)?.contiguous()?;
+        sim.extend_from_slice(&combined.flatten_all()?.to_vec1::<f32>()?);
     }
 
     // Process unindexed embeddings: full similarities
