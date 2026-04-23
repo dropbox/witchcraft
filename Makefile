@@ -23,6 +23,7 @@ ifeq ($(UNAME_S),Darwin)
 else ifeq ($(UNAME_S),Linux)
   CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
   NAPI_FEATURES := t5-quantized,fbgemm,napi
+  PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
   RUSTFLAGS_EXTRA :=
   TARGET :=
 endif
