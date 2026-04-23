@@ -752,7 +752,7 @@ pub fn match_centroids(
 ) -> Result<Vec<(f32, u32, u32)>> {
     let total_start = std::time::Instant::now();
 
-    let t_prime: usize = std::env::var("WARP_T_PRIME").ok().and_then(|v| v.parse().ok()).unwrap_or(30000);
+    let t_prime_base: usize = std::env::var("WARP_T_PRIME").ok().and_then(|v| v.parse().ok()).unwrap_or(10000);
     let device = query_embeddings.device();
     let (m, _n) = query_embeddings.dims2()?;
 
@@ -780,6 +780,7 @@ pub fn match_centroids(
             let k_sub = pq.k_sub;
             let ms = pq.m_subspaces;
             let sub_dim = pq.sub_dim;
+            let t_prime = 4 * t_prime_base * ms;
 
             // Score query tokens against each subspace's centroids.
             let sub_scores: Vec<Vec<Vec<f32>>> = (0..ms).map(|s| {
@@ -890,7 +891,7 @@ pub fn match_centroids(
                         missing[qi] = missing[qi].max(score_for(qi, &worst));
                     }
                 }
-                if !any_progress || token_done.iter().all(|&d| d) || global_cumsum >= t_prime * 4 {
+                if !any_progress || token_done.iter().all(|&d| d) || global_cumsum >= t_prime {
                     let worst: Vec<u16> = vec![k_sub as u16 - 1; ms];
                     for qi in 0..m {
                         if !token_done[qi] {
