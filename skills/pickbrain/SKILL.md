@@ -63,7 +63,14 @@ To exclude the current (calling) session from results:
 pickbrain --exclude-current "<query>"
 ```
 
-To exclude specific sessions by ID (comma-separated or repeated):
+To filter by git branch:
+
+```bash
+pickbrain --branch <branch-name> "<query>"
+pickbrain --branch . "<query>"          # . = current branch
+```
+
+To exclude specific sessions from results (comma-separated or repeated):
 
 ```bash
 pickbrain --exclude <uuid1>,<uuid2> "<query>"
