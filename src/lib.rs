@@ -766,9 +766,6 @@ pub fn match_centroids(
 
     let generations = get_all_generation_centers(db, device)?;
 
-    let mut bucket_query =
-        db.query("SELECT indices, residuals FROM bucket WHERE id = ?1")?;
-
     let table: [f32; 16] = packops::make_q4_dequant_table()?;
 
     for gen in &generations {
@@ -796,14 +793,24 @@ pub fn match_centroids(
             }).collect();
 
             // For each (token, subspace), sort centroid indices by descending score.
-            let sub_sorted: Vec<Vec<Vec<u16>>> = (0..ms).map(|s| {
-                (0..m).map(|qi| {
-                    let mut indices: Vec<u16> = (0..k_sub as u16).collect();
-                    indices.sort_unstable_by(|&a, &b|
-                        sub_scores[s][qi][b as usize].partial_cmp(&sub_scores[s][qi][a as usize]).unwrap());
-                    indices
+            // Use GPU arg_sort for M=1 (avoids O(m*k) CPU sort on large k_sub).
+            let sub_sorted: Vec<Vec<Vec<u16>>> = if ms == 1 {
+                let sim = fast_ops::matmul_t(query_embeddings, &pq.sub_centers[0])?;
+                let sorted = sim.arg_sort_last_dim(false)?.to_device(&Device::Cpu)?;
+                let sorted_vec = sorted.to_vec2::<u32>()?;
+                vec![sorted_vec.into_iter().map(|row|
+                    row.into_iter().map(|v| v as u16).collect()
+                ).collect()]
+            } else {
+                (0..ms).map(|s| {
+                    (0..m).map(|qi| {
+                        let mut indices: Vec<u16> = (0..k_sub as u16).collect();
+                        indices.sort_unstable_by(|&a, &b|
+                            sub_scores[s][qi][b as usize].partial_cmp(&sub_scores[s][qi][a as usize]).unwrap());
+                        indices
+                    }).collect()
                 }).collect()
-            }).collect();
+            };
 
             let grid: usize = k_sub.checked_pow(ms as u32).unwrap();
             let mut token_visited: Vec<BitVec> = (0..m).map(|_| bitvec![0; grid]).collect();
@@ -909,22 +916,31 @@ pub fn match_centroids(
             }
             gen_centroid_scores_all.push(gen_centroid_scores);
 
-            for &i in &topk_clusters {
-                let bucket_id = gen.bucket_ids[i as usize];
-
-                let (keys_compressed, residual_bytes): (Vec<u8>, Vec<u8>) = bucket_query
-                    .query_row((bucket_id,), |row| {
-                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-                    })?;
-
-                let document_indices = decompress_keys(&keys_compressed)?;
-                let num_docs = residual_bytes.len() / RESIDUAL_BYTES;
-                all_q4_bytes.extend_from_slice(&residual_bytes);
-                q4_count += num_docs;
-                for idx in &document_indices[..num_docs] {
-                    document_clusters.push((gen_idx, i as usize));
-                    all.push((*idx, count));
-                    count += 1;
+            {
+                let placeholders: String = topk_clusters.iter().map(|i| gen.bucket_ids[*i as usize].to_string()).collect::<Vec<_>>().join(",");
+                let sql = format!("SELECT id, indices, residuals FROM bucket WHERE id IN ({placeholders}) ORDER BY id");
+                let mut batch_query = db.query(&sql)?;
+                let rows = batch_query.query_map((), |row| {
+                    Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+                })?;
+                let mut bucket_data: HashMap<u32, (Vec<u8>, Vec<u8>)> = HashMap::new();
+                for r in rows {
+                    let (id, keys, residuals) = r?;
+                    bucket_data.insert(id, (keys, residuals));
+                }
+                drop(batch_query);
+                for &i in &topk_clusters {
+                    let bucket_id = gen.bucket_ids[i as usize];
+                    let (keys_compressed, residual_bytes) = bucket_data.remove(&bucket_id).unwrap();
+                    let document_indices = decompress_keys(&keys_compressed)?;
+                    let num_docs = residual_bytes.len() / RESIDUAL_BYTES;
+                    all_q4_bytes.extend_from_slice(&residual_bytes);
+                    q4_count += num_docs;
+                    for idx in &document_indices[..num_docs] {
+                        document_clusters.push((gen_idx, i as usize));
+                        all.push((*idx, count));
+                        count += 1;
+                    }
                 }
             }
         } else {
@@ -971,12 +987,20 @@ pub fn match_centroids(
 
     // Process indexed embeddings: query·residuals + centroid scores
     if q4_count > 0 {
-        let mut dequant_flat = Vec::with_capacity(q4_count * EMBEDDING_DIM);
-        for &byte in &all_q4_bytes {
-            let hi = (byte >> 4) & 0x0f;
-            let lo = byte & 0x0f;
-            dequant_flat.push(table[hi as usize]);
-            dequant_flat.push(table[lo as usize]);
+        let mut pair_table = [(0.0f32, 0.0f32); 256];
+        for b in 0..256u16 {
+            pair_table[b as usize] = (table[(b >> 4) as usize], table[(b & 0x0f) as usize]);
+        }
+        let total_floats = q4_count * EMBEDDING_DIM;
+        let mut dequant_flat = Vec::with_capacity(total_floats);
+        unsafe { dequant_flat.set_len(total_floats); }
+        let dst: *mut f32 = dequant_flat.as_mut_ptr();
+        for (i, &byte) in all_q4_bytes.iter().enumerate() {
+            let (hi, lo) = pair_table[byte as usize];
+            unsafe {
+                *dst.add(2 * i) = hi;
+                *dst.add(2 * i + 1) = lo;
+            }
         }
         let all_residuals = Tensor::from_vec(dequant_flat, &[q4_count, EMBEDDING_DIM], device)?;
 
