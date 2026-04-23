@@ -1472,7 +1472,10 @@ fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(
 }
 
 fn pq_groups_log2_for_level(level: u32) -> u32 {
-    level / 3
+    std::env::var("WARP_PQ_GROUPS_LOG2")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(level / 3)
 }
 
 fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize, level: u32) -> Result<(Vec<Tensor>, usize, usize, u32)> {
