@@ -111,12 +111,6 @@ pub trait TensorPackOps {
     fn embeddings_from_packed(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
 
     fn to_q4_bytes(&self) -> Result<Vec<u8>>;
-    fn from_companded_q4_bytes(
-        bytes: &[u8],
-        cols: usize,
-        table: &[f32; 16],
-        device: &Device,
-    ) -> Result<Tensor>;
 
     fn from_f32_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
     fn to_f32_bytes(&self) -> Result<Vec<u8>>;
@@ -488,29 +482,6 @@ impl TensorPackOps for Tensor {
         Ok(Tensor::from_vec(f32s, &[rows, cols], device)?)
     }
 
-    fn from_companded_q4_bytes(
-        bytes: &[u8],
-        cols: usize,
-        table: &[f32; 16],
-        device: &Device,
-    ) -> Result<Tensor> {
-        let mut out = Vec::with_capacity(bytes.len() * 2);
-        for &byte in bytes {
-            let high = (byte >> 4) & 0x0f;
-            let low = byte & 0x0f;
-            out.push(table[high as usize]);
-            out.push(table[low as usize]);
-        }
-
-        assert!(
-            out.len() % cols == 0,
-            "Unpacked data length ({}) must be divisible by cols ({})",
-            out.len(),
-            cols
-        );
-        let rows = out.len() / cols;
-        Ok(Tensor::from_vec(out, &[rows, cols], device)?)
-    }
 
     /*
     fn from_companded_q8_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
