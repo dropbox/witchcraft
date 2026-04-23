@@ -10,7 +10,7 @@ use super::sql_generator::build_filter_sql_and_params;
 
 const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
 const APP_ID: i32 = 0x07DB_DA55;
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 pub struct DB {
     db_fn: PathBuf,
@@ -106,6 +106,7 @@ impl DB {
              CREATE TABLE generation(
                  id INTEGER PRIMARY KEY,
                  level INTEGER NOT NULL,
+                 pq_groups_log2 INTEGER NOT NULL DEFAULT 0,
                  num_embeddings INTEGER NOT NULL,
                  min_chunk_rowid INTEGER NOT NULL,
                  max_chunk_rowid INTEGER NOT NULL,
@@ -410,15 +411,16 @@ impl DB {
     pub fn add_generation(
         &self,
         level: u32,
+        pq_groups_log2: u32,
         num_embeddings: u64,
         min_chunk_rowid: i64,
         max_chunk_rowid: i64,
     ) -> SQLResult<i64> {
         let created = iso8601_timestamp::Timestamp::now_utc().to_string();
         self.conn().execute(
-            "INSERT INTO generation(level, num_embeddings, min_chunk_rowid, max_chunk_rowid, created)
-             VALUES(?1, ?2, ?3, ?4, ?5)",
-            (level, num_embeddings as i64, min_chunk_rowid, max_chunk_rowid, &created),
+            "INSERT INTO generation(level, pq_groups_log2, num_embeddings, min_chunk_rowid, max_chunk_rowid, created)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            (level, pq_groups_log2, num_embeddings as i64, min_chunk_rowid, max_chunk_rowid, &created),
         )?;
         Ok(self.conn().last_insert_rowid())
     }
