@@ -1,3 +1,4 @@
+use bitvec::prelude::*;
 use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 #[cfg(feature = "deterministic")]
@@ -49,6 +50,7 @@ mod merger;
 
 mod priority;
 use priority::PriorityManager;
+mod max_heap;
 
 mod progress_reporter;
 use progress_reporter::ProgressReporter;
@@ -67,7 +69,9 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
-const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 2; // packed 4-bit residuals
+const SUB_DIM: usize = EMBEDDING_DIM / 2;
+const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 2;
+
 #[cfg(not(test))]
 const L0_CAPACITY: usize = 1024;
 #[cfg(test)]
@@ -240,7 +244,6 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
                 *d += s;
             }
         }
-
         // Replace underpopulated centroids with perturbed copies of the largest.
         let median_count = {
             let mut sorted_counts = counts.clone();
@@ -370,18 +373,21 @@ fn decompress_keys(bytes: &[u8]) -> Result<Vec<(u32, u32)>> {
 fn merge_and_write_buckets(
     db: &DB,
     tmpfiles: Vec<tempfile::NamedTempFile>,
-    centers_cpu: &Tensor,
+    centers_left_cpu: &Tensor,
+    centers_right_cpu: &Tensor,
+    k_sub: usize,
     generation_id: i64,
-    id_offset: u32,
 ) -> Result<()> {
     let mut merger = merger::Merger::from_tempfiles(tmpfiles, RESIDUAL_BYTES)?;
     for result in &mut merger {
         let entry = result?;
-        let center = centers_cpu.get(entry.value as usize)?;
+        let li = entry.value as usize / k_sub;
+        let ri = entry.value as usize % k_sub;
+        let center = Tensor::cat(&[centers_left_cpu.get(li)?, centers_right_cpu.get(ri)?], 0)?;
         let center_bytes = center.to_f32_bytes()?;
         let compressed_keys = compress_keys(&entry.keys);
         db.add_bucket(
-            id_offset + entry.value,
+            entry.value,
             generation_id,
             &center_bytes,
             &compressed_keys,
@@ -513,6 +519,14 @@ struct GenerationCentroids {
     bucket_ids: Vec<u32>,
     sizes: Vec<usize>,
     centers_matrix: Tensor,
+    pq: Option<PqCentroids>,
+}
+
+struct PqCentroids {
+    k_sub: usize,
+    left_centers: Tensor,
+    right_centers: Tensor,
+    id_to_index: HashMap<u32, usize>,
 }
 
 type CentersCache = Vec<GenerationCentroids>;
@@ -521,6 +535,73 @@ static CACHED: Lazy<RwLock<Option<CentersCache>>> = Lazy::new(|| RwLock::new(Non
 
 fn invalidate_center_cache() {
     *CACHED.write().unwrap() = None;
+}
+
+fn detect_pq_structure(
+    bucket_ids: &[u32],
+    centers_matrix: &Tensor,
+    sizes: &[usize],
+    device: &Device,
+) -> Option<PqCentroids> {
+    let max_id = *bucket_ids.iter().max()? as usize;
+    let k_sub = (max_id as f64 + 1.0).sqrt().round() as usize;
+    if k_sub < 2 || k_sub * k_sub != max_id + 1 {
+        return None;
+    }
+
+    let id_to_index: HashMap<u32, usize> = bucket_ids
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| (id, i))
+        .collect();
+
+    let centers_cpu = centers_matrix.to_device(&Device::Cpu).ok()?;
+    let mut left_accum = vec![vec![0.0f64; SUB_DIM]; k_sub];
+    let mut left_counts = vec![0usize; k_sub];
+    let mut right_accum = vec![vec![0.0f64; SUB_DIM]; k_sub];
+    let mut right_counts = vec![0usize; k_sub];
+
+    for (idx, &id) in bucket_ids.iter().enumerate() {
+        let li = id as usize / k_sub;
+        let ri = id as usize % k_sub;
+        let w = sizes[idx];
+        if w == 0 {
+            continue;
+        }
+        let center = centers_cpu.get(idx).ok()?.to_vec1::<f32>().ok()?;
+        for d in 0..SUB_DIM {
+            left_accum[li][d] += center[d] as f64 * w as f64;
+            right_accum[ri][d] += center[d + SUB_DIM] as f64 * w as f64;
+        }
+        left_counts[li] += w;
+        right_counts[ri] += w;
+    }
+
+    let mut left_flat = vec![0.0f32; k_sub * SUB_DIM];
+    let mut right_flat = vec![0.0f32; k_sub * SUB_DIM];
+    for i in 0..k_sub {
+        if left_counts[i] > 0 {
+            for d in 0..SUB_DIM {
+                left_flat[i * SUB_DIM + d] = (left_accum[i][d] / left_counts[i] as f64) as f32;
+            }
+        }
+        if right_counts[i] > 0 {
+            for d in 0..SUB_DIM {
+                right_flat[i * SUB_DIM + d] = (right_accum[i][d] / right_counts[i] as f64) as f32;
+            }
+        }
+    }
+
+    let left_centers = Tensor::from_vec(left_flat, (k_sub, SUB_DIM), device).ok()?;
+    let right_centers = Tensor::from_vec(right_flat, (k_sub, SUB_DIM), device).ok()?;
+
+    debug!("detected PQ structure: k_sub={}", k_sub);
+    Some(PqCentroids {
+        k_sub,
+        left_centers,
+        right_centers,
+        id_to_index,
+    })
 }
 
 fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<GenerationCentroids>> {
@@ -568,11 +649,19 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
         } else {
             Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?
         };
+
+        let pq = if !bucket_ids.is_empty() {
+            detect_pq_structure(&bucket_ids, &centers_matrix, &sizes, device)
+        } else {
+            None
+        };
+
         all.push(GenerationCentroids {
             generation_id: gen_id,
             bucket_ids,
             sizes,
             centers_matrix,
+            pq,
         });
     }
 
@@ -587,6 +676,17 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
     Ok(all)
 }
 
+impl Clone for PqCentroids {
+    fn clone(&self) -> Self {
+        Self {
+            k_sub: self.k_sub,
+            left_centers: self.left_centers.clone(),
+            right_centers: self.right_centers.clone(),
+            id_to_index: self.id_to_index.clone(),
+        }
+    }
+}
+
 impl Clone for GenerationCentroids {
     fn clone(&self) -> Self {
         Self {
@@ -594,6 +694,7 @@ impl Clone for GenerationCentroids {
             bucket_ids: self.bucket_ids.clone(),
             sizes: self.sizes.clone(),
             centers_matrix: self.centers_matrix.clone(),
+            pq: self.pq.clone(),
         }
     }
 }
@@ -631,12 +732,14 @@ pub fn match_centroids(
 ) -> Result<Vec<(f32, u32, u32)>> {
     let total_start = std::time::Instant::now();
 
-    let k = 32;
-    let t_prime = 40000;
+    let k: usize = std::env::var("WARP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+    let t_prime: usize = std::env::var("WARP_T_PRIME").ok().and_then(|v| v.parse().ok()).unwrap_or(30000);
     let device = query_embeddings.device();
     let (m, _n) = query_embeddings.dims2()?;
 
     let mut all_residuals = vec![];
+    let mut all_q4_bytes: Vec<u8> = vec![];
+    let mut q4_count = 0usize;
     let mut document_clusters: Vec<(usize, usize)> = vec![]; // (gen_idx, cluster_idx)
     let mut gen_centroid_scores_all: Vec<Vec<Vec<f32>>> = vec![];
     let mut all = vec![];
@@ -658,58 +761,191 @@ pub fn match_centroids(
         let gen_idx = gen_centroid_scores_all.len();
         let n_centroids = gen.bucket_ids.len();
 
-        let query_centroid_similarity =
-            fast_ops::matmul_t(query_embeddings, &gen.centers_matrix)?;
-        let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
+        if let Some(pq) = &gen.pq {
+            let k_sub = pq.k_sub;
+            let query_left = query_embeddings.narrow(1, 0, SUB_DIM)?.contiguous()?;
+            let query_right = query_embeddings.narrow(1, SUB_DIM, SUB_DIM)?.contiguous()?;
 
-        let gen_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
-        gen_centroid_scores_all.push(gen_centroid_scores);
+            let left_scores = fast_ops::matmul_t(&query_left, &pq.left_centers)?
+                .to_device(&Device::Cpu)?
+                .to_vec2::<f32>()?;
+            let right_scores = fast_ops::matmul_t(&query_right, &pq.right_centers)?
+                .to_device(&Device::Cpu)?
+                .to_vec2::<f32>()?;
 
-        let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
+            // Compute centroid scores from sub-scores for loaded buckets only.
+            // Use per-token heap with bitvec to select which buckets to load.
+            let mut left_sorted: Vec<Vec<u16>> = Vec::with_capacity(m);
+            for qi in 0..m {
+                let mut indices: Vec<u16> = (0..k_sub as u16).collect();
+                indices.sort_unstable_by(|&a, &b| left_scores[qi][b as usize].partial_cmp(&left_scores[qi][a as usize]).unwrap());
+                left_sorted.push(indices);
+            }
+            let mut right_sorted: Vec<Vec<u16>> = Vec::with_capacity(m);
+            for qi in 0..m {
+                let mut indices: Vec<u16> = (0..k_sub as u16).collect();
+                indices.sort_unstable_by(|&a, &b| right_scores[qi][b as usize].partial_cmp(&right_scores[qi][a as usize]).unwrap());
+                right_sorted.push(indices);
+            }
 
-        let mut topk_clusters = Vec::with_capacity(k);
-        for i in 0..m {
-            let row = sorted_indices.get(i)?;
-            let row_scores_sorted =
-                query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
-            let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
-            let row = row.to_vec1::<u32>()?;
-            let mut cumsum = 0;
-            for j in 0..n_centroids.min(k) {
-                let idx = row[j];
-                topk_clusters.push(idx);
-                cumsum += gen.sizes[idx as usize];
-                if cumsum >= t_prime {
+            let grid = k_sub * k_sub;
+            let mut token_visited: Vec<BitVec> = (0..m).map(|_| bitvec![0; grid]).collect();
+            let mut global_selected = vec![false; n_centroids];
+            let mut global_cumsum = 0usize;
+            let mut topk_clusters = Vec::new();
+
+            let mut heaps: Vec<max_heap::MaxHeap<(u16, u16)>> = Vec::with_capacity(m);
+            let mut token_cumsum = vec![0usize; m];
+            let mut token_done = vec![false; m];
+            for qi in 0..m {
+                let mut heap = max_heap::MaxHeap::new();
+                let li = left_sorted[qi][0] as usize;
+                let ri = right_sorted[qi][0] as usize;
+                heap.push(left_scores[qi][li] + right_scores[qi][ri], (0u16, 0u16));
+                token_visited[qi].set(0, true);
+                heaps.push(heap);
+            }
+
+            loop {
+                let mut any_progress = false;
+                for qi in 0..m {
+                    if token_done[qi] { continue; }
+                    if let Some((_score, (l_rank, r_rank))) = heaps[qi].pop() {
+                        any_progress = true;
+                        let li = left_sorted[qi][l_rank as usize] as usize;
+                        let ri = right_sorted[qi][r_rank as usize] as usize;
+                        let bucket_id = (li * k_sub + ri) as u32;
+
+                        if let Some(&idx) = pq.id_to_index.get(&bucket_id) {
+                            let sz = gen.sizes[idx];
+                            token_cumsum[qi] += sz;
+                            if !global_selected[idx] {
+                                global_selected[idx] = true;
+                                topk_clusters.push(idx as u32);
+                                global_cumsum += sz;
+                            }
+                        }
+
+                        if token_cumsum[qi] >= t_prime {
+                            token_done[qi] = true;
+                        } else {
+                            for (nl, nr) in [(l_rank + 1, r_rank), (l_rank, r_rank + 1)] {
+                                if (nl as usize) < k_sub && (nr as usize) < k_sub {
+                                    let idx = nl as usize * k_sub + nr as usize;
+                                    if !token_visited[qi][idx] {
+                                        token_visited[qi].set(idx, true);
+                                        let nli = left_sorted[qi][nl as usize] as usize;
+                                        let nri = right_sorted[qi][nr as usize] as usize;
+                                        heaps[qi].push(left_scores[qi][nli] + right_scores[qi][nri], (nl, nr));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        token_done[qi] = true;
+                        let li = left_sorted[qi][k_sub - 1] as usize;
+                        let ri = right_sorted[qi][k_sub - 1] as usize;
+                        missing[qi] = missing[qi].max(left_scores[qi][li] + right_scores[qi][ri]);
+                    }
+                }
+                if !any_progress || token_done.iter().all(|&d| d) || global_cumsum >= t_prime * 4 {
+                    for qi in 0..m {
+                        if !token_done[qi] {
+                            let li = left_sorted[qi][k_sub - 1] as usize;
+                            let ri = right_sorted[qi][k_sub - 1] as usize;
+                            missing[qi] = missing[qi].max(left_scores[qi][li] + right_scores[qi][ri]);
+                        }
+                    }
                     break;
                 }
             }
-            if cumsum < t_prime {
-                missing[i] = missing[i].max(row_scores_sorted[n_centroids.min(k) - 1]);
+            topk_clusters.sort_unstable();
+
+            debug!("pq search: loading {} / {} buckets", topk_clusters.len(), n_centroids);
+            // Build centroid scores only for loaded buckets
+            let mut gen_centroid_scores = vec![vec![0.0f32; n_centroids]; m];
+            for &idx in &topk_clusters {
+                let id = gen.bucket_ids[idx as usize];
+                let li = id as usize / k_sub;
+                let ri = id as usize % k_sub;
+                for qi in 0..m {
+                    gen_centroid_scores[qi][idx as usize] = left_scores[qi][li] + right_scores[qi][ri];
+                }
             }
-        }
-        topk_clusters.sort_unstable();
-        topk_clusters.dedup();
+            gen_centroid_scores_all.push(gen_centroid_scores);
 
-        for &i in &topk_clusters {
-            let bucket_id = gen.bucket_ids[i as usize];
-            let (keys_compressed, residual_bytes) = bucket_query
-                .query_row((bucket_id,), |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?;
+            for &i in &topk_clusters {
+                let bucket_id = gen.bucket_ids[i as usize];
 
-            let document_indices = decompress_keys(&keys_compressed)?;
-            let residuals = Tensor::from_companded_q4_bytes(
-                &residual_bytes,
-                EMBEDDING_DIM,
-                &table,
-                &Device::Cpu,
-            )?;
-            let (num_docs, _) = residuals.dims2()?;
-            all_residuals.push(residuals);
-            for idx in &document_indices[..num_docs] {
-                document_clusters.push((gen_idx, i as usize));
-                all.push((*idx, count));
-                count += 1;
+                let (keys_compressed, residual_bytes): (Vec<u8>, Vec<u8>) = bucket_query
+                    .query_row((bucket_id,), |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })?;
+
+                let document_indices = decompress_keys(&keys_compressed)?;
+                let num_docs = residual_bytes.len() / RESIDUAL_BYTES;
+                all_q4_bytes.extend_from_slice(&residual_bytes);
+                q4_count += num_docs;
+                for idx in &document_indices[..num_docs] {
+                    document_clusters.push((gen_idx, i as usize));
+                    all.push((*idx, count));
+                    count += 1;
+                }
+            }
+        } else {
+            let query_centroid_similarity =
+                fast_ops::matmul_t(query_embeddings, &gen.centers_matrix)?;
+            let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
+
+            let gen_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
+            gen_centroid_scores_all.push(gen_centroid_scores);
+
+            let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
+
+            let mut topk_clusters = Vec::with_capacity(k);
+            for i in 0..m {
+                let row = sorted_indices.get(i)?;
+                let row_scores_sorted =
+                    query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
+                let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
+                let row = row.to_vec1::<u32>()?;
+                let mut cumsum = 0;
+                for j in 0..n_centroids.min(k) {
+                    let idx = row[j];
+                    topk_clusters.push(idx);
+                    cumsum += gen.sizes[idx as usize];
+                    if cumsum >= t_prime {
+                        break;
+                    }
+                }
+                if cumsum < t_prime {
+                    missing[i] = missing[i].max(row_scores_sorted[n_centroids.min(k) - 1]);
+                }
+            }
+            topk_clusters.sort_unstable();
+            topk_clusters.dedup();
+
+            for &i in &topk_clusters {
+                let bucket_id = gen.bucket_ids[i as usize];
+                let (keys_compressed, residual_bytes) = bucket_query
+                    .query_row((bucket_id,), |row| {
+                        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })?;
+
+                let document_indices = decompress_keys(&keys_compressed)?;
+                let residuals = Tensor::from_companded_q4_bytes(
+                    &residual_bytes,
+                    EMBEDDING_DIM,
+                    &table,
+                    &Device::Cpu,
+                )?;
+                let (num_docs, _) = residuals.dims2()?;
+                all_residuals.push(residuals);
+                for idx in &document_indices[..num_docs] {
+                    document_clusters.push((gen_idx, i as usize));
+                    all.push((*idx, count));
+                    count += 1;
+                }
             }
         }
     }
@@ -752,7 +988,33 @@ pub fn match_centroids(
     let mut sim: Vec<f32> = Vec::with_capacity(count * n);
 
     // Process indexed embeddings: query·residuals + centroid scores
-    if !all_residuals.is_empty() {
+    if q4_count > 0 {
+        let mut dequant_flat = Vec::with_capacity(q4_count * EMBEDDING_DIM);
+        for &byte in &all_q4_bytes {
+            let hi = (byte >> 4) & 0x0f;
+            let lo = byte & 0x0f;
+            dequant_flat.push(table[hi as usize]);
+            dequant_flat.push(table[lo as usize]);
+        }
+        let all_residuals = Tensor::from_vec(dequant_flat, &[q4_count, EMBEDDING_DIM], device)?;
+
+        let residual_sims =
+            fast_ops::matmul_t(query_embeddings, &all_residuals)?.transpose(0, 1)?;
+        let residual_sims = residual_sims.to_device(&Device::Cpu)?;
+        let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
+
+        let mut residual_sims_flat = residual_sims.flatten_all()?.to_vec1::<f32>()?;
+        for (doc_idx, &(gen_idx, cluster_idx)) in
+            document_clusters.iter().enumerate().take(q4_count)
+        {
+            let centroid_scores = &gen_centroid_scores_all[gen_idx];
+            for (query_idx, scores) in centroid_scores.iter().enumerate().take(n) {
+                let offset = doc_idx * n + query_idx;
+                residual_sims_flat[offset] += scores[cluster_idx];
+            }
+        }
+        sim.extend_from_slice(&residual_sims_flat);
+    } else if !all_residuals.is_empty() {
         let all_residuals = Tensor::cat(&all_residuals, 0)?;
         let all_residuals = all_residuals.to_device(device)?;
 
@@ -1216,18 +1478,22 @@ fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(
     Ok((matrix, total_embeddings))
 }
 
-fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tensor> {
+fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<(Tensor, Tensor, usize)> {
     let now = std::time::Instant::now();
-    let mut k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
-    k = k.max(1);
-    debug!("total_embeddings={} k={}", total_embeddings, k);
+    let mut k_sub = (4.0 * (total_embeddings as f64).powf(0.25)).ceil() as usize;
+    k_sub = k_sub.max(2);
     let (m, _) = matrix.dims2()?;
-    if m < k {
-        k = (m / 4).max(1);
+    if k_sub > m / 2 {
+        k_sub = (m / 2).max(2);
     }
-    let centers = kmeans(matrix, k, 5)?;
-    debug!("kmeans took {} ms.", now.elapsed().as_millis());
-    Ok(centers)
+    debug!("total_embeddings={} k_sub={} k_eff={}", total_embeddings, k_sub, k_sub * k_sub);
+    let left = matrix.narrow(1, 0, SUB_DIM)?.contiguous()?;
+    let right = matrix.narrow(1, SUB_DIM, SUB_DIM)?.contiguous()?;
+    let scale = 1.0 / (2.0f64).sqrt();
+    let centers_left = (kmeans(&left, k_sub, 5)? * scale)?;
+    let centers_right = (kmeans(&right, k_sub, 5)? * scale)?;
+    debug!("pq kmeans took {} ms.", now.elapsed().as_millis());
+    Ok((centers_left, centers_right, k_sub))
 }
 
 fn level_capacity(level: u32) -> usize {
@@ -1257,15 +1523,14 @@ fn build_layer(
         "building L{} with {} embeddings (chunks {}..={})",
         level, total_embeddings, min_rowid, max_rowid
     );
-    let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
-    drop(matrix); // Free kmeans sample matrix before write_buckets
+    let (centers_left, centers_right, k_sub) = run_kmeans_for_index(&matrix, total_embeddings)?;
+    drop(matrix);
 
-    let (tmpfiles, centers_cpu) =
-        write_buckets_for_range(db, &centers, device, total_embeddings as u64, min_rowid, max_rowid)?;
+    let (tmpfiles, centers_left_cpu, centers_right_cpu) =
+        write_buckets_for_range(db, &centers_left, &centers_right, k_sub, device, total_embeddings as u64, min_rowid, max_rowid)?;
 
     let gen_id = db.add_generation(level, total_embeddings as u64, min_rowid, max_rowid)?;
-    let bucket_id_offset = 0u32;
-    merge_and_write_buckets(db, tmpfiles, &centers_cpu, gen_id, bucket_id_offset)?;
+    merge_and_write_buckets(db, tmpfiles, &centers_left_cpu, &centers_right_cpu, k_sub, gen_id)?;
 
     Ok(())
 }
@@ -1273,12 +1538,14 @@ fn build_layer(
 /// Like write_buckets but only processes chunks in [min_rowid, max_rowid].
 fn write_buckets_for_range(
     db: &DB,
-    centers: &Tensor,
+    centers_left: &Tensor,
+    centers_right: &Tensor,
+    k_sub: usize,
     device: &Device,
     expected_count: u64,
     min_rowid: i64,
     max_rowid: i64,
-) -> Result<(Vec<tempfile::NamedTempFile>, Tensor)> {
+) -> Result<(Vec<tempfile::NamedTempFile>, Tensor, Tensor)> {
     let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
     let mut writes_total = 0;
@@ -1310,8 +1577,10 @@ fn write_buckets_for_range(
     let mut done = false;
     let mut batch = 0;
     let mut tmpfiles = vec![];
-    let centers_cpu = centers.to_device(&Device::Cpu)?;
-    let packed_centers = fast_ops::PackedRight::new(centers)?;
+    let centers_left_cpu = centers_left.to_device(&Device::Cpu)?;
+    let centers_right_cpu = centers_right.to_device(&Device::Cpu)?;
+    let packed_left = fast_ops::PackedRight::new(centers_left)?;
+    let packed_right = fast_ops::PackedRight::new(centers_right)?;
     while !done {
         match results.next() {
             Some(result) => {
@@ -1350,8 +1619,11 @@ fn write_buckets_for_range(
             let indices = document_indices.split_off(left);
             let data = Tensor::cat(&embeddings, 0)?.to_device(device)?;
 
-            let cluster_assignments =
-                matmul_argmax_batched(&data, &packed_centers, 1024)?.to_device(&Device::Cpu)?;
+            let data_left = data.narrow(1, 0, SUB_DIM)?.contiguous()?;
+            let data_right = data.narrow(1, SUB_DIM, SUB_DIM)?.contiguous()?;
+            let left_assignments = matmul_argmax_batched(&data_left, &packed_left, 1024)?.to_device(&Device::Cpu)?;
+            let right_assignments = matmul_argmax_batched(&data_right, &packed_right, 1024)?.to_device(&Device::Cpu)?;
+            let cluster_assignments = (left_assignments * k_sub as f64)?.add(&right_assignments)?;
             mmuls_total += now.elapsed().as_millis();
 
             let now = std::time::Instant::now();
@@ -1395,7 +1667,9 @@ fn write_buckets_for_range(
                     }
                 }
 
-                let center = centers_cpu.get(bucket as usize)?;
+                let li = bucket as usize / k_sub;
+                let ri = bucket as usize % k_sub;
+                let center = Tensor::cat(&[centers_left_cpu.get(li)?, centers_right_cpu.get(ri)?], 0)?;
                 let residual = (embeddings[sample].get(0) - &center)?;
                 let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
                 residuals_bytes.extend(&residual_quantized);
@@ -1412,7 +1686,7 @@ fn write_buckets_for_range(
     debug!("mmuls took {} ms.", mmuls_total);
     debug!("writes took {} ms.", writes_total);
 
-    Ok((tmpfiles, centers_cpu))
+    Ok((tmpfiles, centers_left_cpu, centers_right_cpu))
 }
 
 pub fn full_index(db: &DB, device: &Device) -> Result<()> {

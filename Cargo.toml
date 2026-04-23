@@ -46,6 +46,7 @@ log = "0.4.28"
 text-splitter = { version = "0.28.0", features = ["markdown"] } # !Dash
 regex = "1"                # !Dash
 chrono = "0.4"             # !Dash
+bitvec = "1"
 lz4_flex = "0.11.5"
 strsim = "0.11.1"
 rayon = { version = "1", optional = true }
