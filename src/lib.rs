@@ -903,7 +903,7 @@ pub fn match_centroids(
             }
             topk_clusters.sort_unstable();
 
-            debug!("pq search: pq_groups={} k_sub={} loading {} / {} buckets",
+            debug!("pq search: pg={} k_sub={} loading {} / {} buckets",
                    pg, k_sub, topk_clusters.len(), n_centroids);
 
             let mut gen_centroid_scores = vec![vec![0.0f32; n_centroids]; m];
@@ -988,25 +988,32 @@ pub fn match_centroids(
 
     // Process indexed embeddings: query·residuals + centroid scores
     if q4_count > 0 {
-        let mut pair_table = [(0.0f32, 0.0f32); 256];
+        let mut pair_table = [0u32; 256];
         for b in 0..256u16 {
-            pair_table[b as usize] = (table[(b >> 4) as usize], table[(b & 0x0f) as usize]);
+            let hi = half::f16::from_f32(table[(b >> 4) as usize]).to_bits() as u32;
+            let lo = half::f16::from_f32(table[(b & 0x0f) as usize]).to_bits() as u32;
+            pair_table[b as usize] = hi | (lo << 16);
         }
-        let total_floats = q4_count * EMBEDDING_DIM;
-        let mut dequant_flat = Vec::with_capacity(total_floats);
-        unsafe { dequant_flat.set_len(total_floats); }
-        let dst: *mut f32 = dequant_flat.as_mut_ptr();
+        let total_elems = q4_count * EMBEDDING_DIM;
+        let total_pairs = total_elems / 2;
+        let mut dequant_u32: Vec<u32> = Vec::with_capacity(total_pairs);
+        unsafe { dequant_u32.set_len(total_pairs); }
+        let dst: *mut u32 = dequant_u32.as_mut_ptr();
         for (i, &byte) in all_q4_bytes.iter().enumerate() {
-            let (hi, lo) = pair_table[byte as usize];
-            unsafe {
-                *dst.add(2 * i) = hi;
-                *dst.add(2 * i + 1) = lo;
-            }
+            unsafe { *dst.add(i) = pair_table[byte as usize]; }
         }
+        let dequant_flat = unsafe {
+            let ptr = dequant_u32.as_mut_ptr() as *mut half::f16;
+            let len = total_elems;
+            let cap = total_elems;
+            std::mem::forget(dequant_u32);
+            Vec::from_raw_parts(ptr, len, cap)
+        };
         let all_residuals = Tensor::from_vec(dequant_flat, &[q4_count, EMBEDDING_DIM], device)?;
 
+        let query_f16 = query_embeddings.to_dtype(DType::F16)?;
         let residual_sims =
-            fast_ops::matmul_t(query_embeddings, &all_residuals)?.transpose(0, 1)?;
+            fast_ops::matmul_t(&query_f16, &all_residuals)?.transpose(0, 1)?;
         let residual_sims = residual_sims.to_device(&Device::Cpu)?;
         let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
 
@@ -1153,7 +1160,7 @@ pub fn match_centroids(
     debug!(
         "match_centroids: {} embeddings in {} ms.",
         count,
-        total_start.elapsed().as_millis()
+        total_start.elapsed().as_millis(),
     );
     Ok(results)
 }
