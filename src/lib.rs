@@ -241,26 +241,60 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
             }
         }
 
-        // Normalize each cluster sum; reinit empty clusters from a random point.
+        // Replace underpopulated centroids with perturbed copies of the largest.
+        let median_count = {
+            let mut sorted_counts = counts.clone();
+            sorted_counts.sort_unstable();
+            sorted_counts[k / 2]
+        };
+        let threshold = median_count / 4;
+        let mut by_count: Vec<usize> = (0..k).collect();
+        by_count.sort_unstable_by(|&a, &b| counts[b].cmp(&counts[a]));
+        let mut donor = 0;
+        for &small in by_count.iter().rev() {
+            if counts[small] > threshold {
+                break;
+            }
+            let big = by_count[donor];
+            if counts[big] <= threshold {
+                break;
+            }
+            let mean: Vec<f32> = (0..n)
+                .map(|d| sums[big * n + d] / counts[big] as f32)
+                .collect();
+            let half = counts[big] / 2;
+            let jitter_idx = rand::seq::index::sample(&mut rng, m, 1).into_vec()[0];
+            let jitter_src = &data_flat[jitter_idx * n..(jitter_idx + 1) * n];
+            for d in 0..n {
+                let jitter = (jitter_src[d] - mean[d]) * 0.1;
+                sums[small * n + d] = (mean[d] + jitter) * half as f32;
+                sums[big * n + d] = (mean[d] - jitter) * half as f32;
+            }
+            counts[small] = half;
+            counts[big] = half;
+            donor += 1;
+        }
+
         let mut centers_flat = vec![0f32; k * n];
         for i in 0..k {
             let src = &sums[i * n..(i + 1) * n];
             let dst = &mut centers_flat[i * n..(i + 1) * n];
-            let (emb, owned);
             if counts[i] > 0 {
-                emb = src;
-            } else {
-                let idx = rand::seq::index::sample(&mut rng, m, 1).into_vec()[0];
-                owned = data_flat[idx * n..(idx + 1) * n].to_vec();
-                emb = &owned;
-            }
-            let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                for (d, e) in dst.iter_mut().zip(emb) {
-                    *d = e / norm;
+                let norm: f32 = src.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    for (d, s) in dst.iter_mut().zip(src) {
+                        *d = s / norm;
+                    }
                 }
             } else {
-                dst.copy_from_slice(emb);
+                let idx = rand::seq::index::sample(&mut rng, m, 1).into_vec()[0];
+                let random = &data_flat[idx * n..(idx + 1) * n];
+                let norm: f32 = random.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    for (d, s) in dst.iter_mut().zip(random) {
+                        *d = s / norm;
+                    }
+                }
             }
         }
 
