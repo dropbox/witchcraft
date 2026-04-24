@@ -884,6 +884,9 @@ pub fn match_centroids(
 
                         if token_cumsum[qi] >= t_prime {
                             token_done[qi] = true;
+                            if let Some(next) = heaps[qi].peek() {
+                                missing[qi] = missing[qi].max(next);
+                            }
                         } else {
                             for s in 0..pg {
                                 let mut neighbor = ranks.clone();
@@ -899,15 +902,14 @@ pub fn match_centroids(
                         }
                     } else {
                         token_done[qi] = true;
-                        let worst: Vec<u16> = vec![k_sub as u16 - 1; pg];
-                        missing[qi] = missing[qi].max(score_for(qi, &worst));
                     }
                 }
                 if !any_progress || token_done.iter().all(|&d| d) || global_cumsum >= t_prime {
-                    let worst: Vec<u16> = vec![k_sub as u16 - 1; pg];
                     for qi in 0..m {
                         if !token_done[qi] {
-                            missing[qi] = missing[qi].max(score_for(qi, &worst));
+                            if let Some(next) = heaps[qi].peek() {
+                                missing[qi] = missing[qi].max(next);
+                            }
                         }
                     }
                     break;

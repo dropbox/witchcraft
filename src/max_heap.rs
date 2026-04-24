@@ -39,6 +39,10 @@ impl<T> MaxHeap<T> {
         self.heap.push(HeapEntry { score, data });
     }
 
+    pub fn peek(&self) -> Option<f32> {
+        self.heap.peek().map(|e| e.score)
+    }
+
     pub fn pop(&mut self) -> Option<(f32, T)> {
         self.heap.pop().map(|e| (e.score, e.data))
     }
