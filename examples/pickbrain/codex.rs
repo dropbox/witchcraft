@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 use witchcraft::DB;
@@ -90,13 +91,42 @@ fn extract_reasoning_text(payload: &serde_json::Value) -> Option<String> {
     payload.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
 }
 
-fn parse_session_file(path: &Path) -> (Option<String>, Vec<Chunk>) {
+/// Extract a branch name from git checkout/switch output in exec command results.
+/// Matches patterns like:
+///   "Switched to a new branch 'foo'"
+///   "Switched to branch 'foo'"
+///   "Already on 'foo'"
+///
+/// TODO: git's single-quote format isn't guaranteed across versions/locales.
+/// Covers all standard English git output; revisit if we hit edge cases.
+static BRANCH_SWITCH_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:Switched to (?:a new )?branch|Already on) '([^']+)'").unwrap()
+});
+
+fn extract_branch_from_output(payload: &serde_json::Value) -> Option<String> {
+    let ty = payload.get("type")?.as_str()?;
+    if ty != "function_call_output" {
+        return None;
+    }
+    let output = payload.get("output")?.as_str()?;
+    BRANCH_SWITCH_RE
+        .captures(output)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+struct SessionMeta {
+    cwd: Option<String>,
+    branch: Option<String>,
+}
+
+fn parse_session_file(path: &Path) -> (SessionMeta, Vec<Chunk>) {
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
-        Err(_) => return (None, vec![]),
+        Err(_) => return (SessionMeta { cwd: None, branch: None }, vec![]),
     };
 
-    let mut cwd = None;
+    let mut meta = SessionMeta { cwd: None, branch: None };
     let mut chunks = Vec::new();
     let mut offset: u64 = 0;
 
@@ -112,10 +142,25 @@ fn parse_session_file(path: &Path) -> (Option<String>, Vec<Chunk>) {
         };
 
         if entry.entry_type == "session_meta" {
-            if cwd.is_none() {
-                cwd = entry.payload.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
+            if meta.cwd.is_none() {
+                meta.cwd = entry.payload.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
+            }
+            // Only set from session_meta if no branch seen yet — exec output
+            // overwrites unconditionally below, so the last checkout always wins.
+            if meta.branch.is_none() {
+                meta.branch = entry.payload
+                    .get("git")
+                    .and_then(|g| g.get("branch"))
+                    .and_then(|b| b.as_str())
+                    .map(|s| s.to_string());
             }
             continue;
+        }
+
+        // Detect branch changes from git checkout/switch in exec output.
+        // Unconditional overwrite: the last branch switch in the session wins.
+        if let Some(switched) = extract_branch_from_output(&entry.payload) {
+            meta.branch = Some(switched);
         }
 
         let timestamp = match &entry.timestamp {
@@ -165,7 +210,7 @@ fn parse_session_file(path: &Path) -> (Option<String>, Vec<Chunk>) {
     }
 
     chunks.sort_by_key(|c| c.ts_ms);
-    (cwd, chunks)
+    (meta, chunks)
 }
 
 fn project_from_cwd(cwd: &str) -> String {
@@ -188,20 +233,27 @@ fn session_id_from_filename(path: &Path) -> String {
     stem.to_string()
 }
 
-fn ingest_session(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize> {
-    let (cwd, chunks) = parse_session_file(path);
+fn ingest_session(
+    db: &mut DB,
+    path: &Path,
+    mtime_ms: i64,
+    session_name: Option<&str>,
+) -> Result<usize> {
+    let (meta, chunks) = parse_session_file(path);
     if chunks.is_empty() {
         return Ok(0);
     }
 
-    let project_name = cwd.as_deref().map(project_from_cwd).unwrap_or_default();
+    let project_name = meta.cwd.as_deref().map(project_from_cwd).unwrap_or_default();
     let session_id = session_id_from_filename(path);
 
-    let session_title: String = chunks
-        .iter()
-        .find(|c| c.role == "user")
-        .map(|c| c.text.chars().take(240).collect())
-        .unwrap_or_default();
+    let session_title: String = session_name.map(|s| s.to_string()).unwrap_or_else(|| {
+        chunks
+            .iter()
+            .find(|c| c.role == "user")
+            .map(|c| c.text.chars().take(240).collect())
+            .unwrap_or_default()
+    });
 
     // Split into interactions starting at each user message
     let mut interactions: Vec<&[Chunk]> = Vec::new();
@@ -251,11 +303,13 @@ fn ingest_session(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize> {
             "source": "codex",
             "project": project_name,
             "session_id": session_id,
+            "session_name": session_title,
             "turn": turn_idx,
             "path": path.to_string_lossy(),
-            "cwd": cwd,
+            "cwd": meta.cwd,
             "mtime_ms": mtime_ms,
             "turns": turns_meta,
+            "branch": meta.branch,
         })
         .to_string();
 
@@ -301,6 +355,27 @@ fn collect_session_files(base: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn load_session_index() -> std::collections::HashMap<String, String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let index_path = PathBuf::from(&home).join(".codex/session_index.jsonl");
+    let mut names = std::collections::HashMap::new();
+    let raw = match fs::read_to_string(&index_path) {
+        Ok(s) => s,
+        Err(_) => return names,
+    };
+    for line in raw.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let (Some(id), Some(name)) = (
+                v.get("id").and_then(|i| i.as_str()),
+                v.get("thread_name").and_then(|n| n.as_str()),
+            ) {
+                names.insert(id.to_string(), name.to_string());
+            }
+        }
+    }
+    names
+}
+
 pub fn ingest_codex(db: &mut DB) -> Result<usize> {
     let home = std::env::var("HOME").unwrap_or_default();
     let sessions_dir = PathBuf::from(&home).join(".codex/sessions");
@@ -309,6 +384,7 @@ pub fn ingest_codex(db: &mut DB) -> Result<usize> {
         return Ok(0);
     }
 
+    let session_names = load_session_index();
     let wm_path = watermark::codex_path();
     let wm_ts = watermark::mtime_ms(&wm_path);
     let mut session_count = 0usize;
@@ -318,8 +394,10 @@ pub fn ingest_codex(db: &mut DB) -> Result<usize> {
             continue;
         }
         let mtime_ms = file_mtime_ms(&jsonl_path).unwrap_or(0);
+        let sid = session_id_from_filename(&jsonl_path);
+        let name = session_names.get(&sid).map(|s| s.as_str());
         println!("{}", jsonl_path.display());
-        match ingest_session(db, &jsonl_path, mtime_ms) {
+        match ingest_session(db, &jsonl_path, mtime_ms, name) {
             Ok(n) => session_count += n,
             Err(e) => {
                 log::warn!("failed to ingest codex {}: {e}", jsonl_path.display());
@@ -329,4 +407,180 @@ pub fn ingest_codex(db: &mut DB) -> Result<usize> {
 
     watermark::touch(&wm_path);
     Ok(session_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_tempfile(content: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    // -- extract_branch_from_output tests --
+
+    #[test]
+    fn test_extract_branch_from_output() {
+        let cases = vec![
+            // (output text, expected branch)
+            ("Switched to a new branch 'feature/foo'", Some("feature/foo")),
+            ("Switched to branch 'main'", Some("main")),
+            ("Already on 'develop'", Some("develop")),
+            ("Switched to a new branch 'codex/reserve-deprecated-signals'", Some("codex/reserve-deprecated-signals")),
+            // No match
+            ("some random output", None),
+            ("branch 'foo' deleted", None),
+        ];
+        for (output, expected) in cases {
+            let payload = serde_json::json!({
+                "type": "function_call_output",
+                "output": output,
+            });
+            assert_eq!(
+                extract_branch_from_output(&payload).as_deref(),
+                expected,
+                "failed for output: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_branch_wrong_type() {
+        let payload = serde_json::json!({
+            "type": "agent_reasoning",
+            "output": "Switched to a new branch 'foo'",
+        });
+        assert_eq!(extract_branch_from_output(&payload), None);
+    }
+
+    // -- parse_session_file tests --
+
+    fn session_meta_line(cwd: &str, branch: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "cwd": cwd,
+                "git": { "branch": branch }
+            }
+        })).unwrap()
+    }
+
+    fn user_msg_line(text: &str, ts: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "type": "response_item",
+            "timestamp": ts,
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": text }]
+            }
+        })).unwrap()
+    }
+
+    fn checkout_line(output: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "type": "event_msg",
+            "timestamp": "2025-01-15T10:05:00Z",
+            "payload": {
+                "type": "function_call_output",
+                "output": output,
+            }
+        })).unwrap()
+    }
+
+    #[test]
+    fn test_codex_parse_initial_branch() {
+        let content = format!(
+            "{}\n{}\n",
+            session_meta_line("/Users/me/src/server", "main"),
+            user_msg_line("hello world from the user", "2025-01-15T10:00:00Z"),
+        );
+        let f = write_tempfile(&content);
+        let (meta, chunks) = parse_session_file(f.path());
+        assert_eq!(meta.branch.as_deref(), Some("main"));
+        assert_eq!(meta.cwd.as_deref(), Some("/Users/me/src/server"));
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_codex_parse_branch_switch_overrides() {
+        let content = format!(
+            "{}\n{}\n{}\n",
+            session_meta_line("/Users/me/src/server", "main"),
+            checkout_line("Switched to a new branch 'feature/xyz'"),
+            user_msg_line("do some work on the branch", "2025-01-15T10:10:00Z"),
+        );
+        let f = write_tempfile(&content);
+        let (meta, _) = parse_session_file(f.path());
+        assert_eq!(meta.branch.as_deref(), Some("feature/xyz"));
+    }
+
+    #[test]
+    fn test_codex_parse_multiple_switches_last_wins() {
+        let content = format!(
+            "{}\n{}\n{}\n{}\n",
+            session_meta_line("/Users/me/src/server", "main"),
+            checkout_line("Switched to a new branch 'first-branch'"),
+            checkout_line("Switched to branch 'second-branch'"),
+            user_msg_line("work on second branch now", "2025-01-15T10:10:00Z"),
+        );
+        let f = write_tempfile(&content);
+        let (meta, _) = parse_session_file(f.path());
+        assert_eq!(meta.branch.as_deref(), Some("second-branch"));
+    }
+
+    #[test]
+    fn test_codex_parse_session_meta_after_checkout_doesnt_overwrite() {
+        // session_meta branch is first-write-only, so a later session_meta
+        // should NOT overwrite a branch detected from exec output
+        let content = format!(
+            "{}\n{}\n{}\n{}\n",
+            session_meta_line("/Users/me/src/server", "main"),
+            checkout_line("Switched to a new branch 'feature/new'"),
+            // second session_meta (e.g. from a reconnect)
+            session_meta_line("/Users/me/src/server", "main"),
+            user_msg_line("still on feature branch", "2025-01-15T10:10:00Z"),
+        );
+        let f = write_tempfile(&content);
+        let (meta, _) = parse_session_file(f.path());
+        assert_eq!(meta.branch.as_deref(), Some("feature/new"));
+    }
+
+    #[test]
+    fn test_codex_parse_empty_file() {
+        let f = write_tempfile("");
+        let (meta, chunks) = parse_session_file(f.path());
+        assert!(meta.branch.is_none());
+        assert!(meta.cwd.is_none());
+        assert!(chunks.is_empty());
+    }
+
+    // -- session_id_from_filename --
+
+    #[test]
+    fn test_session_id_from_filename() {
+        let cases = vec![
+            ("rollout-2025-01-15T10-00-00-abcdef01-2345-6789-abcd-ef0123456789.jsonl",
+             "abcdef01-2345-6789-abcd-ef0123456789"),
+            ("short.jsonl", "short"),
+        ];
+        for (filename, expected) in cases {
+            let path = PathBuf::from(filename);
+            assert_eq!(session_id_from_filename(&path), expected, "failed for {filename}");
+        }
+    }
+
+    // -- project_from_cwd --
+
+    #[test]
+    fn test_project_from_cwd() {
+        assert_eq!(project_from_cwd("/Users/me/src/server"), "server");
+        assert_eq!(project_from_cwd("/Users/me/src/dash-search-debugger"), "dash-search-debugger");
+        // Root path has no file_name, falls back to the input string
+        assert_eq!(project_from_cwd("/"), "/");
+    }
 }

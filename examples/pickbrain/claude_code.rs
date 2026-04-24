@@ -24,6 +24,11 @@ struct SessionEntry {
     entry_type: String,
     timestamp: Option<String>,
     message: Option<Message>,
+    #[serde(rename = "gitBranch")]
+    git_branch: Option<String>,
+    #[serde(rename = "customTitle")]
+    custom_title: Option<String>,
+    cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -64,6 +69,7 @@ struct Chunk {
     ts_ms: i64,
     byte_offset: u64,
     byte_len: u64,
+    git_branch: Option<String>,
 }
 
 fn codepoint_len(s: &str) -> usize {
@@ -168,13 +174,19 @@ fn compact(text: &str) -> String {
     re.replace_all(text, " ").trim().to_string()
 }
 
-fn parse_session_file(path: &Path) -> Vec<Chunk> {
+struct SessionInfo {
+    custom_title: Option<String>,
+    cwd: Option<String>,
+}
+
+fn parse_session_file(path: &Path) -> (SessionInfo, Vec<Chunk>) {
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
-        Err(_) => return vec![],
+        Err(_) => return (SessionInfo { custom_title: None, cwd: None }, vec![]),
     };
 
     let mut chunks = Vec::new();
+    let mut info = SessionInfo { custom_title: None, cwd: None };
     let mut offset: u64 = 0;
 
     for line in raw.lines() {
@@ -188,6 +200,21 @@ fn parse_session_file(path: &Path) -> Vec<Chunk> {
             Ok(e) => e,
             Err(_) => continue,
         };
+
+        if entry.entry_type == "custom-title" {
+            if let Some(ref title) = entry.custom_title {
+                info.custom_title = Some(title.clone());
+            }
+            continue;
+        }
+
+        // Use the cwd from JSONL entries (authoritative) rather than decoding
+        // from the directory name, which is ambiguous when paths contain dashes.
+        if info.cwd.is_none() {
+            if let Some(ref cwd) = entry.cwd {
+                info.cwd = Some(cwd.clone());
+            }
+        }
 
         if entry.entry_type != "user" && entry.entry_type != "assistant" {
             continue;
@@ -243,11 +270,12 @@ fn parse_session_file(path: &Path) -> Vec<Chunk> {
             ts_ms,
             byte_offset: line_offset,
             byte_len: line.len() as u64,
+            git_branch: entry.git_branch,
         });
     }
 
     chunks.sort_by_key(|c| c.ts_ms);
-    chunks
+    (info, chunks)
 }
 
 fn decode_project_name(dir_name: &str) -> String {
@@ -255,19 +283,29 @@ fn decode_project_name(dir_name: &str) -> String {
 }
 
 fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -> Result<usize> {
-    let chunks = parse_session_file(path);
+    let (info, chunks) = parse_session_file(path);
     if chunks.is_empty() {
         return Ok(0);
     }
 
+    // Prefer the cwd from inside the JSONL (authoritative) over the decoded
+    // directory name, which is lossy when paths contain dashes.
+    let project_name = info
+        .cwd
+        .as_deref()
+        .map(|cwd| cwd.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| project_name.to_string());
+
     let session_id = path.file_stem().unwrap().to_string_lossy();
 
-    // Session title: first user message of the entire session
-    let session_title: String = chunks
-        .iter()
-        .find(|c| c.role == "user")
-        .map(|c| c.text.chars().take(240).collect())
-        .unwrap_or_default();
+    // Session title: custom name if set, otherwise first user message
+    let session_title: String = info.custom_title.unwrap_or_else(|| {
+        chunks
+            .iter()
+            .find(|c| c.role == "user")
+            .map(|c| c.text.chars().take(240).collect())
+            .unwrap_or_default()
+    });
 
     // Split into interactions: each starts at a user message
     let mut interactions: Vec<&[Chunk]> = Vec::new();
@@ -315,13 +353,21 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
             format!("{session_id}:{turn_idx}").as_bytes(),
         );
 
+        let branch: Option<&str> = interaction
+            .iter()
+            .filter_map(|c| c.git_branch.as_deref())
+            .last();
+
         let metadata = serde_json::json!({
             "project": project_name,
             "session_id": session_id.to_string(),
+            "session_name": session_title,
             "turn": turn_idx,
             "path": path.to_string_lossy(),
+            "cwd": info.cwd,
             "mtime_ms": mtime_ms,
             "turns": turns_meta,
+            "branch": branch,
         })
         .to_string();
 
@@ -685,6 +731,162 @@ pub fn ingest_claude_code(db: &mut DB, skip_session: Option<&str>) -> Result<(us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn write_tempfile(content: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    fn jsonl_line(entry_type: &str, role: &str, text: &str, ts: &str, branch: Option<&str>, cwd: Option<&str>) -> String {
+        let msg = serde_json::json!({
+            "role": role,
+            "content": text,
+        });
+        let mut entry = serde_json::json!({
+            "type": entry_type,
+            "timestamp": ts,
+            "message": msg,
+        });
+        if let Some(b) = branch {
+            entry["gitBranch"] = serde_json::Value::String(b.to_string());
+        }
+        if let Some(c) = cwd {
+            entry["cwd"] = serde_json::Value::String(c.to_string());
+        }
+        serde_json::to_string(&entry).unwrap()
+    }
+
+    // -- sanitize tests --
+
+    #[test]
+    fn test_sanitize_strips_code_and_compacts() {
+        let input = "Hello ```rust\nfn main() {}\n``` world  and  `inline`  code";
+        let result = sanitize(input);
+        assert_eq!(result, "Hello world and code");
+    }
+
+    #[test]
+    fn test_sanitize_strips_system_xml() {
+        let input = "Before <system-reminder>secret stuff</system-reminder> after";
+        let result = sanitize(input);
+        assert_eq!(result, "Before after");
+    }
+
+    #[test]
+    fn test_sanitize_strips_tables() {
+        let input = "Header\n| col1 | col2 |\n| --- | --- |\n| a | b |\nFooter";
+        let result = sanitize(input);
+        // strip_tables removes table rows, compact collapses multi-whitespace
+        // but a single \n between Header and Footer doesn't trigger compaction
+        assert!(!result.contains("col1"));
+        assert!(result.contains("Header"));
+        assert!(result.contains("Footer"));
+    }
+
+    #[test]
+    fn test_sanitize_strips_interrupted_and_continuation() {
+        assert_eq!(
+            sanitize("Hello [Request interrupted by user] world"),
+            "Hello world"
+        );
+        assert_eq!(
+            sanitize("Keep this. This session is being continued from a previous conversation and more"),
+            "Keep this."
+        );
+    }
+
+    // -- parse_session_file tests --
+
+    #[test]
+    fn test_parse_extracts_custom_title() {
+        let content = format!(
+            "{}\n{}\n",
+            r#"{"type":"custom-title","customTitle":"My Title"}"#,
+            jsonl_line("user", "user", "hello world test message", "2025-01-15T10:00:00Z", None, None),
+        );
+        let f = write_tempfile(&content);
+        let (info, chunks) = parse_session_file(f.path());
+        assert_eq!(info.custom_title.as_deref(), Some("My Title"));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].role, "user");
+    }
+
+    #[test]
+    fn test_parse_extracts_cwd() {
+        let content = format!(
+            "{}\n",
+            jsonl_line("user", "user", "hello world test message", "2025-01-15T10:00:00Z", None, Some("/Users/me/src/dash-search-debugger")),
+        );
+        let f = write_tempfile(&content);
+        let (info, _) = parse_session_file(f.path());
+        assert_eq!(info.cwd.as_deref(), Some("/Users/me/src/dash-search-debugger"));
+    }
+
+    #[test]
+    fn test_parse_last_branch_wins() {
+        let content = format!(
+            "{}\n{}\n{}\n",
+            jsonl_line("user", "user", "first user message here", "2025-01-15T10:00:00Z", Some("branch-a"), None),
+            jsonl_line("assistant", "assistant", "first assistant response here", "2025-01-15T10:01:00Z", Some("branch-b"), None),
+            jsonl_line("user", "user", "second user message here", "2025-01-15T10:02:00Z", Some("branch-c"), None),
+        );
+        let f = write_tempfile(&content);
+        let (_, chunks) = parse_session_file(f.path());
+        assert_eq!(chunks.len(), 3);
+        // Last chunk has branch-c
+        assert_eq!(chunks[2].git_branch.as_deref(), Some("branch-c"));
+        // The last branch in the full sequence is branch-c
+        let last_branch = chunks.iter().filter_map(|c| c.git_branch.as_deref()).last();
+        assert_eq!(last_branch, Some("branch-c"));
+    }
+
+    #[test]
+    fn test_parse_skips_short_and_long_text() {
+        let short = "hi"; // < MIN_CHUNK_CODEPOINTS
+        let long = "x".repeat(MAX_CHUNK_CODEPOINTS + 1);
+        let ok = "this is a valid chunk of text";
+        let content = format!(
+            "{}\n{}\n{}\n",
+            jsonl_line("user", "user", short, "2025-01-15T10:00:00Z", None, None),
+            jsonl_line("user", "user", &long, "2025-01-15T10:01:00Z", None, None),
+            jsonl_line("user", "user", ok, "2025-01-15T10:02:00Z", None, None),
+        );
+        let f = write_tempfile(&content);
+        let (_, chunks) = parse_session_file(f.path());
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("valid chunk"));
+    }
+
+    #[test]
+    fn test_parse_empty_file() {
+        let f = write_tempfile("");
+        let (info, chunks) = parse_session_file(f.path());
+        assert!(info.custom_title.is_none());
+        assert!(info.cwd.is_none());
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_nonexistent_file() {
+        let (info, chunks) = parse_session_file(Path::new("/nonexistent/file.jsonl"));
+        assert!(info.custom_title.is_none());
+        assert!(chunks.is_empty());
+    }
+
+    // -- decode_project_name tests --
+
+    #[test]
+    fn test_decode_project_name() {
+        assert_eq!(decode_project_name("-Users-eider-src-server"), "Users/eider/src/server");
+        // Ambiguous: dashes in the actual path
+        assert_eq!(
+            decode_project_name("-Users-eider-src-dash-search-debugger"),
+            "Users/eider/src/dash/search/debugger"
+        );
+    }
 
     #[test]
     fn test_split_markdown_no_bare_headings() {
