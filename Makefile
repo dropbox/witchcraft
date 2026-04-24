@@ -23,6 +23,7 @@ ifeq ($(UNAME_S),Darwin)
 else ifeq ($(UNAME_S),Linux)
   CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
   NAPI_FEATURES := t5-quantized,fbgemm,napi
+  PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
   RUSTFLAGS_EXTRA :=
   TARGET :=
 endif
@@ -120,7 +121,6 @@ nfcorpus: datasets/nfcorpus.tsv
 
 nfcorpus-score: testset/nfcorpus/questions.test.tsv testset/nfcorpus/questions.test.tsv testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
 	make warp-cli EXTRA_FEATURES=deterministic
-	$(CLI_BIN) hybridcsv testset/nfcorpus/questions.test.tsv warp-results.txt
 	echo ensuring presence of pytrec-eval...
 	uv pip install pytrec-eval 2>/dev/null
 	echo running queries...

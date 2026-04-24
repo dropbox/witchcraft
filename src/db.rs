@@ -9,6 +9,8 @@ use uuid::Uuid;
 use super::sql_generator::build_filter_sql_and_params;
 
 const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
+const APP_ID: i32 = 0x07DB_DA55;
+const SCHEMA_VERSION: i32 = 8;
 
 pub struct DB {
     db_fn: PathBuf,
@@ -26,14 +28,104 @@ impl DB {
         self.recreated
     }
 
-    pub fn set_mmap_size(&self, bytes: i64) -> SQLResult<()> {
-        self.conn().pragma_update(None, "mmap_size", bytes)?;
+    fn configure(connection: &Connection) -> SQLResult<()> {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
+        Ok(())
+    }
+
+    fn schema_matches(connection: &Connection) -> bool {
+        let app_id: SQLResult<i32> =
+            connection.query_row("PRAGMA application_id;", [], |r| r.get(0));
+        let user_version: SQLResult<i32> =
+            connection.query_row("PRAGMA user_version;", [], |r| r.get(0));
+        matches!(
+            (app_id, user_version),
+            (Ok(a), Ok(v)) if a == APP_ID && v == SCHEMA_VERSION
+        )
+    }
+
+    fn create_schema(connection: &Connection) -> SQLResult<()> {
+        connection.execute_batch(&format!(
+            "PRAGMA application_id = {APP_ID};
+             PRAGMA user_version = {SCHEMA_VERSION};
+
+             CREATE TABLE document(
+                 uuid TEXT NOT NULL PRIMARY KEY,
+                 date TEXT NOT NULL,
+                 metadata JSON,
+                 hash TEXT CHECK (length(hash) = {HASH_CHARS}),
+                 body TEXT,
+                 lens TEXT);
+
+             CREATE INDEX document_index ON document(hash);
+
+             CREATE VIRTUAL TABLE document_fts
+                 USING fts5(body, content='document', content_rowid='rowid');
+             INSERT INTO document_fts(document_fts) VALUES('rebuild');
+
+             CREATE TRIGGER document_fts_insert AFTER INSERT ON document
+             BEGIN
+                 INSERT INTO document_fts(rowid, body) VALUES (new.rowid, new.body);
+             END;
+
+             CREATE TRIGGER document_fts_delete AFTER DELETE ON document
+             BEGIN
+                 INSERT INTO document_fts(document_fts, rowid, body)
+                     VALUES('delete', old.rowid, old.body);
+             END;
+
+             CREATE TRIGGER document_fts_update AFTER UPDATE ON document
+             BEGIN
+                 INSERT INTO document_fts(document_fts, rowid, body)
+                     VALUES('delete', old.rowid, old.body);
+                 INSERT INTO document_fts(rowid, body) VALUES (new.rowid, new.body);
+             END;
+
+             CREATE TABLE chunk(
+                 hash TEXT PRIMARY KEY CHECK (length(hash) = {HASH_CHARS}),
+                 model TEXT,
+                 embeddings BLOB NOT NULL,
+                 counts TEXT NOT NULL);
+
+             CREATE TRIGGER document_after_delete AFTER DELETE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = OLD.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
+             END;
+
+             CREATE TRIGGER document_after_update AFTER UPDATE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = OLD.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
+             END;
+
+             CREATE TABLE generation(
+                 id INTEGER PRIMARY KEY,
+                 level INTEGER NOT NULL,
+                 num_embeddings INTEGER NOT NULL,
+                 min_chunk_rowid INTEGER NOT NULL,
+                 max_chunk_rowid INTEGER NOT NULL,
+                 created TEXT NOT NULL);
+
+             CREATE TABLE bucket(
+                 id INTEGER PRIMARY KEY,
+                 generation_id INTEGER NOT NULL REFERENCES generation(id),
+                 center BLOB NOT NULL,
+                 indices BLOB NOT NULL,
+                 residuals BLOB NOT NULL);"
+        ))?;
         Ok(())
     }
 
     pub fn new_reader(db_fn: PathBuf) -> SQLResult<Self> {
         let connection =
             Connection::open_with_flags(db_fn.clone(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             db_fn,
             connection: Some(connection),
@@ -42,39 +134,25 @@ impl DB {
         })
     }
 
-    pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
-        const APP_ID: i32 = 0x07DB_DA55;
-        const EXPECTED_VERSION: i32 = 8;
-
-        let mut first_creation = !db_fn.exists();
-        let connection = Connection::open(&db_fn)?;
-
+    fn integrity_ok(connection: &Connection) -> bool {
         let status: SQLResult<String> =
             connection.query_row("PRAGMA quick_check;", [], |row| row.get(0));
-        let db_ok = match status {
-            Ok(text) => text.trim().eq_ignore_ascii_case("ok"),
-            Err(_e) => false,
-        };
+        matches!(status, Ok(text) if text.trim().eq_ignore_ascii_case("ok"))
+    }
 
-        let schema_ok = if first_creation {
-            true
-        } else {
-            let app_id: SQLResult<i32> =
-                connection.query_row("PRAGMA application_id;", [], |r| r.get(0));
-            let user_version: SQLResult<i32> =
-                connection.query_row("PRAGMA user_version;", [], |r| r.get(0));
-            matches!((app_id, user_version),
-                (Ok(a), Ok(v)) if a == APP_ID && v == EXPECTED_VERSION && a != 0 && v != 0
-            )
-        };
+    fn open_internal(db_fn: PathBuf, fast: bool) -> SQLResult<Self> {
+        let mut first_creation = !db_fn.exists();
+        let mut connection = Connection::open(&db_fn)?;
+
+        let db_ok = fast || first_creation || Self::integrity_ok(&connection);
+        let schema_ok = first_creation || Self::schema_matches(&connection);
 
         let mut recreated = false;
-        let connection = if db_ok && schema_ok {
-            connection
-        } else {
+        if !db_ok || !schema_ok {
             warn!(
-                "warp database {} corrupted or schema mismatch, recreating it!",
-                db_fn.display()
+                "warp database {} {}, recreating!",
+                db_fn.display(),
+                if !db_ok { "corrupted" } else { "schema mismatch" }
             );
             recreated = !first_creation;
             connection.close().map_err(|(_conn, e)| e)?;
@@ -82,81 +160,16 @@ impl DB {
                 .map_err(|_e| rusqlite::Error::InvalidPath(db_fn.clone()))?;
             let _ = std::fs::remove_file(db_fn.with_extension("wal"));
             let _ = std::fs::remove_file(db_fn.with_extension("shm"));
+            connection = Connection::open(&db_fn)?;
             first_creation = true;
-
-            Connection::open(&db_fn)?
-        };
-
-        if first_creation {
-            connection.execute_batch(&format!(
-                "PRAGMA application_id = {APP_ID}; PRAGMA user_version = {EXPECTED_VERSION}"
-            ))?;
         }
 
-        // Enable WAL mode for better concurrency and performance
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Self::configure(&connection)?;
 
-        let query = format!(
-            "CREATE TABLE IF NOT EXISTS document(uuid TEXT NOT NULL PRIMARY KEY,
-            date TEXT NOT NULL,
-            metadata JSON, hash TEXT
-            CHECK (length(hash) = {HASH_CHARS}),
-            body TEXT,
-            lens TEXT)"
-        );
-        connection.execute(&query, ())?;
+        if first_creation {
+            Self::create_schema(&connection)?;
+        }
 
-        let query = "CREATE INDEX IF NOT EXISTS document_index ON document(hash)";
-        connection.execute(query, ())?;
-
-        let query = "CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(body, content='document', content_rowid='rowid')";
-        connection.execute(query, ())?;
-
-        let query = "INSERT INTO document_fts(document_fts) VALUES('rebuild')";
-        connection.execute(query, ())?;
-
-        let query = format!(
-            "CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY
-            CHECK (length(hash) = {HASH_CHARS}),
-            model TEXT,
-            embeddings BLOB NOT NULL,
-            counts TEXT NOT NULL)"
-        );
-        connection.execute(&query, ())?;
-
-
-        let query = "CREATE TRIGGER IF NOT EXISTS document_after_delete
-            AFTER DELETE ON document
-            BEGIN
-              DELETE FROM chunk
-              WHERE hash = OLD.hash
-                AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
-            END";
-        connection.execute(query, ())?;
-
-        let query = "CREATE TRIGGER IF NOT EXISTS document_after_update
-            AFTER UPDATE ON document
-            BEGIN
-              DELETE FROM chunk
-              WHERE hash = OLD.hash
-                AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
-            END";
-        connection.execute(query, ())?;
-
-        let query = "CREATE TABLE IF NOT EXISTS generation(
-            id INTEGER PRIMARY KEY,
-            level INTEGER NOT NULL,
-            num_embeddings INTEGER NOT NULL,
-            min_chunk_rowid INTEGER NOT NULL,
-            max_chunk_rowid INTEGER NOT NULL,
-            created TEXT NOT NULL)";
-        connection.execute(query, ())?;
-
-        let query = "CREATE TABLE IF NOT EXISTS bucket(id INTEGER PRIMARY KEY,
-            generation_id INTEGER NOT NULL REFERENCES generation(id),
-            center BLOB NOT NULL, indices BLOB NOT NULL, residuals BLOB NOT NULL)";
-        connection.execute(query, ())?;
         Ok(Self {
             db_fn,
             connection: Some(connection),
@@ -165,17 +178,23 @@ impl DB {
         })
     }
 
+    /// Open with integrity check — safe for in-process use.
+    pub fn new(db_fn: PathBuf) -> SQLResult<Self> {
+        Self::open_internal(db_fn, false)
+    }
+
+    /// Open without integrity check — for CLI batch operations where startup
+    /// latency on large databases is prohibitive.
+    pub fn new_fast(db_fn: PathBuf) -> SQLResult<Self> {
+        Self::open_internal(db_fn, true)
+    }
+
     fn clear_inner(&mut self) -> SQLResult<()> {
         self.execute("DELETE FROM document")?;
         self.execute("DELETE FROM chunk")?;
         self.execute("DELETE FROM bucket")?;
         self.execute("DELETE FROM generation")?;
         self.execute("VACUUM")?;
-        Ok(())
-    }
-
-    pub fn refresh_ft(&mut self) -> SQLResult<()> {
-        self.execute("INSERT INTO document_fts(document_fts) VALUES('rebuild')")?;
         Ok(())
     }
 

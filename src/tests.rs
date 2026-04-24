@@ -75,7 +75,6 @@ mod tests {
         }
         for round in 0..3 {
             crate::embed_chunks(&db, &embedder, None).unwrap();
-            db.refresh_ft().unwrap();
             for (i, (q, pos)) in QUERIES.iter().enumerate() {
                 let use_fulltext = round == 0;
                 println!("searching for {q}");
@@ -373,7 +372,6 @@ mod tests {
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
         crate::index_chunks(&db, &device).unwrap();
-        db.refresh_ft().unwrap();
 
         // Phase 2: add more docs to create a second level
         let extra_facts = [
@@ -388,7 +386,6 @@ mod tests {
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
         crate::index_chunks(&db, &device).unwrap();
-        db.refresh_ft().unwrap();
 
         // Verify generations span multiple levels
         let levels: Vec<(u32, usize)> = {

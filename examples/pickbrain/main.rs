@@ -1014,9 +1014,7 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        let end = max.saturating_sub(3);
-        // Back up to a char boundary
-        let end = s.floor_char_boundary(end);
+        let end = s.floor_char_boundary(max.saturating_sub(3));
         format!("{}...", &s[..end])
     }
 }

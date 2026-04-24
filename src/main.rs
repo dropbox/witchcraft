@@ -82,7 +82,6 @@ pub fn bulk_search(
     outputname: std::path::PathBuf,
     use_fulltext: bool,
 ) -> Result<()> {
-    db.set_mmap_size(512 * 1024 * 1024)?;
     let file = File::open(csvname)?;
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(b'\t')
@@ -193,21 +192,21 @@ fn main() -> Result<()> {
     let db_name = std::path::PathBuf::from("mydb.sqlite");
 
     if args.len() == 3 && args[1] == "readcsv" {
-        let mut db = DB::new(db_name).unwrap();
+        let mut db = DB::new_fast(db_name).unwrap();
         let csvname = &args[2];
         read_csv(&mut db, csvname.into()).unwrap();
     } else if args.len() == 2 && &args[1] == "embed" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
-        let db = DB::new(db_name).unwrap();
+        let db = DB::new_fast(db_name).unwrap();
         let _got = witchcraft::embed_chunks(&db, &embedder, None).unwrap();
     } else if args.len() == 2 && &args[1] == "index" {
         let device = witchcraft::make_device();
-        let db = DB::new(db_name).unwrap();
+        let db = DB::new_fast(db_name).unwrap();
         witchcraft::index_chunks(&db, &device).unwrap();
     } else if args.len() == 2 && &args[1] == "reindex" {
         let device = witchcraft::make_device();
-        let db = DB::new(db_name).unwrap();
+        let db = DB::new_fast(db_name).unwrap();
         witchcraft::full_index(&db, &device).unwrap();
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
         let device = witchcraft::make_device();
@@ -256,7 +255,7 @@ fn main() -> Result<()> {
             println!("`{}': score={}", args[3 + i], *score);
         }
     } else if args.len() == 2 && &args[1] == "clear" {
-        let mut db = DB::new(db_name).unwrap();
+        let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
         eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);
