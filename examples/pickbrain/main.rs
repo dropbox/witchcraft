@@ -516,12 +516,8 @@ fn search_tui(
                                     &r.session_id
                                 };
                                 meta_spans.push(Span::styled(
-                                    format!("  {source_label} {short_sid}"),
+                                    format!("  {source_label} {short_sid}  turn {}", r.turn),
                                     Style::default().fg(Color::Magenta),
-                                ));
-                                meta_spans.push(Span::styled(
-                                    format!("  turn {}", r.turn),
-                                    Style::default().fg(Color::DarkGray),
                                 ));
                             }
                             let match_role = matched_tm.map(|tm| tm.role.as_str()).unwrap_or("");
