@@ -1095,7 +1095,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
             let n = bpe.ceil() as u32;
             let qn = stretch_rows(&embeddings)?.quantize(n)?.dequantize(n)?;
             let min_qn_acc = rowwise_cosine_min(&embeddings, &qn)?;
-            println!("haar reconstruction accuracy={min_acc} compare at q{n}_acc={min_qn_acc}");
+            debug!("haar reconstruction accuracy={min_acc} compare at q{n}_acc={min_qn_acc}");
         }
 
         let counts = counts
