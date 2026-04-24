@@ -636,53 +636,65 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
         }
     }
 
-    let mut gen_query = db.query("SELECT id, level, pq_groups_log2 FROM generation ORDER BY level, id")?;
-    let gens: Vec<(i64, u32, u32)> = gen_query
-        .query_map((), |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?)))?
+    let mut center_query = db.query(
+        "SELECT g.id, g.pq_groups_log2, b.id, length(b.residuals) / ?1, b.center
+         FROM generation g
+         LEFT JOIN bucket b ON b.generation_id = g.id
+         ORDER BY g.level, g.id, b.id",
+    )?;
+    let rows: Vec<(i64, u32, Option<u32>, Option<usize>, Option<Vec<u8>>)> = center_query
+        .query_map((RESIDUAL_BYTES as i64,), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
+    drop(center_query);
 
-    let mut all = Vec::with_capacity(gens.len());
+    let mut all = Vec::new();
+    let mut cur_gen_id = -1i64;
+    let mut cur_pq_log2 = 0u32;
+    let mut bucket_ids: Vec<u32> = vec![];
+    let mut sizes: Vec<usize> = vec![];
+    let mut centers: Vec<Tensor> = vec![];
 
-    for (gen_id, _level, pq_groups_log2) in gens {
-        let mut center_query = db.query(
-            "SELECT id, length(residuals) / ?1, center FROM bucket
-             WHERE generation_id = ?2 ORDER BY id",
-        )?;
-        let mut bucket_ids = vec![];
-        let mut sizes = vec![];
-        let mut centers = vec![];
-        for result in center_query.query_map((RESIDUAL_BYTES as i64, gen_id), |row| {
-            let id = row.get(0)?;
-            let size = row.get(1)?;
-            let blob: Vec<u8> = row.get(2)?;
-            Ok((id, size, blob))
-        })? {
-            let (id, size, center) = result?;
-            bucket_ids.push(id);
-            sizes.push(size);
-            let t = Tensor::from_f32_bytes(&center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
-            centers.push(t);
-        }
+    let mut flush_gen = |gen_id: i64, pq_log2: u32,
+                         bucket_ids: &mut Vec<u32>, sizes: &mut Vec<usize>,
+                         centers: &mut Vec<Tensor>| -> Result<()> {
+        if gen_id < 0 { return Ok(()); }
         let centers_matrix = if !centers.is_empty() {
-            Tensor::stack(&centers, 0)?.to_device(device)?
+            Tensor::stack(centers, 0)?.to_device(device)?
         } else {
             Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?
         };
-
         let pq = if !bucket_ids.is_empty() {
-            detect_pq_structure(&bucket_ids, &centers_matrix, &sizes, pq_groups_log2, device)
+            detect_pq_structure(bucket_ids, &centers_matrix, sizes, pq_log2, device)
         } else {
             None
         };
-
         all.push(GenerationCentroids {
             generation_id: gen_id,
-            bucket_ids,
-            sizes,
+            bucket_ids: std::mem::take(bucket_ids),
+            sizes: std::mem::take(sizes),
             centers_matrix,
             pq,
         });
+        centers.clear();
+        Ok(())
+    };
+
+    for (gen_id, pq_log2, bucket_id, size, center_blob) in &rows {
+        if *gen_id != cur_gen_id {
+            flush_gen(cur_gen_id, cur_pq_log2, &mut bucket_ids, &mut sizes, &mut centers)?;
+            cur_gen_id = *gen_id;
+            cur_pq_log2 = *pq_log2;
+        }
+        if let (Some(bid), Some(sz), Some(blob)) = (bucket_id, size, center_blob) {
+            bucket_ids.push(*bid);
+            sizes.push(*sz);
+            let t = Tensor::from_f32_bytes(blob, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
+            centers.push(t);
+        }
     }
+    flush_gen(cur_gen_id, cur_pq_log2, &mut bucket_ids, &mut sizes, &mut centers)?;
 
     debug!(
         "reading centers for {} generations took {} ms",
