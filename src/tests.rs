@@ -642,8 +642,7 @@ mod tests {
         Ok(())
     }
 
-    /// Regression: the centroid cache was a single global slot. Searching an
-    /// empty DB first cached an empty generation list, causing a subsequent
+    /// Searching an empty DB first cached an empty generation list, causing a subsequent
     /// search on a populated DB to skip all indexed embeddings.
     #[test]
     fn test_cross_db_cache_isolation() -> anyhow::Result<()> {
