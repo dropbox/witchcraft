@@ -28,6 +28,10 @@ impl DB {
         self.recreated
     }
 
+    pub fn path(&self) -> &PathBuf {
+        &self.db_fn
+    }
+
     fn configure(connection: &Connection) -> SQLResult<()> {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;

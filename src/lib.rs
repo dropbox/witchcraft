@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use rand::SeedableRng;
 use rusqlite::Statement;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::RwLock;
 // Conditionally compile T5 encoder based on features
 #[cfg(feature = "t5-quantized")]
@@ -490,17 +491,18 @@ struct GenerationCentroids {
 
 type CentersCache = Vec<GenerationCentroids>;
 
-static CACHED: Lazy<RwLock<Option<CentersCache>>> = Lazy::new(|| RwLock::new(None));
+static CACHED: Lazy<RwLock<HashMap<PathBuf, CentersCache>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
-fn invalidate_center_cache() {
-    *CACHED.write().unwrap() = None;
+fn invalidate_center_cache(db: &DB) {
+    CACHED.write().unwrap().remove(db.path());
 }
 
 fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<GenerationCentroids>> {
     let now = std::time::Instant::now();
     {
         let cache = CACHED.read().unwrap();
-        if let Some(cached) = &*cache {
+        if let Some(cached) = cache.get(db.path()) {
             debug!(
                 "get_all_generation_centers cache hit ({} generations)",
                 cached.len()
@@ -556,7 +558,7 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
     );
 
     let mut cache = CACHED.write().unwrap();
-    *cache = Some(all.clone());
+    cache.insert(db.path().clone(), all.clone());
     Ok(all)
 }
 
@@ -1391,7 +1393,7 @@ fn write_buckets_for_range(
 pub fn full_index(db: &DB, device: &Device) -> Result<()> {
     db.execute("DELETE FROM bucket")?;
     db.execute("DELETE FROM generation")?;
-    invalidate_center_cache();
+    invalidate_center_cache(db);
     index_chunks(db, device)
 }
 
@@ -1465,7 +1467,7 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     build_layer(db, device, target_level, min_rowid, max_chunk_rowid)?;
 
     db.commit_transaction()?;
-    invalidate_center_cache();
+    invalidate_center_cache(db);
     db.checkpoint();
     Ok(())
 }
