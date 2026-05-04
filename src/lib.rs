@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 use rand::SeedableRng;
 use rusqlite::Statement;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::RwLock;
 // Conditionally compile T5 encoder based on features
 #[cfg(feature = "t5-quantized")]
@@ -56,7 +57,7 @@ use progress_reporter::ProgressReporter;
 pub mod types;
 pub use types::SqlStatementInternal;
 
-mod sql_generator;
+pub mod sql_generator;
 use sql_generator::build_filter_sql_and_params;
 
 #[cfg(feature = "napi")]
@@ -83,12 +84,19 @@ const LSM_FANOUT: usize = 2;
 pub type DocPtr = (u32, u32);
 
 pub fn make_device() -> Device {
-    // Metal only works on Apple Silicon (ARM), not Intel x86_64
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         match Device::new_metal(0) {
             Ok(device) => device,
             Err(v) => {
                 warn!("unable to create metal device: {v}");
+                Device::Cpu
+            }
+        }
+    } else if cfg!(feature = "cuda") {
+        match Device::new_cuda(0) {
+            Ok(device) => device,
+            Err(v) => {
+                warn!("unable to create cuda device: {v}");
                 Device::Cpu
             }
         }
@@ -483,17 +491,18 @@ struct GenerationCentroids {
 
 type CentersCache = Vec<GenerationCentroids>;
 
-static CACHED: Lazy<RwLock<Option<CentersCache>>> = Lazy::new(|| RwLock::new(None));
+static CACHED: Lazy<RwLock<HashMap<PathBuf, CentersCache>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
-fn invalidate_center_cache() {
-    *CACHED.write().unwrap() = None;
+fn invalidate_center_cache(db: &DB) {
+    CACHED.write().unwrap().remove(db.path());
 }
 
 fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<GenerationCentroids>> {
     let now = std::time::Instant::now();
     {
         let cache = CACHED.read().unwrap();
-        if let Some(cached) = &*cache {
+        if let Some(cached) = cache.get(db.path()) {
             debug!(
                 "get_all_generation_centers cache hit ({} generations)",
                 cached.len()
@@ -549,7 +558,7 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
     );
 
     let mut cache = CACHED.write().unwrap();
-    *cache = Some(all.clone());
+    cache.insert(db.path().clone(), all.clone());
     Ok(all)
 }
 
@@ -1384,7 +1393,7 @@ fn write_buckets_for_range(
 pub fn full_index(db: &DB, device: &Device) -> Result<()> {
     db.execute("DELETE FROM bucket")?;
     db.execute("DELETE FROM generation")?;
-    invalidate_center_cache();
+    invalidate_center_cache(db);
     index_chunks(db, device)
 }
 
@@ -1458,7 +1467,7 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     build_layer(db, device, target_level, min_rowid, max_chunk_rowid)?;
 
     db.commit_transaction()?;
-    invalidate_center_cache();
+    invalidate_center_cache(db);
     db.checkpoint();
     Ok(())
 }
@@ -1554,6 +1563,9 @@ pub fn search(
     fused.truncate(top_k);
 
     let mut results = vec![];
+    // Stale bucket entries from before a re-chunking may have out-of-range sub_idx
+    // values that clamp to the same position, producing duplicates.
+    let mut seen: HashMap<u32, bool> = HashMap::new();
     let mut body_query = db.query("SELECT metadata,body,lens,date FROM document WHERE rowid = ?1")?;
     for (idx, sub_idx) in fused {
         let tuple : DocPtr = (idx, sub_idx);
@@ -1580,6 +1592,9 @@ pub fn search(
         })?;
 
         let sub = (sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
+        if seen.insert(idx, true).is_some() {
+            continue;
+        }
         results.push((score, metadata, bodies, sub, date));
     }
 

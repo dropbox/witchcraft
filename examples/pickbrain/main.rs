@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod claude_code;
 mod codex;
+mod slack;
 mod watermark;
 
 use witchcraft::{DB, Embedder};
@@ -87,29 +88,44 @@ fn get_ppid(_pid: i32) -> Option<i32> {
     None
 }
 
-fn ingest(db_name: &PathBuf, skip_session: Option<&str>, stale_ms: i64) -> Result<bool> {
+fn ingest(db_name: &PathBuf, skip_session: Option<&str>, stale_ms: i64, types: &[String]) -> Result<bool> {
     let mut db = DB::new(db_name.clone()).unwrap();
+
+    let want = |src: &str| types.is_empty() || types.iter().any(|t| t == src);
 
     if db.was_recreated() {
         watermark::remove(&watermark::claude_path());
         watermark::remove(&watermark::codex_path());
+        slack::remove_watermark();
     }
 
-    // Skip the active session only if its source watermark is fresh
-    let claude_skip = skip_session
-        .filter(|_| watermark::is_fresh(&watermark::claude_path(), stale_ms));
-    let (sessions, memories, authored, configs) =
-        claude_code::ingest_claude_code(&mut db, claude_skip)?;
+    let (sessions, memories, authored, configs) = if want("claude") {
+        let claude_skip = skip_session
+            .filter(|_| watermark::is_fresh(&watermark::claude_path(), stale_ms));
+        claude_code::ingest_claude_code(&mut db, claude_skip)?
+    } else {
+        (0, 0, 0, 0)
+    };
 
-    let codex_sessions = codex::ingest_codex(&mut db)?;
+    let codex_sessions = if want("codex") {
+        codex::ingest_codex(&mut db)?
+    } else {
+        0
+    };
 
-    let total = sessions + memories + authored + configs + codex_sessions;
+    let slack_conversations = if want("slack") {
+        slack::ingest_slack(&mut db)?
+    } else {
+        0
+    };
+
+    let total = sessions + memories + authored + configs + codex_sessions + slack_conversations;
     if total == 0 {
         eprintln!("No new sessions to ingest.");
         return Ok(false);
     }
     eprintln!(
-        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {memories} memory files, {authored} authored files, {configs} config files"
+        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {slack_conversations} slack conversations, {memories} memory files, {authored} authored files, {configs} config files"
     );
     Ok(true)
 }
@@ -143,6 +159,7 @@ struct SearchResult {
     cwd: String,
     source: String,
     branch: String,
+    conv_key: String,
     bodies: Vec<String>,
     match_idx: usize,
     turns: Vec<TurnMeta>,
@@ -229,19 +246,63 @@ fn build_sql_filter(
     branch: Option<&str>,
     exclude: &[String],
     since_ms: Option<i64>,
+    types: &[String],
+    dm_only: bool,
+    no_dm: bool,
+    unread_only: bool,
 ) -> Option<witchcraft::types::SqlStatementInternal> {
     use witchcraft::types::*;
     let mut conditions: Vec<SqlStatementInternal> = Vec::new();
     if let Some(id) = session {
+        let name = id.strip_prefix('#').unwrap_or(id);
+        let thread_ts = name.strip_prefix("thr:").unwrap_or(name);
+        let thread_like = format!("%-{thread_ts}");
         conditions.push(SqlStatementInternal {
-            statement_type: SqlStatementType::Condition,
-            condition: Some(SqlConditionInternal {
-                key: "$.session_id".to_string(),
-                operator: SqlOperator::Equals,
-                value: Some(SqlValue::String(id.to_string())),
-            }),
-            logic: None,
-            statements: None,
+            statement_type: SqlStatementType::Group,
+            condition: None,
+            logic: Some(SqlLogic::Or),
+            statements: Some(vec![
+                SqlStatementInternal {
+                    statement_type: SqlStatementType::Condition,
+                    condition: Some(SqlConditionInternal {
+                        key: "$.session_id".to_string(),
+                        operator: SqlOperator::Equals,
+                        value: Some(SqlValue::String(id.to_string())),
+                    }),
+                    logic: None,
+                    statements: None,
+                },
+                SqlStatementInternal {
+                    statement_type: SqlStatementType::Condition,
+                    condition: Some(SqlConditionInternal {
+                        key: "$.channel_id".to_string(),
+                        operator: SqlOperator::Equals,
+                        value: Some(SqlValue::String(id.to_string())),
+                    }),
+                    logic: None,
+                    statements: None,
+                },
+                SqlStatementInternal {
+                    statement_type: SqlStatementType::Condition,
+                    condition: Some(SqlConditionInternal {
+                        key: "$.channel_name".to_string(),
+                        operator: SqlOperator::Equals,
+                        value: Some(SqlValue::String(name.to_string())),
+                    }),
+                    logic: None,
+                    statements: None,
+                },
+                SqlStatementInternal {
+                    statement_type: SqlStatementType::Condition,
+                    condition: Some(SqlConditionInternal {
+                        key: "$.conv_key".to_string(),
+                        operator: SqlOperator::Like,
+                        value: Some(SqlValue::String(thread_like)),
+                    }),
+                    logic: None,
+                    statements: None,
+                },
+            ]),
         });
     }
     if let Some(br) = branch {
@@ -282,6 +343,75 @@ fn build_sql_filter(
                 key: "date".to_string(),
                 operator: SqlOperator::GreaterThanOrEquals,
                 value: Some(SqlValue::String(cutoff_iso)),
+            }),
+            logic: None,
+            statements: None,
+        });
+    }
+    if !types.is_empty() {
+        if types.len() == 1 {
+            conditions.push(SqlStatementInternal {
+                statement_type: SqlStatementType::Condition,
+                condition: Some(SqlConditionInternal {
+                    key: "$.source".to_string(),
+                    operator: SqlOperator::Equals,
+                    value: Some(SqlValue::String(types[0].clone())),
+                }),
+                logic: None,
+                statements: None,
+            });
+        } else {
+            let stmts: Vec<SqlStatementInternal> = types
+                .iter()
+                .map(|t| SqlStatementInternal {
+                    statement_type: SqlStatementType::Condition,
+                    condition: Some(SqlConditionInternal {
+                        key: "$.source".to_string(),
+                        operator: SqlOperator::Equals,
+                        value: Some(SqlValue::String(t.clone())),
+                    }),
+                    logic: None,
+                    statements: None,
+                })
+                .collect();
+            conditions.push(SqlStatementInternal {
+                statement_type: SqlStatementType::Group,
+                condition: None,
+                logic: Some(SqlLogic::Or),
+                statements: Some(stmts),
+            });
+        }
+    }
+    if dm_only {
+        conditions.push(SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.is_dm".to_string(),
+                operator: SqlOperator::Equals,
+                value: Some(SqlValue::Number(1.0)),
+            }),
+            logic: None,
+            statements: None,
+        });
+    } else if no_dm {
+        conditions.push(SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.is_dm".to_string(),
+                operator: SqlOperator::Equals,
+                value: Some(SqlValue::Number(0.0)),
+            }),
+            logic: None,
+            statements: None,
+        });
+    }
+    if unread_only {
+        conditions.push(SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.has_unread".to_string(),
+                operator: SqlOperator::Equals,
+                value: Some(SqlValue::Number(1.0)),
             }),
             logic: None,
             statements: None,
@@ -332,6 +462,7 @@ fn parse_search_results(
                 cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
                 source: meta["source"].as_str().unwrap_or("claude").to_string(),
                 branch: meta["branch"].as_str().unwrap_or("").to_string(),
+                conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
                 bodies,
                 match_idx: idx,
                 turns: turns_arr,
@@ -348,10 +479,60 @@ fn run_search(
     branch: Option<&str>,
     exclude: &[String],
     since_ms: Option<i64>,
+    types: &[String],
+    num_results: usize,
+    dm_only: bool,
+    no_dm: bool,
+    unread_only: bool,
 ) -> Result<(Vec<SearchResult>, u128)> {
     let device = witchcraft::make_device();
     let embedder = witchcraft::Embedder::new(&device, assets)?;
-    run_search_with(&DB::new_reader(db_name.clone()).unwrap(), &embedder, q, session, branch, exclude, since_ms)
+    let db = DB::new_reader(db_name.clone()).unwrap();
+    let sql_filter = build_sql_filter(session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only);
+    let effective_limit = if num_results == 0 { usize::MAX } else { num_results };
+    let now = std::time::Instant::now();
+    let results = if q.is_empty() {
+        use witchcraft::sql_generator::build_filter_sql_and_params;
+        let (filter_sql, params) = build_filter_sql_and_params(sql_filter.as_ref())?;
+        let where_clause = if filter_sql.is_empty() { String::new() } else { format!("WHERE {filter_sql}") };
+        let limit_clause = if num_results == 0 { String::new() } else { " LIMIT ?".to_string() };
+        let sql = format!(
+            "SELECT metadata, body, lens, date FROM document {where_clause} ORDER BY date DESC{limit_clause}",
+        );
+        let mut stmt = db.query(&sql)?;
+        let mut param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p as &dyn rusqlite::ToSql).collect();
+        let limit = num_results as i64;
+        if num_results > 0 {
+            param_refs.push(&limit);
+        }
+        let rows: Vec<(f32, String, Vec<String>, u32, String)> = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                let metadata: String = row.get(0)?;
+                let body: String = row.get(1)?;
+                let lens_str: String = row.get(2)?;
+                let date: String = row.get(3)?;
+                let lens: Vec<usize> = lens_str.split(',').map(|x| x.parse::<usize>().unwrap_or(0)).collect();
+                let bodies: Vec<String> = witchcraft::split_by_codepoints(&body, &lens)
+                    .into_iter().map(|s| s.to_string()).collect();
+                Ok((0.0f32, metadata, bodies, 0u32, date))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    } else {
+        witchcraft::search(
+            &db,
+            &embedder,
+            &mut witchcraft::EmbeddingsCache::new(1),
+            q,
+            0.5,
+            effective_limit,
+            true,
+            sql_filter.as_ref(),
+        )?
+    };
+    let search_ms = now.elapsed().as_millis();
+    Ok((parse_search_results(results), search_ms))
 }
 
 fn run_search_with(
@@ -362,9 +543,13 @@ fn run_search_with(
     branch: Option<&str>,
     exclude: &[String],
     since_ms: Option<i64>,
+    types: &[String],
+    dm_only: bool,
+    no_dm: bool,
+    unread_only: bool,
 ) -> Result<(Vec<SearchResult>, u128)> {
     let mut cache = witchcraft::EmbeddingsCache::new(1);
-    let sql_filter = build_sql_filter(session, branch, exclude, since_ms);
+    let sql_filter = build_sql_filter(session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only);
     let now = std::time::Instant::now();
     let results = witchcraft::search(
         db,
@@ -395,14 +580,26 @@ fn search_tui(
     branch: Option<&str>,
     exclude: &[String],
     since_ms: Option<i64>,
+    types: &[String],
+    num_results: usize,
+    dm_only: bool,
+    no_dm: bool,
+    unread_only: bool,
 ) -> Result<Option<BranchSession>> {
     let device = witchcraft::make_device();
     let embedder = witchcraft::Embedder::new(&device, assets)?;
     let db = DB::new_reader(db_name.clone()).unwrap();
-    let (mut results, mut search_ms) = if let Some(q) = q {
-        run_search_with(&db, &embedder, q, session, branch, exclude, since_ms)?
-    } else {
-        (find_recent_sessions(db_name, branch)?, 0)
+    let (mut results, mut search_ms) = match q {
+        Some(q) if !q.is_empty() => {
+            run_search_with(&db, &embedder, q, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only)?
+        }
+        Some(_) => {
+            // Empty query with filters: use filter-only search
+            run_search(db_name, assets, "", session, branch, exclude, since_ms, types, num_results, dm_only, no_dm, unread_only)?
+        }
+        None => {
+            (find_recent_sessions(db_name, branch)?, 0)
+        }
     };
     if results.is_empty() {
         eprintln!("no results");
@@ -564,7 +761,7 @@ fn search_tui(
                                 .map(|tm| format_date(&tm.timestamp))
                                 .unwrap_or_else(|| r.timestamp.clone());
                             let mut meta_spans = session_meta_spans(
-                                &ts, &r.project, &r.session_id, &r.session_name, &r.source, &r.branch,
+                                &ts, &r.project, &r.session_id, &r.session_name, &r.source, &r.branch, &r.conv_key,
                             );
                             if r.path.ends_with(".md") {
                                 meta_spans.push(Span::styled(
@@ -579,7 +776,9 @@ fn search_tui(
                                 ));
                             }
                             let match_role = matched_tm.map(|tm| tm.role.as_str()).unwrap_or("");
-                            let role_prefix = if match_role == "user" {
+                            let role_prefix = if r.source == "slack" {
+                                ""
+                            } else if match_role == "user" {
                                 "[User] "
                             } else if match_role == "assistant" {
                                 if r.source == "codex" { "[Codex] " } else { "[Claude] " }
@@ -669,7 +868,9 @@ fn search_tui(
                             };
                             lines.push(Line::from(vec![
                                 Span::styled(
-                                    if turn.role == "user" {
+                                    if r.source == "slack" {
+                                        ""
+                                    } else if turn.role == "user" {
                                         "[User] "
                                     } else if r.source == "codex" {
                                         "[Codex] "
@@ -749,7 +950,7 @@ fn search_tui(
                         search_filter.pop();
                         if search_filter.chars().count() >= 3 && search_filter != active_query {
                             if let Ok((new_results, ms)) = run_search_with(
-                                &db, &embedder, &search_filter, session, branch, exclude, since_ms,
+                                &db, &embedder, &search_filter, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only,
                             ) {
                                 active_query = search_filter.clone();
                                 results = new_results;
@@ -774,7 +975,7 @@ fn search_tui(
                         search_filter.push(c);
                         if search_filter.chars().count() >= 3 && search_filter != active_query {
                             if let Ok((new_results, ms)) = run_search_with(
-                                &db, &embedder, &search_filter, session, branch, exclude, since_ms,
+                                &db, &embedder, &search_filter, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only,
                             ) {
                                 active_query = search_filter.clone();
                                 results = new_results;
@@ -996,6 +1197,18 @@ fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
 }
 
 
+/// Extract a display tag from a Slack conv_key.
+/// Thread keys (`thr:CHAN-TS`) → `thr:TS` (the thread timestamp, usable with --session).
+/// Session keys (`sess:CHAN-TS`) → empty (channel + turn is sufficient).
+fn slack_conv_tag(conv_key: &str) -> String {
+    if let Some(rest) = conv_key.strip_prefix("thr:") {
+        if let Some((_chan, ts)) = rest.split_once('-') {
+            return format!("thr:{ts}");
+        }
+    }
+    String::new()
+}
+
 fn strip_body_prefix(s: &str) -> &str {
     s.strip_prefix("[User] ")
         .or_else(|| s.strip_prefix("[Claude] "))
@@ -1029,11 +1242,19 @@ fn search_plain(
     branch: Option<&str>,
     exclude: &[String],
     since_ms: Option<i64>,
+    types: &[String],
+    num_results: usize,
+    dm_only: bool,
+    no_dm: bool,
+    unread_only: bool,
 ) -> Result<()> {
-    let (results, search_ms) = run_search(db_name, assets, q, session, branch, exclude, since_ms)?;
+    let (results, search_ms) = run_search(db_name, assets, q, session, branch, exclude, since_ms, types, num_results, dm_only, no_dm, unread_only)?;
 
     let mut buf = Vec::new();
-    writeln!(buf, "\n[[ {q} ]]")?;
+    let you = slack::cached_self_user()
+        .map(|(_id, name)| format!("  (you: {name})"))
+        .unwrap_or_default();
+    writeln!(buf, "\n[[ {q} ]]{you}")?;
     writeln!(buf, "search completed in {search_ms} ms\n")?;
     for r in &results {
         writeln!(buf, "---")?;
@@ -1047,18 +1268,21 @@ fn search_plain(
             .filter(|tm| !tm.timestamp.is_empty())
             .map(|tm| format_date(&tm.timestamp))
             .unwrap_or_else(|| r.timestamp.clone());
-        let source_label = if r.source == "codex" { "codex" } else { "claude" };
+        let source_label = if r.source == "slack" { "slack" } else if r.source == "codex" { "codex" } else { "claude" };
         let filename = if r.path.ends_with(".md") {
             format!("  {}", r.path)
         } else {
             String::new()
         };
-        let name_info = if !r.session_name.is_empty() {
-            format!(" \"{}\"", r.session_name)
-        } else {
-            String::new()
-        };
-        let session_info = if !r.session_id.is_empty() {
+        let session_info = if r.source == "slack" {
+            let tag = slack_conv_tag(&r.conv_key);
+            format!("  {source_label} {tag}")
+        } else if !r.session_id.is_empty() {
+            let name_info = if !r.session_name.is_empty() {
+                format!(" \"{}\"", r.session_name)
+            } else {
+                String::new()
+            };
             format!("  {source_label} {}{name_info} turn {}", r.session_id, r.turn)
         } else {
             String::new()
@@ -1069,8 +1293,19 @@ fn search_plain(
             String::new()
         };
         writeln!(buf, "{ts}  {}{filename}{session_info}{branch_info}", r.project)?;
-        if !r.session_id.is_empty() && !r.path.is_empty() && !r.turns.is_empty() {
-            // Read only the matched turn + neighbors via byte offsets
+        if r.source == "slack" || r.turns.is_empty() || r.path.is_empty() {
+            // Slack and .md files: use indexed bodies directly
+            let idx = r.match_idx;
+            let start = idx.saturating_sub(1);
+            let end = (idx + 3).min(r.bodies.len());
+            for i in start..end {
+                let prefix = if i == idx { ">>>" } else { "   " };
+                for line in r.bodies[i].lines().filter(|l| !l.is_empty()) {
+                    writeln!(buf, "{prefix} {line}")?;
+                }
+            }
+        } else if !r.session_id.is_empty() {
+            // Claude/Codex: read turns via byte offsets
             let mi = if r.match_idx > 0 { r.match_idx - 1 } else { 0 };
             let ctx_start = mi.saturating_sub(1);
             let ctx_end = (mi + 2).min(r.turns.len());
@@ -1091,12 +1326,6 @@ fn search_plain(
                     }
                 }
             }
-        } else {
-            // Fallback for .md files etc: use indexed bodies
-            let idx = r.match_idx;
-            for line in r.bodies[idx].lines().filter(|l| !l.is_empty()) {
-                writeln!(buf, "  {line}")?;
-            }
         }
     }
     if results.is_empty() {
@@ -1115,6 +1344,7 @@ fn session_meta_spans(
     session_name: &str,
     source: &str,
     branch: &str,
+    conv_key: &str,
 ) -> Vec<ratatui::text::Span<'static>> {
     use ratatui::style::{Color, Style};
     use ratatui::text::Span;
@@ -1123,7 +1353,13 @@ fn session_meta_spans(
         Span::styled(format!("{} ", format_date(date)), Style::default().fg(Color::Green)),
         Span::styled(project.to_string(), Style::default().fg(Color::Cyan)),
     ];
-    if !session_id.is_empty() {
+    if source == "slack" {
+        let tag = slack_conv_tag(conv_key);
+        spans.push(Span::styled(
+            format!("  slack {tag}"),
+            Style::default().fg(Color::Magenta),
+        ));
+    } else if !session_id.is_empty() {
         let source_label = if source == "codex" { "codex" } else { "claude" };
         let short_sid = if session_id.len() > 8 { &session_id[..8] } else { session_id };
         spans.push(Span::styled(
@@ -1226,6 +1462,7 @@ fn find_recent_sessions(db_name: &PathBuf, branch: Option<&str>) -> Result<Vec<S
             cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
             source: meta["source"].as_str().unwrap_or("claude").to_string(),
             branch: meta["branch"].as_str().unwrap_or("").to_string(),
+            conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
             bodies: vec![body.clone()],
             match_idx: 0,
             turns: turns_arr,
@@ -1266,39 +1503,154 @@ fn parse_range(s: &str) -> (usize, usize) {
     }
 }
 
-fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Result<()> {
+fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms: Option<i64>) -> Result<()> {
+    use witchcraft::types::*;
+    use witchcraft::sql_generator::build_filter_sql_and_params;
+
     let db = DB::new_reader(db_name.clone()).unwrap();
+    let name = session_id.strip_prefix('#').unwrap_or(session_id);
 
-    let (turn_start, turn_end) = turns_range.map(parse_range).unwrap_or((0, usize::MAX));
+    // Try as session_id first, then thread conv_key, then channel_id/channel_name
+    let (rows, is_channel) = {
+        let (turn_start, turn_end) = turns_range.map(parse_range).unwrap_or((0, usize::MAX));
+        let thread_ts = name.strip_prefix("thr:").unwrap_or(name);
+        let thread_like = format!("%-{thread_ts}");
 
-    let mut stmt = db.query(
-        "SELECT date, body, json_extract(metadata, '$.turn') as turn
-         FROM document
-         WHERE json_extract(metadata, '$.session_id') = ?1
-         ORDER BY turn",
-    )?;
-    let rows: Vec<(String, String, i64)> = stmt
-        .query_map((session_id,), |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        // Helper: run a filter query and return matched rows
+        fn query_filter(
+            db: &DB,
+            filter: &SqlStatementInternal,
+            order: &str,
+            turn_start: usize,
+            turn_end: usize,
+        ) -> Result<Vec<(String, String, i64)>> {
+            let (filter_sql, params) = build_filter_sql_and_params(Some(filter))?;
+            let sql = format!(
+                "SELECT date, body, json_extract(metadata, '$.turn') as turn
+                 FROM document WHERE {filter_sql} ORDER BY {order}"
+            );
+            let mut stmt = db.query(&sql)?;
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p as &dyn rusqlite::ToSql).collect();
+            let rows: Vec<(String, String, i64)> = stmt
+                .query_map(param_refs.as_slice(), |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .filter_map(|r| r.ok())
+                .filter(|(_, _, t)| (*t as usize) >= turn_start && (*t as usize) <= turn_end)
+                .collect();
+            Ok(rows)
+        }
+
+        // 1. Try as Claude/Codex session_id
+        let session_match = SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.session_id".to_string(),
+                operator: SqlOperator::Equals,
+                value: Some(SqlValue::String(session_id.to_string())),
+            }),
+            logic: None,
+            statements: None,
+        };
+        let rows = query_filter(&db, &session_match, "turn", turn_start, turn_end)?;
+        if !rows.is_empty() {
+            (rows, false)
+        } else {
+            // 2. Try as Slack thread TS (conv_key LIKE %-<ts>)
+            let thread_match = SqlStatementInternal {
+                statement_type: SqlStatementType::Condition,
+                condition: Some(SqlConditionInternal {
+                    key: "$.conv_key".to_string(),
+                    operator: SqlOperator::Like,
+                    value: Some(SqlValue::String(thread_like)),
+                }),
+                logic: None,
+                statements: None,
+            };
+            let rows = query_filter(&db, &thread_match, "date", turn_start, turn_end)?;
+            if !rows.is_empty() {
+                (rows, true)
+            } else {
+            // 3. Try as channel_id/channel_name
+            let channel_match = SqlStatementInternal {
+                statement_type: SqlStatementType::Group,
+                condition: None,
+                logic: Some(SqlLogic::Or),
+                statements: Some(vec![
+                    SqlStatementInternal {
+                        statement_type: SqlStatementType::Condition,
+                        condition: Some(SqlConditionInternal {
+                            key: "$.channel_id".to_string(),
+                            operator: SqlOperator::Equals,
+                            value: Some(SqlValue::String(name.to_string())),
+                        }),
+                        logic: None,
+                        statements: None,
+                    },
+                    SqlStatementInternal {
+                        statement_type: SqlStatementType::Condition,
+                        condition: Some(SqlConditionInternal {
+                            key: "$.channel_name".to_string(),
+                            operator: SqlOperator::Equals,
+                            value: Some(SqlValue::String(name.to_string())),
+                        }),
+                        logic: None,
+                        statements: None,
+                    },
+                ]),
+            };
+            let since_filter = since_ms.map(|ms| {
+                let cutoff_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+                    - ms / 1000;
+                let cutoff_iso = chrono::DateTime::from_timestamp(cutoff_secs, 0)
+                    .unwrap()
+                    .to_rfc3339();
+                SqlStatementInternal {
+                    statement_type: SqlStatementType::Condition,
+                    condition: Some(SqlConditionInternal {
+                        key: "date".to_string(),
+                        operator: SqlOperator::GreaterThanOrEquals,
+                        value: Some(SqlValue::String(cutoff_iso)),
+                    }),
+                    logic: None,
+                    statements: None,
+                }
+            });
+            let filters: Vec<SqlStatementInternal> =
+                [Some(channel_match), since_filter].into_iter().flatten().collect();
+            let combined = if filters.len() == 1 {
+                filters.into_iter().next().unwrap()
+            } else {
+                SqlStatementInternal {
+                    statement_type: SqlStatementType::Group,
+                    condition: None,
+                    logic: Some(SqlLogic::And),
+                    statements: Some(filters),
+                }
+            };
+            let rows = query_filter(&db, &combined, "turn DESC", turn_start, turn_end)?;
+            (rows, true)
+        }}
+    };
 
     if rows.is_empty() {
-        eprintln!("No session found for {session_id}");
+        eprintln!("No session or channel found for {session_id}");
         std::process::exit(1);
     }
 
     let mut buf = Vec::new();
     for (date, body, turn) in &rows {
-        let t = *turn as usize;
-        if t < turn_start || t > turn_end {
-            continue;
-        }
         writeln!(buf, "---")?;
-        writeln!(buf, "turn {t}  {}", format_date(date))?;
+        if is_channel {
+            writeln!(buf, "conv {}  {}", *turn, format_date(date))?;
+        } else {
+            writeln!(buf, "turn {}  {}", *turn, format_date(date))?;
+        }
         for line in body.lines().skip_while(|l| {
-            l.starts_with('[') && !l.starts_with("[User]") && !l.starts_with("[Claude]")
+            !is_channel && l.starts_with('[') && !l.starts_with("[User]") && !l.starts_with("[Claude]")
         }) {
             writeln!(buf, "{line}")?;
         }
@@ -1331,8 +1683,13 @@ fn main() -> Result<()> {
     let mut branch_filter: Option<String> = None;
     let mut exclude_sessions: Vec<String> = Vec::new();
     let mut since_ms: Option<i64> = None;
+    let mut type_filter: Vec<String> = Vec::new();
+    let mut num_results: Option<usize> = None;
     let mut dump_session: Option<String> = None;
     let mut turns_range: Option<String> = None;
+    let mut dm_only = false;
+    let mut no_dm = false;
+    let mut unread_only = false;
     let mut current = false;
     let mut exclude_current = false;
     let mut query_args: Vec<&str> = Vec::new();
@@ -1342,7 +1699,7 @@ fn main() -> Result<()> {
             "--help" | "-h" => {
                 eprintln!("Usage:");
                 eprintln!("  pickbrain [options] [query]");
-                eprintln!("  pickbrain --dump <UUID> [--turns N-M]");
+                eprintln!("  pickbrain --dump <session-id|channel|thr:ts> [--turns N-M] [--since T]");
                 eprintln!("  pickbrain --nuke");
                 eprintln!();
                 eprintln!("With no arguments, opens an interactive session browser.");
@@ -1352,8 +1709,15 @@ fn main() -> Result<()> {
                 eprintln!("  --current            search within the calling session");
                 eprintln!("  --exclude UUID,...   exclude sessions from results");
                 eprintln!("  --exclude-current    exclude the calling session");
-                eprintln!("  --session UUID       search within a specific session");
+                eprintln!("  --session ID         search within a session, channel, or thread");
                 eprintln!("  --since 24h|7d|2w    only search recent history");
+                eprintln!("  --type claude,slack  filter by source (claude, codex, slack)");
+                eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
+                eprintln!("  --dm                 only DMs (Slack)");
+                eprintln!("  --no-dm              exclude DMs (Slack)");
+                eprintln!("  --unread             only unread conversations (Slack)");
+                eprintln!("  --dump ID            dump a session, channel, or thread");
+                eprintln!("  --turns N-M          limit turns/conversations in dump");
                 std::process::exit(0);
             }
             "--nuke" => {
@@ -1366,9 +1730,10 @@ fn main() -> Result<()> {
                 }
                 watermark::remove(&watermark::claude_path());
                 watermark::remove(&watermark::codex_path());
+                slack::remove_watermark();
                 std::process::exit(0);
             }
-            "--session" => {
+            "--session" | "--channel" => {
                 session_filter = iter.next().cloned();
             }
             "--branch" => {
@@ -1395,6 +1760,21 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            "--type" => {
+                if let Some(val) = iter.next() {
+                    for t in val.split(',') {
+                        let t = t.trim();
+                        if !t.is_empty() {
+                            type_filter.push(t.to_string());
+                        }
+                    }
+                }
+            }
+            "-n" => {
+                if let Some(val) = iter.next() {
+                    num_results = Some(val.parse().unwrap_or(0));
+                }
+            }
             "--dump" => {
                 dump_session = iter.next().cloned();
             }
@@ -1406,6 +1786,19 @@ fn main() -> Result<()> {
             }
             "--exclude-current" => {
                 exclude_current = true;
+            }
+            "--dm" => {
+                dm_only = true;
+            }
+            "--no-dm" => {
+                no_dm = true;
+            }
+            "--unread" => {
+                unread_only = true;
+            }
+            s if s.starts_with('-') => {
+                eprintln!("unknown option: {s}");
+                std::process::exit(1);
             }
             _ => {
                 query_args.push(arg);
@@ -1464,7 +1857,7 @@ fn main() -> Result<()> {
     // Skip the active session's JSONL if its watermark is fresh (<10 min).
     // If we can't detect the active session, nothing is skipped (eager by default).
     let stale_ms = 10 * 60 * 1000;
-    match ingest(&db_name, active_session.as_deref(), stale_ms) {
+    match ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter) {
         Ok(have_changes) => {
             if have_changes {
                 let db_rw = DB::new(db_name.clone()).unwrap();
@@ -1480,20 +1873,25 @@ fn main() -> Result<()> {
     }
 
     let has_branch = branch_filter.is_some();
+    let has_filters = session_filter.is_some() || !exclude_sessions.is_empty() || since_ms.is_some()
+        || !type_filter.is_empty() || dm_only || no_dm || unread_only || current || exclude_current
+        || has_branch;
 
     if let Some(ref sid) = dump_session {
-        dump(&db_name, sid, turns_range.as_deref())?;
-    } else if !query_args.is_empty() {
+        dump(&db_name, sid, turns_range.as_deref(), since_ms)?;
+    } else if !query_args.is_empty() || has_filters {
         let q = query_args.join(" ");
         if std::io::stdout().is_terminal() {
-            if let Some(s) = search_tui(&db_name, &assets, Some(&q), session_filter.as_deref(), branch_filter.as_deref(), &exclude_sessions, since_ms)? {
+            let n = num_results.unwrap_or(0);
+            if let Some(s) = search_tui(&db_name, &assets, Some(&q), session_filter.as_deref(), branch_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, n, dm_only, no_dm, unread_only)? {
                 launch_resume(&s, has_branch)?;
             }
         } else {
-            search_plain(&db_name, &assets, &q, session_filter.as_deref(), branch_filter.as_deref(), &exclude_sessions, since_ms)?;
+            let n = num_results.unwrap_or(20);
+            search_plain(&db_name, &assets, &q, session_filter.as_deref(), branch_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, n, dm_only, no_dm, unread_only)?;
         }
     } else {
-        if let Some(s) = search_tui(&db_name, &assets, None, session_filter.as_deref(), branch_filter.as_deref(), &exclude_sessions, since_ms)? {
+        if let Some(s) = search_tui(&db_name, &assets, None, session_filter.as_deref(), branch_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, 0, dm_only, no_dm, unread_only)? {
             launch_resume(&s, has_branch)?;
         }
     }
@@ -1518,13 +1916,13 @@ mod tests {
 
     #[test]
     fn test_build_sql_filter_none() {
-        assert!(build_sql_filter(None, None, &[], None).is_none());
+        assert!(build_sql_filter(None, None, &[], None, &[], false, false, false).is_none());
     }
 
     #[test]
     fn test_build_sql_filter_branch_only() {
         use witchcraft::types::*;
-        let f = build_sql_filter(None, Some("main"), &[], None).unwrap();
+        let f = build_sql_filter(None, Some("main"), &[], None, &[], false, false, false).unwrap();
         assert_eq!(f.statement_type, SqlStatementType::Condition);
         let cond = f.condition.unwrap();
         assert_eq!(cond.key, "$.branch");
@@ -1533,7 +1931,7 @@ mod tests {
     #[test]
     fn test_build_sql_filter_both() {
         use witchcraft::types::*;
-        let f = build_sql_filter(Some("abc"), Some("main"), &[], None).unwrap();
+        let f = build_sql_filter(Some("abc"), Some("main"), &[], None, &[], false, false, false).unwrap();
         assert_eq!(f.statement_type, SqlStatementType::Group);
         assert_eq!(f.logic, Some(SqlLogic::And));
         assert_eq!(f.statements.unwrap().len(), 2);

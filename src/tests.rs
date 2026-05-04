@@ -642,6 +642,53 @@ mod tests {
         Ok(())
     }
 
+    /// Searching an empty DB first cached an empty generation list, causing a subsequent
+    /// search on a populated DB to skip all indexed embeddings.
+    #[test]
+    fn test_cross_db_cache_isolation() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let assets = PathBuf::from("assets");
+        let device = crate::make_device();
+        let embedder = crate::Embedder::new(&device, &assets)?;
+        let mut cache = crate::EmbeddingsCache::new(4);
+
+        // Populated DB with indexed data
+        let baseline_path = dir.path().join("baseline.sqlite");
+        let mut baseline = DB::new(baseline_path.clone())?;
+        for &body in &FACTS {
+            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
+            baseline.add_doc(&uuid, None, &uuid.to_string(), body, None)?;
+        }
+        crate::embed_chunks(&baseline, &embedder, None)?;
+        crate::index_chunks(&baseline, &device)?;
+
+        // Empty DB (simulates an overlay with 0 generations)
+        let overlay_path = dir.path().join("overlay.sqlite");
+        let mut overlay = DB::new(overlay_path)?;
+
+        // Search the empty DB first — this poisoned the global cache before the fix
+        let overlay_results = crate::search(
+            &overlay, &embedder, &mut cache,
+            "a lake with funny colors", THRESHOLD, 10, false, None,
+        )?;
+        assert!(overlay_results.is_empty());
+
+        // Search the populated DB — must still find indexed results
+        let baseline_results = crate::search(
+            &baseline, &embedder, &mut cache,
+            "a lake with funny colors", THRESHOLD, 10, false, None,
+        )?;
+        assert!(
+            !baseline_results.is_empty(),
+            "baseline search must not be poisoned by prior empty-DB search"
+        );
+
+        baseline.clear();
+        baseline.shutdown();
+        overlay.shutdown();
+        Ok(())
+    }
+
     #[test]
     fn test_empty_body_not_embedded() -> anyhow::Result<()> {
         let dir = tempdir()?;

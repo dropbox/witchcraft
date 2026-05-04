@@ -21,8 +21,14 @@ ifeq ($(UNAME_S),Darwin)
   endif
   PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
 else ifeq ($(UNAME_S),Linux)
-  CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
-  NAPI_FEATURES := t5-quantized,fbgemm,napi
+  NVCC := $(or $(shell which nvcc 2>/dev/null),$(wildcard /usr/local/cuda/bin/nvcc),$(wildcard /opt/cuda/bin/nvcc))
+  ifneq ($(NVCC),)
+    CLI_FEATURES := t5-quantized,cuda,progress
+    NAPI_FEATURES := t5-quantized,cuda,napi
+  else
+    CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
+    NAPI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,napi
+  endif
   PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
   RUSTFLAGS_EXTRA :=
   TARGET :=

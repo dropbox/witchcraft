@@ -40,10 +40,10 @@ impl CustomOp2 for FastAddOp {
 /// On Metal/GPU, falls back to candle's built-in addition since custom ops
 /// have overhead on GPU and the optimization is CPU-specific.
 pub fn fast_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    if matches!(a.device(), Device::Metal(_)) {
-        a + b
-    } else {
+    if matches!(a.device(), Device::Cpu) {
         a.apply_op2_no_bwd(b, &FastAddOp)
+    } else {
+        a + b
     }
 }
 

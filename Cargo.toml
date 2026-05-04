@@ -5,7 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace]                     # !Dash
-members = ["tools/quantize-tool", "tools/t5-bench", "tools/ov-stress", "tools/compare-backends"] # !Dash
+members = ["tools/quantize-tool", "tools/t5-bench", "tools/ov-stress", "tools/compare-backends", "crates/chromium-idb"] # !Dash
 
 [[bin]]                         # !Dash
 name = "warp-cli"               # !Dash
@@ -56,6 +56,7 @@ test-log = { version = "0.2.16", features = ["trace", "color"] }
 ratatui = "0.29"
 crossterm = "0.28"
 libc = "0.2"
+chromium-idb = { path = "crates/chromium-idb" }
 
 # Apple Silicon (ARM) - enable Metal support
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
@@ -88,6 +89,7 @@ t5-openvino = ["dep:openvino"]
 embed-assets = []
 progress = ["dep:indicatif"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
 hybrid-dequant = ["dep:rayon"]
 fbgemm = ["dep:fbgemm-rs"]
 deterministic = []
