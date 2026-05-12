@@ -178,6 +178,10 @@ nfcorpus-score: prereqs env/pyvenv.cfg testset/nfcorpus/questions.test.tsv tests
 	echo scoring...
 	$(PYTHON_BIN) score.py output.txt testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
 
+reindex:
+	make warp-cli EXTRA_FEATURES=deterministic
+	$(CLI_BIN) reindex
+
 run: module
 	ln -sf target/release/warp-macos-universal.node warp.node
 	node index.cjs
