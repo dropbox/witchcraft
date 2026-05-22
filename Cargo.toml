@@ -84,6 +84,7 @@ napi-build = "2.2.3"
 [features]
 #default = ["t5-quantized"]
 #default = ["t5-openvino"]
+default = ["polar-quant-2bit"]
 napi = ["dep:napi", "dep:napi-derive"]
 python = ["dep:pyo3"]
 t5-quantized = []
@@ -95,6 +96,8 @@ cuda = ["candle-core/cuda", "candle-nn/cuda"]
 hybrid-dequant = ["dep:rayon"]
 fbgemm = ["dep:fbgemm-rs"]
 deterministic = []
+polar-quant = []
+polar-quant-2bit = ["polar-quant"]
 
 [dependencies.rusqlite]
 version = "0.39.0"

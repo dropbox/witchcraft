@@ -71,6 +71,9 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
+#[cfg(all(feature = "polar-quant", feature = "polar-quant-2bit"))]
+const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 4; // packed 2-bit polar residual pairs
+#[cfg(not(all(feature = "polar-quant", feature = "polar-quant-2bit")))]
 const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 2; // packed 4-bit residuals
 #[cfg(not(test))]
 const L0_CAPACITY: usize = 1024;
@@ -757,7 +760,10 @@ pub fn match_centroids(
     let mut bucket_query =
         db.query("SELECT indices, residuals FROM bucket WHERE id = ?1")?;
 
-    let table: [f32; 16] = packops::make_q4_dequant_table()?;
+    #[cfg(not(feature = "polar-quant"))]
+    let table: [f32; 16] = packops::make_residual_dequant_table()?;
+    #[cfg(feature = "polar-quant")]
+    let table: packops::PolarDequantTable = packops::make_residual_dequant_table()?;
 
     for gen in &generations {
         if gen.bucket_ids.is_empty() {
@@ -807,6 +813,15 @@ pub fn match_centroids(
                 })?;
 
             let document_indices = decompress_keys(&keys_compressed)?;
+            anyhow::ensure!(
+                residual_bytes.len() % RESIDUAL_BYTES == 0,
+                "bucket {bucket_id} residual byte length {} is not divisible by compiled residual width {RESIDUAL_BYTES}; run ./warp-cli reindex with matching feature flags",
+                residual_bytes.len()
+            );
+            #[cfg(feature = "polar-quant")]
+            let residuals =
+                Tensor::from_polar_q4_bytes(&residual_bytes, EMBEDDING_DIM, &table, &Device::Cpu)?;
+            #[cfg(not(feature = "polar-quant"))]
             let residuals = Tensor::from_companded_q4_bytes(
                 &residual_bytes,
                 EMBEDDING_DIM,
@@ -814,6 +829,11 @@ pub fn match_centroids(
                 &Device::Cpu,
             )?;
             let (num_docs, _) = residuals.dims2()?;
+            anyhow::ensure!(
+                num_docs == document_indices.len(),
+                "bucket {bucket_id} has {num_docs} residual vectors but {} document indices; run ./warp-cli reindex with matching feature flags",
+                document_indices.len()
+            );
             all_residuals.push(residuals);
             for idx in &document_indices[..num_docs] {
                 document_clusters.push((gen_idx, i as usize));
@@ -1507,6 +1527,9 @@ fn write_buckets_for_range(
 
                 let center = centers_cpu.get(bucket as usize)?;
                 let residual = (embeddings[sample].get(0) - &center)?;
+                #[cfg(feature = "polar-quant")]
+                let residual_quantized = residual.to_polar_q4_bytes()?;
+                #[cfg(not(feature = "polar-quant"))]
                 let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
                 residuals_bytes.extend(&residual_quantized);
             }

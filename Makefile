@@ -117,7 +117,7 @@ buildemb: warp-cli
 
 warp-cli: prereqs download
 	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES)$(if $(EXTRA_FEATURES),$(comma)$(EXTRA_FEATURES)) --bin warp-cli
-	ln -sf target/$(TARGET)/release/warp-cli ./warp-cli
+	ln -sf $(CLI_BIN) ./warp-cli
 
 pickbrain: prereqs download
 	cargo build --release $(BUILD_TARGET) --features $(PICKBRAIN_FEATURES) --example pickbrain

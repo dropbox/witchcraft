@@ -124,7 +124,7 @@ pub fn bulk_search(
             embedder_histogram.record(embedder_latency_ms);
 
             let match_start = std::time::Instant::now();
-            let matches = witchcraft::match_centroids(db, &qe, 0.0, top_k, None).unwrap();
+            let matches = witchcraft::match_centroids(db, &qe, 0.0, top_k, None)?;
             debug!(
                 "match_centroids call took {} ms.",
                 match_start.elapsed().as_millis()
@@ -242,8 +242,7 @@ fn main() -> Result<()> {
             csvname.into(),
             outputname.into(),
             use_fulltext,
-        )
-        .unwrap();
+        )?;
     } else if args.len() >= 4 && &args[1] == "score" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
