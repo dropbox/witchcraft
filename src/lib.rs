@@ -1,11 +1,14 @@
 use log::{debug, info, warn};
+use memmap2::Mmap;
 use once_cell::sync::Lazy;
 #[cfg(feature = "deterministic")]
 use rand::SeedableRng;
 use rusqlite::{OptionalExtension, Statement};
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 // Conditionally compile T5 encoder based on features
 #[cfg(feature = "t5-quantized")]
 pub mod quantized_t5;
@@ -71,6 +74,13 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
+const CENTER_BYTES: usize = EMBEDDING_DIM * std::mem::size_of::<f32>();
+const BUCKET_DATA_VERSION: u32 = 2;
+const BUCKET_DATA_MAGIC: [u8; 8] = *b"WRPBKT02";
+const BUCKET_META_PREFIX_BYTES: usize = 20;
+const BUCKET_META_BYTES: usize = BUCKET_META_PREFIX_BYTES + CENTER_BYTES;
+const BUCKET_DATA_HEADER_BYTES: usize =
+    std::mem::size_of::<u32>() + BUCKET_DATA_MAGIC.len() + 3 * std::mem::size_of::<u64>();
 #[cfg(all(feature = "polar-quant", feature = "polar-quant-2bit"))]
 const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 4; // packed 2-bit polar residual pairs
 #[cfg(not(all(feature = "polar-quant", feature = "polar-quant-2bit")))]
@@ -346,28 +356,237 @@ fn decompress_keys(bytes: &[u8]) -> Result<Vec<(u32, u32)>> {
     Ok(keys)
 }
 
+struct BucketSidecarMeta {
+    size: usize,
+    data_offset: u64,
+    indices_len: usize,
+    residual_len: usize,
+    center: Vec<u8>,
+}
+
+struct BucketDataHeader {
+    centroid_count: usize,
+    meta_offset: usize,
+    payload_offset: usize,
+}
+
+fn write_bucket_data_header(
+    writer: &mut impl Write,
+    centroid_count: usize,
+    meta_offset: usize,
+    payload_offset: usize,
+) -> Result<()> {
+    writer.write_all(&BUCKET_DATA_VERSION.to_le_bytes())?;
+    writer.write_all(&BUCKET_DATA_MAGIC)?;
+    writer.write_all(&(centroid_count as u64).to_le_bytes())?;
+    writer.write_all(&(meta_offset as u64).to_le_bytes())?;
+    writer.write_all(&(payload_offset as u64).to_le_bytes())?;
+    Ok(())
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(bytes[offset..offset + 4].try_into()?))
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
+    Ok(u64::from_le_bytes(bytes[offset..offset + 8].try_into()?))
+}
+
+fn bucket_data_header(bucket_data: &[u8], generation_id: i64) -> Result<BucketDataHeader> {
+    anyhow::ensure!(
+        bucket_data.len() >= BUCKET_DATA_HEADER_BYTES,
+        "generation {generation_id} bucket sidecar is too small: {} bytes",
+        bucket_data.len()
+    );
+    let version = read_u32_le(bucket_data, 0)?;
+    anyhow::ensure!(
+        version == BUCKET_DATA_VERSION,
+        "generation {generation_id} bucket sidecar version {version} is not supported; run ./warp-cli reindex"
+    );
+    let magic_offset = std::mem::size_of::<u32>();
+    anyhow::ensure!(
+        &bucket_data[magic_offset..magic_offset + BUCKET_DATA_MAGIC.len()]
+            == BUCKET_DATA_MAGIC.as_slice(),
+        "generation {generation_id} bucket sidecar has an invalid header; run ./warp-cli reindex"
+    );
+    let centroid_count: usize = read_u64_le(bucket_data, 12)?.try_into()?;
+    let meta_offset: usize = read_u64_le(bucket_data, 20)?.try_into()?;
+    let payload_offset: usize = read_u64_le(bucket_data, 28)?.try_into()?;
+    let meta_bytes = centroid_count
+        .checked_mul(BUCKET_META_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("generation {generation_id} bucket metadata length overflow"))?;
+    anyhow::ensure!(
+        meta_offset >= BUCKET_DATA_HEADER_BYTES
+            && payload_offset >= meta_offset + meta_bytes
+            && payload_offset <= bucket_data.len(),
+        "generation {generation_id} bucket sidecar layout is invalid"
+    );
+    Ok(BucketDataHeader {
+        centroid_count,
+        meta_offset,
+        payload_offset,
+    })
+}
+
+fn bucket_data_bucket_meta(
+    bucket_data: &[u8],
+    header: &BucketDataHeader,
+    generation_id: i64,
+) -> Result<Vec<BucketSidecarMeta>> {
+    let mut metas = Vec::with_capacity(header.centroid_count);
+    for bucket_idx in 0..header.centroid_count {
+        let offset = header.meta_offset + bucket_idx * BUCKET_META_BYTES;
+        let size = read_u32_le(bucket_data, offset)? as usize;
+        let data_offset: u64 = read_u64_le(bucket_data, offset + 4)?;
+        let indices_len = read_u32_le(bucket_data, offset + 12)? as usize;
+        let residual_len = read_u32_le(bucket_data, offset + 16)? as usize;
+        let center_start = offset + BUCKET_META_PREFIX_BYTES;
+        let center_end = offset + BUCKET_META_BYTES;
+        anyhow::ensure!(
+            data_offset >= header.payload_offset as u64,
+            "generation {generation_id} bucket {bucket_idx} data offset is before payload block"
+        );
+        let bucket_end = data_offset
+            .checked_add(u64::try_from(indices_len)?)
+            .and_then(|offset| offset.checked_add(u64::try_from(residual_len).ok()?))
+            .ok_or_else(|| anyhow::anyhow!("generation {generation_id} bucket {bucket_idx} data length overflow"))?;
+        anyhow::ensure!(
+            bucket_end <= bucket_data.len() as u64,
+            "generation {generation_id} bucket {bucket_idx} data ends beyond sidecar length"
+        );
+        metas.push(BucketSidecarMeta {
+            size,
+            data_offset,
+            indices_len,
+            residual_len,
+            center: bucket_data[center_start..center_end].to_vec(),
+        });
+    }
+    Ok(metas)
+}
+
+fn write_bucket_meta(writer: &mut impl Write, meta: &BucketSidecarMeta) -> Result<()> {
+    anyhow::ensure!(
+        meta.center.len() == CENTER_BYTES,
+        "bucket center byte length {} does not match expected {CENTER_BYTES}",
+        meta.center.len()
+    );
+    writer.write_all(&u32::try_from(meta.size)?.to_le_bytes())?;
+    writer.write_all(&meta.data_offset.to_le_bytes())?;
+    writer.write_all(&u32::try_from(meta.indices_len)?.to_le_bytes())?;
+    writer.write_all(&u32::try_from(meta.residual_len)?.to_le_bytes())?;
+    writer.write_all(&meta.center)?;
+    Ok(())
+}
 
 fn merge_and_write_buckets(
     db: &DB,
     tmpfiles: Vec<tempfile::NamedTempFile>,
     centers_cpu: &Tensor,
-    generation_id: i64,
-    id_offset: u32,
+    bucket_data_file: &str,
 ) -> Result<()> {
+    let final_path = db.bucket_data_path(bucket_data_file);
+    let mut tmp_path = final_path.as_os_str().to_os_string();
+    tmp_path.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_path);
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let temp_dir = final_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let data_tmp = tempfile::NamedTempFile::new_in(temp_dir)?;
+    let mut data_writer = BufWriter::new(data_tmp.reopen()?);
+    let (centroid_count, center_dim) = centers_cpu.dims2()?;
+    anyhow::ensure!(
+        center_dim == EMBEDDING_DIM,
+        "centers have dim {center_dim}, expected {EMBEDDING_DIM}"
+    );
+    let mut bucket_meta: Vec<BucketSidecarMeta> = (0..centroid_count)
+        .map(|_| BucketSidecarMeta {
+            size: 0,
+            data_offset: 0,
+            indices_len: 0,
+            residual_len: 0,
+            center: vec![0; CENTER_BYTES],
+        })
+        .collect();
+    let mut data_offset = 0u64;
+
     let mut merger = merger::Merger::from_tempfiles(tmpfiles, RESIDUAL_BYTES)?;
     for result in &mut merger {
         let entry = result?;
-        let center = centers_cpu.get(entry.value as usize)?;
+        let bucket_idx = entry.value as usize;
+        anyhow::ensure!(
+            bucket_idx < centroid_count,
+            "bucket {} is outside centroid count {centroid_count}",
+            entry.value
+        );
+        let center = centers_cpu.get(bucket_idx)?;
         let center_bytes = center.to_f32_bytes()?;
+        anyhow::ensure!(
+            center_bytes.len() == CENTER_BYTES,
+            "bucket {} center byte length {} does not match expected {CENTER_BYTES}",
+            entry.value,
+            center_bytes.len()
+        );
         let compressed_keys = compress_keys(&entry.keys);
-        db.add_bucket(
-            id_offset + entry.value,
-            generation_id,
-            &center_bytes,
-            &compressed_keys,
-            &entry.data,
-        )?;
+        anyhow::ensure!(
+            entry.data.len() % RESIDUAL_BYTES == 0,
+            "bucket {} residual byte length {} is not divisible by compiled residual width {RESIDUAL_BYTES}",
+            entry.value,
+            entry.data.len()
+        );
+        data_writer.write_all(&compressed_keys)?;
+        data_writer.write_all(&entry.data)?;
+        let meta = &mut bucket_meta[bucket_idx];
+        meta.size = entry.data.len() / RESIDUAL_BYTES;
+        meta.data_offset = data_offset;
+        meta.indices_len = compressed_keys.len();
+        meta.residual_len = entry.data.len();
+        meta.center = center_bytes;
+        let payload_len = compressed_keys
+            .len()
+            .checked_add(entry.data.len())
+            .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload length overflow"))?;
+        data_offset = data_offset
+            .checked_add(u64::try_from(payload_len)?)
+            .ok_or_else(|| anyhow::anyhow!("bucket sidecar data offset overflow"))?;
     }
+    data_writer.flush()?;
+    drop(data_writer);
+
+    let meta_block_len = centroid_count
+        .checked_mul(BUCKET_META_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("bucket metadata block length overflow"))?;
+    let meta_offset = BUCKET_DATA_HEADER_BYTES;
+    let payload_start = meta_offset
+        .checked_add(meta_block_len)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload start overflow"))?;
+    let payload_start = u64::try_from(payload_start)?;
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    let mut bucket_data_writer = BufWriter::new(file);
+
+    write_bucket_data_header(
+        &mut bucket_data_writer,
+        centroid_count,
+        meta_offset,
+        payload_start.try_into()?,
+    )?;
+    for meta in &mut bucket_meta {
+        meta.data_offset = payload_start
+            .checked_add(meta.data_offset)
+            .ok_or_else(|| anyhow::anyhow!("bucket sidecar absolute offset overflow"))?;
+        write_bucket_meta(&mut bucket_data_writer, meta)?;
+    }
+    let mut data_reader = BufReader::new(data_tmp.reopen()?);
+    std::io::copy(&mut data_reader, &mut bucket_data_writer)?;
+    bucket_data_writer.flush()?;
+    drop(bucket_data_writer);
+    std::fs::rename(&tmp_path, &final_path)?;
     Ok(())
 }
 
@@ -621,8 +840,12 @@ mod reciprocal_rank_fusion_tests {
 /// Per-generation centroid data loaded from the database.
 struct GenerationCentroids {
     generation_id: i64,
-    bucket_ids: Vec<u32>,
+    bucket_indices: Vec<usize>,
     sizes: Vec<usize>,
+    data_offsets: Vec<usize>,
+    indices_lens: Vec<usize>,
+    residual_lens: Vec<usize>,
+    bucket_data: Option<Arc<Mmap>>,
     centers_matrix: Tensor,
 }
 
@@ -648,32 +871,49 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
         }
     }
 
-    let mut gen_query = db.query("SELECT id FROM generation ORDER BY level, id")?;
-    let gen_ids: Vec<i64> = gen_query
-        .query_map((), |row| row.get::<_, i64>(0))?
+    let mut gen_query =
+        db.query("SELECT id, bucket_data_file FROM generation ORDER BY level, id")?;
+    let generations: Vec<(i64, String)> = gen_query
+        .query_map((), |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut all = Vec::with_capacity(gen_ids.len());
+    let mut all = Vec::with_capacity(generations.len());
 
-    for gen_id in gen_ids {
-        let mut center_query = db.query(
-            "SELECT id, length(residuals) / ?1, center FROM bucket
-             WHERE generation_id = ?2 ORDER BY id",
-        )?;
-        let mut bucket_ids = vec![];
+    for (gen_id, bucket_data_file) in generations {
+        let mut bucket_indices = vec![];
         let mut sizes = vec![];
+        let mut data_offsets = vec![];
+        let mut indices_lens = vec![];
+        let mut residual_lens = vec![];
+        let bucket_data = if bucket_data_file.is_empty() {
+            None
+        } else {
+            anyhow::ensure!(
+                !bucket_data_file.is_empty(),
+                "generation {gen_id} has no bucket data sidecar file"
+            );
+            let path = db.bucket_data_path(&bucket_data_file);
+            let file = File::open(&path)?;
+            // The mapped file is immutable after generation creation.
+            let mmap = unsafe { Mmap::map(&file)? };
+            Some(Arc::new(mmap))
+        };
         let mut centers = vec![];
-        for result in center_query.query_map((RESIDUAL_BYTES as i64, gen_id), |row| {
-            let id = row.get(0)?;
-            let size = row.get::<_, i64>(1)? as usize;
-            let blob: Vec<u8> = row.get(2)?;
-            Ok((id, size, blob))
-        })? {
-            let (id, size, center) = result?;
-            bucket_ids.push(id);
-            sizes.push(size);
-            let t = Tensor::from_f32_bytes(&center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
-            centers.push(t);
+        if let Some(bucket_data) = &bucket_data {
+            let header = bucket_data_header(bucket_data, gen_id)?;
+            let metas = bucket_data_bucket_meta(bucket_data, &header, gen_id)?;
+            for (bucket_idx, meta) in metas.into_iter().enumerate() {
+                if meta.size == 0 {
+                    continue;
+                }
+                bucket_indices.push(bucket_idx);
+                sizes.push(meta.size);
+                data_offsets.push(meta.data_offset.try_into()?);
+                indices_lens.push(meta.indices_len);
+                residual_lens.push(meta.residual_len);
+                let t = Tensor::from_f32_bytes(&meta.center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
+                centers.push(t);
+            }
         }
         let centers_matrix = if !centers.is_empty() {
             Tensor::stack(&centers, 0)?.to_device(device)?
@@ -682,8 +922,12 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
         };
         all.push(GenerationCentroids {
             generation_id: gen_id,
-            bucket_ids,
+            bucket_indices,
             sizes,
+            data_offsets,
+            indices_lens,
+            residual_lens,
+            bucket_data,
             centers_matrix,
         });
     }
@@ -703,8 +947,12 @@ impl Clone for GenerationCentroids {
     fn clone(&self) -> Self {
         Self {
             generation_id: self.generation_id,
-            bucket_ids: self.bucket_ids.clone(),
+            bucket_indices: self.bucket_indices.clone(),
             sizes: self.sizes.clone(),
+            data_offsets: self.data_offsets.clone(),
+            indices_lens: self.indices_lens.clone(),
+            residual_lens: self.residual_lens.clone(),
+            bucket_data: self.bucket_data.clone(),
             centers_matrix: self.centers_matrix.clone(),
         }
     }
@@ -757,21 +1005,18 @@ pub fn match_centroids(
 
     let generations = get_all_generation_centers(db, device)?;
 
-    let mut bucket_query =
-        db.query("SELECT indices, residuals FROM bucket WHERE id = ?1")?;
-
     #[cfg(not(feature = "polar-quant"))]
     let table: [f32; 16] = packops::make_residual_dequant_table()?;
     #[cfg(feature = "polar-quant")]
     let table: packops::PolarDequantTable = packops::make_residual_dequant_table()?;
 
     for gen in &generations {
-        if gen.bucket_ids.is_empty() {
+        if gen.sizes.is_empty() {
             continue;
         }
 
         let gen_idx = gen_centroid_scores_all.len();
-        let n_centroids = gen.bucket_ids.len();
+        let n_centroids = gen.sizes.len();
 
         let query_centroid_similarity =
             fast_ops::matmul_t(query_embeddings, &gen.centers_matrix)?;
@@ -791,9 +1036,9 @@ pub fn match_centroids(
             let row = row.to_vec1::<u32>()?;
             let mut cumsum = 0;
             for j in 0..n_centroids.min(k) {
-                let idx = row[j];
+                let idx = row[j] as usize;
                 topk_clusters.push(idx);
-                cumsum += gen.sizes[idx as usize];
+                cumsum += gen.sizes[idx];
                 if cumsum >= t_prime {
                     break;
                 }
@@ -806,13 +1051,30 @@ pub fn match_centroids(
         topk_clusters.dedup();
 
         for &i in &topk_clusters {
-            let bucket_id = gen.bucket_ids[i as usize];
-            let (keys_compressed, residual_bytes) = bucket_query
-                .query_row((bucket_id,), |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?;
+            let bucket_idx = i as usize;
+            let bucket_id = gen.bucket_indices[bucket_idx];
+            let data_offset = gen.data_offsets[bucket_idx];
+            let indices_len = gen.indices_lens[bucket_idx];
+            let residual_len = gen.residual_lens[bucket_idx];
+            let bucket_data = gen.bucket_data.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "generation {} has no mapped bucket data sidecar",
+                    gen.generation_id
+                )
+            })?;
+            let indices_end = data_offset + indices_len;
+            let residual_end = indices_end + residual_len;
+            anyhow::ensure!(
+                residual_end <= bucket_data.len(),
+                "bucket {bucket_id} data range {}..{} exceeds sidecar length {}",
+                data_offset,
+                residual_end,
+                bucket_data.len()
+            );
+            let keys_compressed = &bucket_data[data_offset..indices_end];
+            let residual_bytes = &bucket_data[indices_end..residual_end];
 
-            let document_indices = decompress_keys(&keys_compressed)?;
+            let document_indices = decompress_keys(keys_compressed)?;
             anyhow::ensure!(
                 residual_bytes.len() % RESIDUAL_BYTES == 0,
                 "bucket {bucket_id} residual byte length {} is not divisible by compiled residual width {RESIDUAL_BYTES}; run ./warp-cli reindex with matching feature flags",
@@ -844,9 +1106,7 @@ pub fn match_centroids(
     }
 
     // Also load any unindexed chunks (documents not yet in any generation)
-    let max_indexed_rowid: i64 = db
-        .query("SELECT IFNULL(MAX(max_chunk_rowid), 0) FROM generation")?
-        .query_row((), |row| row.get(0))?;
+    let max_indexed_rowid = max_indexed_chunk_rowid(db)?;
 
     let mut unindexed_embeddings = vec![];
     {
@@ -1268,7 +1528,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
             .collect::<Vec<_>>()
             .join(",");
 
-        match db.add_chunk(&hash, "xtr-base-en", &bytes, &counts) {
+        match db.add_chunk(&hash, "xtr-base-en", &bytes, &counts, rows) {
             Ok(()) => {
                 count += 1;
                 progress.inc(1);
@@ -1289,35 +1549,40 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
 
 
 pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
-    let total_chunk_embeddings = count_chunk_embeddings(db)?;
-    let indexed = count_indexed_embeddings(db)?;
-    Ok(total_chunk_embeddings.saturating_sub(indexed))
+    let max_indexed_rowid = max_indexed_chunk_rowid(db)?;
+    count_chunk_embeddings_after(db, max_indexed_rowid)
 }
 
-/// Count total embeddings across all chunks by summing the counts column
-/// (not byte length, which is haar-packed and compressed).
-fn count_chunk_embeddings(db: &DB) -> Result<usize> {
-    let mut query = db.query("SELECT counts FROM chunk")?;
-    let mut total = 0usize;
-    let results = query.query_map((), |row| row.get::<_, String>(0))?;
-    for result in results {
-        let counts_str = result?;
-        let n: usize = counts_str
-            .split(',')
-            .filter_map(|s| s.parse::<usize>().ok())
-            .sum();
-        total += n;
-    }
-    Ok(total)
+fn max_indexed_chunk_rowid(db: &DB) -> Result<i64> {
+    let rowid = db
+        .query("SELECT IFNULL(MAX(max_chunk_rowid), 0) FROM generation")?
+        .query_row((), |row| row.get(0))?;
+    Ok(rowid)
+}
+
+fn count_chunk_embeddings_after(db: &DB, min_rowid_exclusive: i64) -> Result<usize> {
+    let count: i64 = db
+        .query("SELECT IFNULL(SUM(embedding_count), 0) FROM chunk WHERE rowid > ?1")?
+        .query_row((min_rowid_exclusive,), |row| row.get(0))?;
+    Ok(count.try_into()?)
 }
 
 fn count_indexed_embeddings(db: &DB) -> Result<usize> {
     let count: i64 = db
-        .query(&format!(
-            "SELECT IFNULL(SUM(length(residuals)/{RESIDUAL_BYTES}), 0) FROM bucket"
-        ))?
+        .query("SELECT IFNULL(SUM(num_embeddings), 0) FROM generation")?
         .query_row((), |row| row.get(0))?;
     Ok(count.try_into()?)
+}
+
+fn bucket_data_files_for_generations(db: &DB, where_clause: &str) -> Result<Vec<String>> {
+    let sql = format!(
+        "SELECT bucket_data_file FROM generation WHERE bucket_data_file != '' AND {where_clause}"
+    );
+    let mut query = db.query(&sql)?;
+    let files = query
+        .query_map((), |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(files)
 }
 
 fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(Tensor, usize)> {
@@ -1394,8 +1659,17 @@ fn build_layer(
         write_buckets_for_range(db, &centers, device, total_embeddings as u64, min_rowid, max_rowid)?;
 
     let gen_id = db.add_generation(level, total_embeddings as u64, min_rowid, max_rowid)?;
-    let bucket_id_offset = 0u32;
-    merge_and_write_buckets(db, tmpfiles, &centers_cpu, gen_id, bucket_id_offset)?;
+    let bucket_data_file = db.bucket_data_file_name(gen_id);
+    if let Err(err) = merge_and_write_buckets(
+        db,
+        tmpfiles,
+        &centers_cpu,
+        &bucket_data_file,
+    ) {
+        db.remove_bucket_data_file(&bucket_data_file);
+        return Err(err);
+    }
+    db.set_generation_bucket_data_file(gen_id, &bucket_data_file)?;
 
     Ok(())
 }
@@ -1549,8 +1823,8 @@ fn write_buckets_for_range(
 }
 
 pub fn full_index(db: &DB, device: &Device) -> Result<()> {
-    db.execute("DELETE FROM bucket")?;
     db.execute("DELETE FROM generation")?;
+    db.remove_all_bucket_data_sidecars();
     invalidate_center_cache(db);
     index_chunks(db, device)
 }
@@ -1570,9 +1844,7 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     }
 
     // Find the max indexed chunk rowid — unindexed chunks are above this
-    let max_indexed_rowid: i64 = db
-        .query("SELECT IFNULL(MAX(max_chunk_rowid), 0) FROM generation")?
-        .query_row((), |row| row.get(0))?;
+    let max_indexed_rowid = max_indexed_chunk_rowid(db)?;
     let max_chunk_rowid: i64 = db
         .query("SELECT MAX(rowid) FROM chunk")?
         .query_row((), |row| row.get(0))?;
@@ -1613,21 +1885,27 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
         total, target_level, min_rowid, max_chunk_rowid
     );
 
+    let stale_bucket_data_files =
+        bucket_data_files_for_generations(db, &format!("level <= {}", target_level))?;
+
     db.begin_transaction()?;
 
-    // Delete all generations at levels 0..=target_level (they get merged)
-    let delete_sql = format!(
-        "DELETE FROM bucket WHERE generation_id IN \
-         (SELECT id FROM generation WHERE level <= {})",
-        target_level
-    );
-    db.execute(&delete_sql)?;
-    let delete_sql = format!("DELETE FROM generation WHERE level <= {}", target_level);
-    db.execute(&delete_sql)?;
+    let result = (|| -> Result<()> {
+        // Delete all generations at levels 0..=target_level (they get merged)
+        let delete_sql = format!("DELETE FROM generation WHERE level <= {}", target_level);
+        db.execute(&delete_sql)?;
 
-    build_layer(db, device, target_level, min_rowid, max_chunk_rowid)?;
+        build_layer(db, device, target_level, min_rowid, max_chunk_rowid)?;
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let _ = db.rollback_transaction();
+        return Err(err);
+    }
 
     db.commit_transaction()?;
+    db.remove_bucket_data_files(&stale_bucket_data_files);
     invalidate_center_cache(db);
     db.checkpoint();
     Ok(())

@@ -523,6 +523,23 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_unindexed_embedding_count_uses_chunk_metadata() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("counts.sqlite");
+        let db = DB::new(path)?;
+
+        let hash1 = "a".repeat(32);
+        let hash2 = "b".repeat(32);
+        db.add_chunk(&hash1, "xtr-base-en", &vec![0], "not,a,count", 7)?;
+        db.add_chunk(&hash2, "xtr-base-en", &vec![0], "", 11)?;
+
+        assert_eq!(crate::count_unindexed_embeddings(&db)?, 18);
+        db.add_generation(0, 7, 1, 1)?;
+        assert_eq!(crate::count_unindexed_embeddings(&db)?, 11);
+        Ok(())
+    }
+
     /// Regression test for scoring off-by-one: the last token vector was
     /// dropped because vmax_inplace was unreachable after the break.
     /// A single-document corpus exercises this: the one document is both

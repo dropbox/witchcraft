@@ -4,13 +4,14 @@ use log::{error, warn};
 use rusqlite::{params_from_iter, Connection, OpenFlags, Result as SQLResult, Statement};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::sql_generator::build_filter_sql_and_params;
 
 const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
 const APP_ID: i32 = 0x07DB_DA55;
-const SCHEMA_VERSION: i32 = 9;
+const SCHEMA_VERSION: i32 = 10;
 
 pub struct DB {
     db_fn: PathBuf,
@@ -39,9 +40,48 @@ impl DB {
         PathBuf::from(path)
     }
 
+    fn bucket_data_prefix(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.buckets.")
+    }
+
+    fn db_parent(db_fn: &Path) -> &Path {
+        match db_fn.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        }
+    }
+
     fn remove_sidecars(db_fn: &Path) {
         let _ = std::fs::remove_file(Self::sidecar_path(db_fn, "-wal"));
         let _ = std::fs::remove_file(Self::sidecar_path(db_fn, "-shm"));
+    }
+
+    fn remove_bucket_data_sidecars(db_fn: &Path) {
+        let parent = Self::db_parent(db_fn);
+        let prefix = Self::bucket_data_prefix(db_fn);
+        let old_prefix = Self::old_residuals_prefix(db_fn);
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) || name.starts_with(&old_prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    fn old_residuals_prefix(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.residuals.")
     }
 
     fn configure(connection: &Connection) -> SQLResult<()> {
@@ -103,7 +143,8 @@ impl DB {
                  hash TEXT PRIMARY KEY CHECK (length(hash) = {HASH_CHARS}),
                  model TEXT,
                  embeddings BLOB NOT NULL,
-                 counts TEXT NOT NULL);
+                 counts TEXT NOT NULL,
+                 embedding_count INTEGER NOT NULL);
 
              CREATE TRIGGER document_after_delete AFTER DELETE ON document
              BEGIN
@@ -124,14 +165,8 @@ impl DB {
                  level INTEGER NOT NULL,
                  num_embeddings INTEGER NOT NULL,
                  min_chunk_rowid INTEGER NOT NULL,
-                 max_chunk_rowid INTEGER NOT NULL);
-
-             CREATE TABLE bucket(
-                 id INTEGER PRIMARY KEY,
-                 generation_id INTEGER NOT NULL REFERENCES generation(id),
-                 center BLOB NOT NULL,
-                 indices BLOB NOT NULL,
-                 residuals BLOB NOT NULL);"
+                 max_chunk_rowid INTEGER NOT NULL,
+                 bucket_data_file TEXT NOT NULL);"
         ))?;
         Ok(())
     }
@@ -175,6 +210,7 @@ impl DB {
             std::fs::remove_file(&db_fn)
                 .map_err(|_e| rusqlite::Error::InvalidPath(db_fn.clone()))?;
             Self::remove_sidecars(&db_fn);
+            Self::remove_bucket_data_sidecars(&db_fn);
             connection = Connection::open(&db_fn)?;
             first_creation = true;
         }
@@ -208,8 +244,8 @@ impl DB {
     fn clear_inner(&mut self) -> SQLResult<()> {
         self.execute("DELETE FROM document")?;
         self.execute("DELETE FROM chunk")?;
-        self.execute("DELETE FROM bucket")?;
         self.execute("DELETE FROM generation")?;
+        self.remove_all_bucket_data_sidecars();
         self.execute("VACUUM")?;
         Ok(())
     }
@@ -278,6 +314,7 @@ impl DB {
 
             // Also remove WAL and SHM files if they exist
             Self::remove_sidecars(&self.db_fn);
+            Self::remove_bucket_data_sidecars(&self.db_fn);
         }
     }
 
@@ -293,6 +330,42 @@ impl DB {
 
     pub fn file_size(&self) -> std::io::Result<u64> {
         std::fs::metadata(&self.db_fn).map(|meta| meta.len())
+    }
+
+    pub fn bucket_data_file_name(&self, generation_id: i64) -> String {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        format!("{}{generation_id}.{nonce}", Self::bucket_data_prefix(&self.db_fn))
+    }
+
+    pub fn bucket_data_path(&self, file_name: &str) -> PathBuf {
+        let path = Path::new(file_name);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            Self::db_parent(&self.db_fn).join(path)
+        }
+    }
+
+    pub fn remove_bucket_data_file(&self, file_name: &str) {
+        let path = self.bucket_data_path(file_name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("unable to remove bucket data sidecar {}: {e}", path.display());
+            }
+        }
+    }
+
+    pub fn remove_bucket_data_files(&self, file_names: &[String]) {
+        for file_name in file_names {
+            self.remove_bucket_data_file(file_name);
+        }
+    }
+
+    pub fn remove_all_bucket_data_sidecars(&self) {
+        Self::remove_bucket_data_sidecars(&self.db_fn);
     }
 
     pub fn execute(&self, sql: &str) -> SQLResult<()> {
@@ -407,25 +480,12 @@ impl DB {
         model: &str,
         embeddings: &Vec<u8>,
         counts: &str,
+        embedding_count: usize,
     ) -> SQLResult<()> {
         self.conn().execute(
-            "INSERT OR IGNORE INTO chunk VALUES(?1, ?2, ?3, ?4)",
-            (&hash, &model, embeddings, counts),
-        )?;
-        Ok(())
-    }
-
-    pub fn add_bucket(
-        &self,
-        id: u32,
-        generation_id: i64,
-        center: &Vec<u8>,
-        indices: &Vec<u8>,
-        residuals: &Vec<u8>,
-    ) -> SQLResult<()> {
-        self.conn().execute(
-            "INSERT OR REPLACE INTO bucket VALUES(?1, ?2, ?3, ?4, ?5)",
-            (id, generation_id, center, indices, residuals),
+            "INSERT OR IGNORE INTO chunk(hash, model, embeddings, counts, embedding_count)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            (&hash, &model, embeddings, counts, embedding_count as i64),
         )?;
         Ok(())
     }
@@ -438,11 +498,23 @@ impl DB {
         max_chunk_rowid: i64,
     ) -> SQLResult<i64> {
         self.conn().execute(
-            "INSERT INTO generation(level, num_embeddings, min_chunk_rowid, max_chunk_rowid)
-             VALUES(?1, ?2, ?3, ?4)",
+            "INSERT INTO generation(level, num_embeddings, min_chunk_rowid, max_chunk_rowid, bucket_data_file)
+             VALUES(?1, ?2, ?3, ?4, '')",
             (level, num_embeddings as i64, min_chunk_rowid, max_chunk_rowid),
         )?;
         Ok(self.conn().last_insert_rowid())
+    }
+
+    pub fn set_generation_bucket_data_file(
+        &self,
+        generation_id: i64,
+        bucket_data_file: &str,
+    ) -> SQLResult<()> {
+        self.conn().execute(
+            "UPDATE generation SET bucket_data_file = ?1 WHERE id = ?2",
+            (bucket_data_file, generation_id),
+        )?;
+        Ok(())
     }
 }
 
@@ -460,5 +532,36 @@ impl Drop for DB {
                 }
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DB;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn db_parent_uses_current_dir_for_bare_relative_path() {
+        assert_eq!(DB::db_parent(Path::new("mydb.sqlite")), Path::new("."));
+        assert_eq!(DB::db_parent(Path::new("data/mydb.sqlite")), Path::new("data"));
+    }
+
+    #[test]
+    fn removes_sidecars_for_bare_relative_path() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = format!("warp-sidecar-test-{nonce}.sqlite");
+        let db_path = PathBuf::from(&base);
+        let sidecar = PathBuf::from(format!("{base}.buckets.1.test"));
+        let old_sidecar = PathBuf::from(format!("{base}.residuals.1.test"));
+
+        std::fs::write(&sidecar, b"bucket").unwrap();
+        std::fs::write(&old_sidecar, b"residual").unwrap();
+        DB::remove_bucket_data_sidecars(&db_path);
+
+        assert!(!sidecar.exists());
+        assert!(!old_sidecar.exists());
     }
 }
