@@ -5,20 +5,32 @@ SHELL := /bin/bash
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
+ENCODER ?= t5-quantized
+
 # Determine features and flags based on platform
 ifeq ($(UNAME_S),Darwin)
   ifeq ($(UNAME_M),arm64)
     # Apple Silicon: Metal GPU + Accelerate BLAS
+<<<<<<< HEAD
     CLI_FEATURES := t5-quantized,metal,progress
     NAPI_FEATURES := t5-quantized,metal,napi
     PYTHON_FEATURES := t5-quantized,metal,python
+=======
+    CLI_FEATURES := $(ENCODER),metal,progress
+    NAPI_FEATURES := $(ENCODER),metal,napi
+>>>>>>> 7b649dc (Add ModernBERT GraniteV2 encoder support)
     RUSTFLAGS_EXTRA :=
     TARGET := aarch64-apple-darwin
   else
     # Intel Mac: CPU-only with FBGEMM + hybrid-dequant
+<<<<<<< HEAD
     CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
     NAPI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,napi
     PYTHON_FEATURES := t5-quantized,fbgemm,hybrid-dequant,python
+=======
+    CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress
+    NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
+>>>>>>> 7b649dc (Add ModernBERT GraniteV2 encoder support)
     RUSTFLAGS_EXTRA := -C target-feature=+avx2,+fma
     TARGET := x86_64-apple-darwin
   endif
@@ -26,6 +38,7 @@ ifeq ($(UNAME_S),Darwin)
 else ifeq ($(UNAME_S),Linux)
   NVCC := $(or $(shell which nvcc 2>/dev/null),$(wildcard /usr/local/cuda/bin/nvcc),$(wildcard /opt/cuda/bin/nvcc))
   ifneq ($(NVCC),)
+<<<<<<< HEAD
     CLI_FEATURES := t5-quantized,cuda,progress
     NAPI_FEATURES := t5-quantized,cuda,napi
     PYTHON_FEATURES := t5-quantized,cuda,python
@@ -39,6 +52,13 @@ else ifeq ($(UNAME_S),Linux)
     CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
     NAPI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,napi
     PYTHON_FEATURES := t5-quantized,fbgemm,hybrid-dequant,python
+=======
+    CLI_FEATURES := $(ENCODER),cuda,progress
+    NAPI_FEATURES := $(ENCODER),cuda,napi
+  else
+    CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress
+    NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
+>>>>>>> 7b649dc (Add ModernBERT GraniteV2 encoder support)
   endif
   PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
   RUSTFLAGS_EXTRA :=
@@ -101,10 +121,37 @@ assets/config.json assets/tokenizer.json xtr.safetensors: env/bin/transformers |
 assets/xtr.gguf: xtr.safetensors | assets prereqs
 	cargo run -p quantize-tool xtr.safetensors assets/xtr.gguf
 
+modernbert-assets: | assets
+	@test -f assets/config.json || (echo "missing assets/config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+	@test -f assets/tokenizer.json || (echo "missing assets/tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+	@test -f assets/model.safetensors || (echo "missing assets/model.safetensors; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+
+modernbert-quantized-assets: | assets
+	@test -f assets/config.json || (echo "missing assets/config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+	@test -f assets/tokenizer.json || (echo "missing assets/tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+	@if [ ! -f assets/modernbert.gguf ]; then \
+		if [ -f assets/model.safetensors ]; then \
+			cargo run -p quantize-tool --release -- assets/model.safetensors assets/modernbert.gguf; \
+		else \
+			echo "missing assets/modernbert.gguf; run scripts/export_modernbert.py <checkpoint> assets, then make ENCODER=modernbert-quantized" >&2; \
+			exit 1; \
+		fi; \
+	fi
+
 assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml: | prereqs
 	$(PYTHON_BIN) quantize-openvino.py
 
-download: prereqs assets assets/config.json assets/tokenizer.json assets/xtr.gguf
+ifeq ($(ENCODER),modernbert)
+DOWNLOAD_TARGETS := modernbert-assets
+else ifeq ($(ENCODER),modernbert-quantized)
+DOWNLOAD_TARGETS := modernbert-quantized-assets
+else ifeq ($(ENCODER),t5-openvino)
+DOWNLOAD_TARGETS := assets assets/config.json assets/tokenizer.json assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
+else
+DOWNLOAD_TARGETS := assets assets/config.json assets/tokenizer.json assets/xtr.gguf
+endif
+
+download: prereqs $(DOWNLOAD_TARGETS)
 
 ovdownload: prereqs assets/config.json assets/tokenizer.json assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
 
@@ -212,4 +259,28 @@ distclean:
 	fi
 	rm -rf .make-stamps .stamp* stamp-* *.stamp */.stamp* */*.stamp */stamp-*
 
-.PHONY: prereqs download ovdownload build buildemb warp-cli pickbrain pickbrain-install module macintel winintel win test bench nfcorpus nfcorpus-score run python-build-deps python-wheel python-dev python-test distclean
+.PHONY: \
+	bench \
+	build \
+	buildemb \
+	distclean \
+	download \
+	macintel \
+	modernbert-assets \
+	modernbert-quantized-assets \
+	module \
+	nfcorpus \
+	nfcorpus-score \
+	ovdownload \
+	pickbrain \
+	pickbrain-install \
+	prereqs \
+	python-build-deps \
+	python-dev \
+	python-test \
+	python-wheel \
+	run \
+	test \
+	warp-cli \
+	win \
+	winintel

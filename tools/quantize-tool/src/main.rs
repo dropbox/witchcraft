@@ -9,19 +9,23 @@ fn run_quantize_safetensors(
     let tensors = candle_core::safetensors::load(in_file, &Device::Cpu)?;
     println!("tensors: {}", tensors.len());
 
-    let dtype = GgmlDType::Q4K;
-    let block_size = dtype.block_size();
-
     let qtensors = tensors
         .into_iter()
         .map(|(name, tensor)| {
-            let should_quantize = tensor.rank() == 2 && tensor.dim(1)? % block_size == 0;
-            println!("  quantizing {name} {dtype:?} {tensor:?} {should_quantize}");
-            let tensor = if should_quantize {
-                QTensor::quantize(&tensor, dtype)?
+            let qdtype = if tensor.rank() == 2 {
+                let dim1 = tensor.dim(1)?;
+                if dim1 % GgmlDType::Q4K.block_size() == 0 {
+                    GgmlDType::Q4K
+                } else if dim1 % GgmlDType::Q4_1.block_size() == 0 {
+                    GgmlDType::Q4_1
+                } else {
+                    GgmlDType::F32
+                }
             } else {
-                QTensor::quantize(&tensor, GgmlDType::F32)?
+                GgmlDType::F32
             };
+            println!("  {name} {qdtype:?} {tensor:?}");
+            let tensor = QTensor::quantize(&tensor, qdtype)?;
             Ok((name, tensor))
         })
         .collect::<Result<Vec<_>>>()?;

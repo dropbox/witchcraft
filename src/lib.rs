@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-// Conditionally compile T5 encoder based on features
+// Conditionally compile encoder backend based on features
 #[cfg(feature = "t5-quantized")]
 pub mod quantized_t5;
 #[cfg(feature = "t5-quantized")]
@@ -23,12 +23,34 @@ mod openvino_t5;
 #[cfg(feature = "t5-openvino")]
 use openvino_t5 as t5_encoder;
 
-// Compile-time checks for mutual exclusivity
-#[cfg(not(any(feature = "t5-quantized", feature = "t5-openvino")))]
-compile_error!("Must enable exactly one T5 backend: t5-quantized or t5-openvino");
+#[cfg(feature = "modernbert")]
+mod modernbert;
+#[cfg(feature = "modernbert")]
+use modernbert as t5_encoder;
 
-#[cfg(all(feature = "t5-quantized", feature = "t5-openvino"))]
-compile_error!("Cannot enable multiple T5 backends simultaneously");
+#[cfg(feature = "modernbert-quantized")]
+mod quantized_modernbert;
+#[cfg(feature = "modernbert-quantized")]
+use quantized_modernbert as t5_encoder;
+
+// Compile-time checks: exactly one encoder backend required.
+#[cfg(not(any(
+    feature = "t5-quantized",
+    feature = "t5-openvino",
+    feature = "modernbert",
+    feature = "modernbert-quantized",
+)))]
+compile_error!("Must enable exactly one encoder backend: t5-quantized, t5-openvino, modernbert, or modernbert-quantized");
+
+#[cfg(any(
+    all(feature = "t5-quantized", feature = "t5-openvino"),
+    all(feature = "t5-quantized", feature = "modernbert"),
+    all(feature = "t5-quantized", feature = "modernbert-quantized"),
+    all(feature = "t5-openvino", feature = "modernbert"),
+    all(feature = "t5-openvino", feature = "modernbert-quantized"),
+    all(feature = "modernbert", feature = "modernbert-quantized"),
+))]
+compile_error!("Cannot enable multiple encoder backends simultaneously");
 
 // hybrid-dequant is a CPU-only optimization and cannot be used with Metal
 #[cfg(all(feature = "hybrid-dequant", feature = "metal"))]
@@ -73,18 +95,12 @@ mod python;
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
-const EMBEDDING_DIM: usize = 128;
-const CENTER_BYTES: usize = EMBEDDING_DIM * std::mem::size_of::<f32>();
+const DEFAULT_EMBEDDING_DIM: usize = 128;
 const BUCKET_DATA_VERSION: u32 = 2;
 const BUCKET_DATA_MAGIC: [u8; 8] = *b"WRPBKT02";
 const BUCKET_META_PREFIX_BYTES: usize = 20;
-const BUCKET_META_BYTES: usize = BUCKET_META_PREFIX_BYTES + CENTER_BYTES;
 const BUCKET_DATA_HEADER_BYTES: usize =
     std::mem::size_of::<u32>() + BUCKET_DATA_MAGIC.len() + 3 * std::mem::size_of::<u64>();
-#[cfg(all(feature = "polar-quant", feature = "polar-quant-2bit"))]
-const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 4; // packed 2-bit polar residual pairs
-#[cfg(not(all(feature = "polar-quant", feature = "polar-quant-2bit")))]
-const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 2; // packed 4-bit residuals
 #[cfg(not(test))]
 const L0_CAPACITY: usize = 1024;
 #[cfg(test)]
@@ -98,6 +114,48 @@ const LSM_FANOUT: usize = 2;
 /// A document pointer combining document ID and sub-chunk index
 /// Allows precise location of results within subdivided documents
 pub type DocPtr = (u32, u32);
+
+fn center_bytes_for_dim(dim: usize) -> usize {
+    dim * std::mem::size_of::<f32>()
+}
+
+fn bucket_meta_bytes_for_dim(dim: usize) -> usize {
+    BUCKET_META_PREFIX_BYTES + center_bytes_for_dim(dim)
+}
+
+fn residual_bytes_for_dim(dim: usize) -> usize {
+    #[cfg(all(feature = "polar-quant", feature = "polar-quant-2bit"))]
+    {
+        assert!(
+            dim % 4 == 0,
+            "embedding dimension must be divisible by four for 2-bit polar residuals"
+        );
+        dim / 4
+    }
+    #[cfg(not(all(feature = "polar-quant", feature = "polar-quant-2bit")))]
+    {
+        assert!(
+            dim % 2 == 0,
+            "embedding dimension must be even for q4 residuals"
+        );
+        dim / 2
+    }
+}
+
+fn model_id_for_dim(dim: usize) -> String {
+    if dim == DEFAULT_EMBEDDING_DIM {
+        "xtr-base-en".to_string()
+    } else {
+        format!("xtr-base-en-d{dim}")
+    }
+}
+
+fn dim_from_model_id(model: &str) -> usize {
+    model
+        .strip_prefix("xtr-base-en-d")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_EMBEDDING_DIM)
+}
 
 pub fn make_device() -> Device {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -366,6 +424,8 @@ struct BucketSidecarMeta {
 
 struct BucketDataHeader {
     centroid_count: usize,
+    embedding_dim: usize,
+    meta_bytes: usize,
     meta_offset: usize,
     payload_offset: usize,
 }
@@ -412,17 +472,38 @@ fn bucket_data_header(bucket_data: &[u8]) -> Result<BucketDataHeader> {
     let centroid_count: usize = read_u64_le(bucket_data, 12)?.try_into()?;
     let meta_offset: usize = read_u64_le(bucket_data, 20)?.try_into()?;
     let payload_offset: usize = read_u64_le(bucket_data, 28)?.try_into()?;
-    let meta_bytes = centroid_count
-        .checked_mul(BUCKET_META_BYTES)
-        .ok_or_else(|| anyhow::anyhow!("bucket metadata length overflow"))?;
     anyhow::ensure!(
-        meta_offset >= BUCKET_DATA_HEADER_BYTES
-            && payload_offset >= meta_offset + meta_bytes
-            && payload_offset <= bucket_data.len(),
+        meta_offset >= BUCKET_DATA_HEADER_BYTES && payload_offset >= meta_offset,
+        "bucket sidecar layout is invalid"
+    );
+    let meta_block_len = payload_offset - meta_offset;
+    let meta_bytes = if centroid_count == 0 {
+        bucket_meta_bytes_for_dim(DEFAULT_EMBEDDING_DIM)
+    } else {
+        anyhow::ensure!(
+            meta_block_len % centroid_count == 0,
+            "bucket sidecar metadata block is not divisible by centroid count"
+        );
+        meta_block_len / centroid_count
+    };
+    anyhow::ensure!(
+        meta_bytes >= BUCKET_META_PREFIX_BYTES,
+        "bucket sidecar metadata entry is too small"
+    );
+    let center_bytes = meta_bytes - BUCKET_META_PREFIX_BYTES;
+    anyhow::ensure!(
+        center_bytes % std::mem::size_of::<f32>() == 0,
+        "bucket sidecar center byte length is not a multiple of f32"
+    );
+    let embedding_dim = center_bytes / std::mem::size_of::<f32>();
+    anyhow::ensure!(
+        payload_offset <= bucket_data.len(),
         "bucket sidecar layout is invalid"
     );
     Ok(BucketDataHeader {
         centroid_count,
+        embedding_dim,
+        meta_bytes,
         meta_offset,
         payload_offset,
     })
@@ -434,13 +515,13 @@ fn bucket_data_bucket_meta(
 ) -> Result<Vec<BucketSidecarMeta>> {
     let mut metas = Vec::with_capacity(header.centroid_count);
     for bucket_idx in 0..header.centroid_count {
-        let offset = header.meta_offset + bucket_idx * BUCKET_META_BYTES;
+        let offset = header.meta_offset + bucket_idx * header.meta_bytes;
         let size = read_u32_le(bucket_data, offset)? as usize;
         let data_offset: u64 = read_u64_le(bucket_data, offset + 4)?;
         let indices_len = read_u32_le(bucket_data, offset + 12)? as usize;
         let residual_len = read_u32_le(bucket_data, offset + 16)? as usize;
         let center_start = offset + BUCKET_META_PREFIX_BYTES;
-        let center_end = offset + BUCKET_META_BYTES;
+        let center_end = offset + header.meta_bytes;
         anyhow::ensure!(
             data_offset >= header.payload_offset as u64,
             "bucket {bucket_idx} data offset is before payload block"
@@ -465,10 +546,10 @@ fn bucket_data_bucket_meta(
 }
 
 fn write_bucket_meta(writer: &mut impl Write, meta: &BucketSidecarMeta) -> Result<()> {
+    let center_bytes = meta.center.len();
     anyhow::ensure!(
-        meta.center.len() == CENTER_BYTES,
-        "bucket center byte length {} does not match expected {CENTER_BYTES}",
-        meta.center.len()
+        center_bytes % std::mem::size_of::<f32>() == 0,
+        "bucket center byte length {center_bytes} is not a multiple of f32"
     );
     writer.write_all(&u32::try_from(meta.size)?.to_le_bytes())?;
     writer.write_all(&meta.data_offset.to_le_bytes())?;
@@ -496,22 +577,21 @@ fn merge_and_write_buckets(
     let data_tmp = tempfile::NamedTempFile::new_in(temp_dir)?;
     let mut data_writer = BufWriter::new(data_tmp.reopen()?);
     let (centroid_count, center_dim) = centers_cpu.dims2()?;
-    anyhow::ensure!(
-        center_dim == EMBEDDING_DIM,
-        "centers have dim {center_dim}, expected {EMBEDDING_DIM}"
-    );
+    let center_bytes = center_bytes_for_dim(center_dim);
+    let bucket_meta_bytes = bucket_meta_bytes_for_dim(center_dim);
+    let residual_bytes = residual_bytes_for_dim(center_dim);
     let mut bucket_meta: Vec<BucketSidecarMeta> = (0..centroid_count)
         .map(|_| BucketSidecarMeta {
             size: 0,
             data_offset: 0,
             indices_len: 0,
             residual_len: 0,
-            center: vec![0; CENTER_BYTES],
+            center: vec![0; center_bytes],
         })
         .collect();
     let mut data_offset = 0u64;
 
-    let mut merger = merger::Merger::from_tempfiles(tmpfiles, RESIDUAL_BYTES)?;
+    let mut merger = merger::Merger::from_tempfiles(tmpfiles, residual_bytes)?;
     for result in &mut merger {
         let entry = result?;
         let bucket_idx = entry.value as usize;
@@ -523,22 +603,24 @@ fn merge_and_write_buckets(
         let center = centers_cpu.get(bucket_idx)?;
         let center_bytes = center.to_f32_bytes()?;
         anyhow::ensure!(
-            center_bytes.len() == CENTER_BYTES,
-            "bucket {} center byte length {} does not match expected {CENTER_BYTES}",
+            center_bytes.len() == center_bytes_for_dim(center_dim),
+            "bucket {} center byte length {} does not match expected {}",
             entry.value,
-            center_bytes.len()
+            center_bytes.len(),
+            center_bytes_for_dim(center_dim)
         );
         let compressed_keys = compress_keys(&entry.keys);
         anyhow::ensure!(
-            entry.data.len() % RESIDUAL_BYTES == 0,
-            "bucket {} residual byte length {} is not divisible by compiled residual width {RESIDUAL_BYTES}",
+            entry.data.len() % residual_bytes == 0,
+            "bucket {} residual byte length {} is not divisible by residual width {}",
             entry.value,
-            entry.data.len()
+            entry.data.len(),
+            residual_bytes
         );
         data_writer.write_all(&compressed_keys)?;
         data_writer.write_all(&entry.data)?;
         let meta = &mut bucket_meta[bucket_idx];
-        meta.size = entry.data.len() / RESIDUAL_BYTES;
+        meta.size = entry.data.len() / residual_bytes;
         meta.data_offset = data_offset;
         meta.indices_len = compressed_keys.len();
         meta.residual_len = entry.data.len();
@@ -555,7 +637,7 @@ fn merge_and_write_buckets(
     drop(data_writer);
 
     let meta_block_len = centroid_count
-        .checked_mul(BUCKET_META_BYTES)
+        .checked_mul(bucket_meta_bytes)
         .ok_or_else(|| anyhow::anyhow!("bucket metadata block length overflow"))?;
     let meta_offset = BUCKET_DATA_HEADER_BYTES;
     let payload_start = meta_offset
@@ -838,6 +920,8 @@ mod reciprocal_rank_fusion_tests {
 
 /// Per-generation centroid data loaded from the database.
 pub struct GenerationCentroids {
+    dim: usize,
+    residual_bytes: usize,
     bucket_indices: Vec<usize>,
     sizes: Vec<usize>,
     data_offsets: Vec<usize>,
@@ -899,6 +983,7 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
         let bucket_data = Arc::new(mmap);
 
         let header = bucket_data_header(&bucket_data)?;
+        let residual_bytes = residual_bytes_for_dim(header.embedding_dim);
         let metas = bucket_data_bucket_meta(&bucket_data, &header)?;
 
         let mut bucket_indices = vec![];
@@ -917,17 +1002,19 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
             data_offsets.push(meta.data_offset.try_into()?);
             indices_lens.push(meta.indices_len);
             residual_lens.push(meta.residual_len);
-            let t = Tensor::from_f32_bytes(&meta.center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
+            let t = Tensor::from_f32_bytes(&meta.center, header.embedding_dim, &Device::Cpu)?.flatten_all()?;
             centers.push(t);
         }
 
         let centers_matrix = if !centers.is_empty() {
             Tensor::stack(&centers, 0)?.to_device(device)?
         } else {
-            Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?
+            Tensor::zeros(&[0, header.embedding_dim], DType::F32, device)?
         };
 
         all.push(GenerationCentroids {
+            dim: header.embedding_dim,
+            residual_bytes,
             bucket_indices,
             sizes,
             data_offsets,
@@ -960,7 +1047,7 @@ pub fn match_centroids_raw(
     let k = 32;
     let t_prime = 40000;
     let device = query_embeddings.device();
-    let (m, _n) = query_embeddings.dims2()?;
+    let (m, query_dim) = query_embeddings.dims2()?;
 
     let mut all_residuals = vec![];
     let mut document_clusters: Vec<(usize, usize)> = vec![];
@@ -978,6 +1065,12 @@ pub fn match_centroids_raw(
         if gen.sizes.is_empty() {
             continue;
         }
+        anyhow::ensure!(
+            gen.dim == query_dim,
+            "index embedding dimension {} does not match query dimension {}; re-embed and reindex with the selected encoder",
+            gen.dim,
+            query_dim
+        );
 
         let gen_idx = gen_centroid_scores_all.len();
         let n_centroids = gen.sizes.len();
@@ -1037,17 +1130,18 @@ pub fn match_centroids_raw(
 
             let document_indices = decompress_keys(keys_compressed)?;
             anyhow::ensure!(
-                residual_bytes.len() % RESIDUAL_BYTES == 0,
-                "bucket {bucket_id} residual byte length {} is not divisible by compiled residual width {RESIDUAL_BYTES}; run ./warp-cli reindex with matching feature flags",
-                residual_bytes.len()
+                residual_bytes.len() % gen.residual_bytes == 0,
+                "bucket {bucket_id} residual byte length {} is not divisible by residual width {}; run ./warp-cli reindex with matching feature flags",
+                residual_bytes.len(),
+                gen.residual_bytes
             );
             #[cfg(feature = "polar-quant")]
             let residuals =
-                Tensor::from_polar_q4_bytes(&residual_bytes, EMBEDDING_DIM, &table, &Device::Cpu)?;
+                Tensor::from_polar_q4_bytes(&residual_bytes, gen.dim, &table, &Device::Cpu)?;
             #[cfg(not(feature = "polar-quant"))]
             let residuals = Tensor::from_companded_q4_bytes(
                 &residual_bytes,
-                EMBEDDING_DIM,
+                gen.dim,
                 &table,
                 &Device::Cpu,
             )?;
@@ -1100,7 +1194,11 @@ pub fn match_centroids_raw(
     if !unindexed.is_empty() {
         let mut unindexed_tensors = vec![];
         for (id, embeddings) in unindexed {
-            let (num_docs, _) = embeddings.dims2()?;
+            let (num_docs, dim) = embeddings.dims2()?;
+            anyhow::ensure!(
+                dim == query_dim,
+                "unindexed embedding dimension {dim} does not match query dimension {query_dim}; re-embed with the selected encoder"
+            );
             unindexed_tensors.push(embeddings.clone());
             for _ in 0..num_docs {
                 all.push(((*id, 0), count));
@@ -1222,19 +1320,23 @@ pub fn match_centroids(
     let mut unindexed: Vec<(u32, Tensor)> = vec![];
     {
         let mut unindexed_query = db.query(
-            "SELECT d.rowid, c.embeddings
+            "SELECT d.rowid, c.model, c.embeddings
              FROM document AS d
              JOIN chunk AS c ON c.hash = d.hash
              WHERE c.rowid > ?1
              ORDER BY d.rowid",
         )?;
         let results = unindexed_query.query_map((max_indexed_rowid,), |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
         })?;
         for result in results {
-            let (id, embeddings) = result?;
+            let (id, model, embeddings) = result?;
             let embeddings =
-                Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
+                Tensor::embeddings_from_packed(&embeddings, dim_from_model_id(&model), &Device::Cpu)?;
             unindexed.push((id, embeddings));
         }
     }
@@ -1290,7 +1392,7 @@ fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
     let dims = tensor.dims();
     let num_rows = dims[0];
 
-    // Collect each row as a separate Tensor of shape [EMBEDDING_DIM]
+    // Collect each row as a separate one-row tensor.
     (0..num_rows)
         .map(|i| {
             let row_tensor = tensor.i(i).unwrap();
@@ -1500,7 +1602,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
 
         #[cfg(debug_assertions)]
         {
-            let t = Tensor::embeddings_from_packed(&bytes, EMBEDDING_DIM, &Device::Cpu)?;
+            let t = Tensor::embeddings_from_packed(&bytes, cols, &Device::Cpu)?;
             let min_acc = rowwise_cosine_min(&embeddings, &t)?;
 
             let n = bpe.ceil() as u32;
@@ -1515,7 +1617,8 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
             .collect::<Vec<_>>()
             .join(",");
 
-        match db.add_chunk(&hash, "xtr-base-en", &bytes, &counts, rows) {
+        let model_id = model_id_for_dim(cols);
+        match db.add_chunk(&hash, &model_id, &bytes, &counts, rows) {
             Ok(()) => {
                 count += 1;
                 progress.inc(1);
@@ -1580,8 +1683,12 @@ fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
-    for embeddings in kmeans_query.query_map((), |row| row.get::<_, Vec<u8>>(0))? {
-        let t = Tensor::embeddings_from_packed(&embeddings?, EMBEDDING_DIM, &Device::Cpu)?;
+    for result in kmeans_query.query_map((), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })? {
+        let (model, embeddings) = result?;
+        let t =
+            Tensor::embeddings_from_packed(&embeddings, dim_from_model_id(&model), &Device::Cpu)?;
         let (m, _) = t.dims2()?;
         let k = ((m as f32).sqrt().ceil()) as usize;
         let subset_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
@@ -1592,7 +1699,7 @@ fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(
         total_embeddings += m;
     }
     if all_embeddings.is_empty() {
-        return Ok((Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?, 0));
+        return Ok((Tensor::zeros(&[0, DEFAULT_EMBEDDING_DIM], DType::F32, device)?, 0));
     }
     let matrix = Tensor::stack(&all_embeddings, 0)?.to_device(device)?;
     Ok((matrix, total_embeddings))
@@ -1626,7 +1733,7 @@ fn build_layer(
     max_rowid: i64,
 ) -> Result<()> {
     let sql = format!(
-        "SELECT chunk.embeddings FROM chunk
+        "SELECT chunk.model, chunk.embeddings FROM chunk
          WHERE chunk.rowid >= {} AND chunk.rowid <= {}",
         min_rowid, max_rowid
     );
@@ -1680,7 +1787,7 @@ fn write_buckets_for_range(
     let mut all_embeddings = vec![];
 
     let embeddings_sql = format!(
-        "SELECT document.rowid, chunk.embeddings, chunk.counts
+        "SELECT document.rowid, chunk.model, chunk.embeddings, chunk.counts
          FROM document, chunk
          WHERE document.hash = chunk.hash
          AND chunk.rowid >= {} AND chunk.rowid <= {}
@@ -1693,8 +1800,9 @@ fn write_buckets_for_range(
     let mut results = query.query_map((), |row| {
         Ok((
             row.get::<_, u32>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
 
@@ -1702,13 +1810,20 @@ fn write_buckets_for_range(
     let mut batch = 0;
     let mut tmpfiles = vec![];
     let centers_cpu = centers.to_device(&Device::Cpu)?;
+    let (_, center_dim) = centers_cpu.dims2()?;
+    let residual_bytes = residual_bytes_for_dim(center_dim);
     let packed_centers = fast_ops::PackedRight::new(centers)?;
     while !done {
         match results.next() {
             Some(result) => {
-                let (id, embeddings, counts) = result?;
+                let (id, model, embeddings, counts) = result?;
 
-                let t = Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
+                let dim = dim_from_model_id(&model);
+                anyhow::ensure!(
+                    dim == center_dim,
+                    "chunk embedding dimension {dim} does not match index center dimension {center_dim}"
+                );
+                let t = Tensor::embeddings_from_packed(&embeddings, dim, &Device::Cpu)?;
                 let split = split_tensor(&t);
                 let m = split.len();
 
@@ -1746,7 +1861,7 @@ fn write_buckets_for_range(
             mmuls_total += now.elapsed().as_millis();
 
             let now = std::time::Instant::now();
-            let mut writer = merger::Writer::new(RESIDUAL_BYTES)?;
+            let mut writer = merger::Writer::new(residual_bytes)?;
 
             let mut pairs: Vec<(usize, u32)> = cluster_assignments
                 .to_vec1::<u32>()?
@@ -1757,7 +1872,7 @@ fn write_buckets_for_range(
             pairs.sort_by_key(|&(_, bucket)| bucket);
 
             let mut keys: Vec<(u32, u32)> = Vec::with_capacity(take);
-            let mut residuals_bytes: Vec<u8> = Vec::with_capacity(take * RESIDUAL_BYTES);
+            let mut residuals_bytes: Vec<u8> = Vec::with_capacity(take * residual_bytes);
             let (_, mut prev_bucket) = pairs[0];
 
             for (sample, bucket) in pairs.iter().copied().chain(std::iter::once((0, u32::MAX))) {
