@@ -837,7 +837,7 @@ mod reciprocal_rank_fusion_tests {
 }
 
 /// Per-generation centroid data loaded from the database.
-struct GenerationCentroids {
+pub struct GenerationCentroids {
     bucket_indices: Vec<usize>,
     sizes: Vec<usize>,
     data_offsets: Vec<usize>,
@@ -847,107 +847,15 @@ struct GenerationCentroids {
     centers_matrix: Tensor,
 }
 
-type CentersCache = Vec<GenerationCentroids>;
-
-static CACHED: Lazy<RwLock<HashMap<PathBuf, CentersCache>>> =
+static GENERATIONS_CACHE: Lazy<RwLock<HashMap<Vec<PathBuf>, Arc<Vec<GenerationCentroids>>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-fn invalidate_center_cache(db: &DB) {
-    CACHED.write().unwrap().remove(db.path());
+pub fn invalidate_generations_cache(paths: &[PathBuf]) {
+    GENERATIONS_CACHE.write().unwrap().remove(paths);
 }
 
-fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<GenerationCentroids>> {
-    let now = std::time::Instant::now();
-    {
-        let cache = CACHED.read().unwrap();
-        if let Some(cached) = cache.get(db.path()) {
-            debug!(
-                "get_all_generation_centers cache hit ({} generations)",
-                cached.len()
-            );
-            return Ok(cached.clone());
-        }
-    }
-
-    let mut gen_query =
-        db.query("SELECT bucket_data_file FROM generation ORDER BY level, id")?;
-    let generations: Vec<String> = gen_query
-        .query_map((), |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut all = Vec::with_capacity(generations.len());
-
-    for bucket_data_file in generations {
-        let mut bucket_indices = vec![];
-        let mut sizes = vec![];
-        let mut data_offsets = vec![];
-        let mut indices_lens = vec![];
-        let mut residual_lens = vec![];
-        let bucket_data = if bucket_data_file.is_empty() {
-            None
-        } else {
-            let path = db.bucket_data_path(&bucket_data_file);
-            let file = File::open(&path)?;
-            // The mapped file is immutable after generation creation.
-            let mmap = unsafe { Mmap::map(&file)? };
-            Some(Arc::new(mmap))
-        };
-        let mut centers = vec![];
-        if let Some(bucket_data) = &bucket_data {
-            let header = bucket_data_header(bucket_data)?;
-            let metas = bucket_data_bucket_meta(bucket_data, &header)?;
-            for (bucket_idx, meta) in metas.into_iter().enumerate() {
-                if meta.size == 0 {
-                    continue;
-                }
-                bucket_indices.push(bucket_idx);
-                sizes.push(meta.size);
-                data_offsets.push(meta.data_offset.try_into()?);
-                indices_lens.push(meta.indices_len);
-                residual_lens.push(meta.residual_len);
-                let t = Tensor::from_f32_bytes(&meta.center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
-                centers.push(t);
-            }
-        }
-        let centers_matrix = if !centers.is_empty() {
-            Tensor::stack(&centers, 0)?.to_device(device)?
-        } else {
-            Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?
-        };
-        all.push(GenerationCentroids {
-            bucket_indices,
-            sizes,
-            data_offsets,
-            indices_lens,
-            residual_lens,
-            bucket_data,
-            centers_matrix,
-        });
-    }
-
-    debug!(
-        "reading centers for {} generations took {} ms",
-        all.len(),
-        now.elapsed().as_millis()
-    );
-
-    let mut cache = CACHED.write().unwrap();
-    cache.insert(db.path().clone(), all.clone());
-    Ok(all)
-}
-
-impl Clone for GenerationCentroids {
-    fn clone(&self) -> Self {
-        Self {
-            bucket_indices: self.bucket_indices.clone(),
-            sizes: self.sizes.clone(),
-            data_offsets: self.data_offsets.clone(),
-            indices_lens: self.indices_lens.clone(),
-            residual_lens: self.residual_lens.clone(),
-            bucket_data: self.bucket_data.clone(),
-            centers_matrix: self.centers_matrix.clone(),
-        }
-    }
+fn clear_generations_cache() {
+    GENERATIONS_CACHE.write().unwrap().clear();
 }
 
 #[inline(always)]
@@ -974,13 +882,79 @@ fn vmax_inplace(current: &mut [f32], row: &[f32]) {
     }
 }
 
-pub fn match_centroids(
-    db: &DB,
+/// Load generation centroid data from mmap sidecar files (cached).
+pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<GenerationCentroids>>> {
+    let key = paths.to_vec();
+    {
+        let cache = GENERATIONS_CACHE.read().unwrap();
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let mut all = Vec::with_capacity(paths.len());
+    for path in paths {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let bucket_data = Arc::new(mmap);
+
+        let header = bucket_data_header(&bucket_data)?;
+        let metas = bucket_data_bucket_meta(&bucket_data, &header)?;
+
+        let mut bucket_indices = vec![];
+        let mut sizes = vec![];
+        let mut data_offsets = vec![];
+        let mut indices_lens = vec![];
+        let mut residual_lens = vec![];
+        let mut centers = vec![];
+
+        for (bucket_idx, meta) in metas.into_iter().enumerate() {
+            if meta.size == 0 {
+                continue;
+            }
+            bucket_indices.push(bucket_idx);
+            sizes.push(meta.size);
+            data_offsets.push(meta.data_offset.try_into()?);
+            indices_lens.push(meta.indices_len);
+            residual_lens.push(meta.residual_len);
+            let t = Tensor::from_f32_bytes(&meta.center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
+            centers.push(t);
+        }
+
+        let centers_matrix = if !centers.is_empty() {
+            Tensor::stack(&centers, 0)?.to_device(device)?
+        } else {
+            Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?
+        };
+
+        all.push(GenerationCentroids {
+            bucket_indices,
+            sizes,
+            data_offsets,
+            indices_lens,
+            residual_lens,
+            bucket_data: Some(bucket_data),
+            centers_matrix,
+        });
+    }
+
+    let result = Arc::new(all);
+    GENERATIONS_CACHE.write().unwrap().insert(key, result.clone());
+    Ok(result)
+}
+
+/// Pure index search: scores query embeddings against generation sidecar files.
+/// No database access — loads generations from mmap files directly.
+/// `unindexed` contains (doc_rowid, embeddings) for documents not yet in any generation.
+pub fn match_centroids_raw(
+    generation_files: &[PathBuf],
     query_embeddings: &Tensor,
+    unindexed: &[(u32, Tensor)],
     threshold: f32,
     top_k: usize,
-    sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<Vec<(f32, u32, u32)>> {
+    let device = query_embeddings.device();
+    let generations = load_generations(generation_files, device)?;
     let total_start = std::time::Instant::now();
 
     let k = 32;
@@ -989,20 +963,18 @@ pub fn match_centroids(
     let (m, _n) = query_embeddings.dims2()?;
 
     let mut all_residuals = vec![];
-    let mut document_clusters: Vec<(usize, usize)> = vec![]; // (gen_idx, cluster_idx)
+    let mut document_clusters: Vec<(usize, usize)> = vec![];
     let mut gen_centroid_scores_all: Vec<Vec<Vec<f32>>> = vec![];
     let mut all = vec![];
     let mut count = 0;
     let mut missing = vec![0.0f32; m];
-
-    let generations = get_all_generation_centers(db, device)?;
 
     #[cfg(not(feature = "polar-quant"))]
     let table: [f32; 16] = packops::make_residual_dequant_table()?;
     #[cfg(feature = "polar-quant")]
     let table: packops::PolarDequantTable = packops::make_residual_dequant_table()?;
 
-    for gen in &generations {
+    for gen in generations.iter() {
         if gen.sizes.is_empty() {
             continue;
         }
@@ -1094,35 +1066,7 @@ pub fn match_centroids(
         }
     }
 
-    // Also load any unindexed chunks (documents not yet in any generation)
-    let max_indexed_rowid = max_indexed_chunk_rowid(db)?;
-
-    let mut unindexed_embeddings = vec![];
-    {
-        let mut unindexed_query = db.query(
-            "SELECT d.rowid, c.embeddings
-             FROM document AS d
-             JOIN chunk AS c ON c.hash = d.hash
-             WHERE c.rowid > ?1
-             ORDER BY d.rowid",
-        )?;
-        let results = unindexed_query.query_map((max_indexed_rowid,), |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        for result in results {
-            let (id, embeddings) = result?;
-            let embeddings =
-                Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
-            let (num_docs, _) = embeddings.dims2()?;
-            unindexed_embeddings.push(embeddings);
-            for _ in 0..num_docs {
-                all.push(((id, 0), count));
-                count += 1;
-            }
-        }
-    }
-
-    if count == 0 {
+    if count == 0 && unindexed.is_empty() {
         return Ok(vec![]);
     }
 
@@ -1138,11 +1082,10 @@ pub fn match_centroids(
             fast_ops::matmul_t(query_embeddings, &all_residuals)?.transpose(0, 1)?;
         let residual_sims = residual_sims.to_device(&Device::Cpu)?;
         let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
-        let (num_indexed, _) = residual_sims.dims2()?;
 
         let mut residual_sims_flat = residual_sims.flatten_all()?.to_vec1::<f32>()?;
         for (doc_idx, &(gen_idx, cluster_idx)) in
-            document_clusters.iter().enumerate().take(num_indexed)
+            document_clusters.iter().enumerate()
         {
             let centroid_scores = &gen_centroid_scores_all[gen_idx];
             for (query_idx, scores) in centroid_scores.iter().enumerate().take(n) {
@@ -1153,9 +1096,18 @@ pub fn match_centroids(
         sim.extend_from_slice(&residual_sims_flat);
     }
 
-    // Process unindexed embeddings: full similarities
-    if !unindexed_embeddings.is_empty() {
-        let all_unindexed = Tensor::cat(&unindexed_embeddings, 0)?;
+    // Process unindexed embeddings: full similarities (no centroid boost)
+    if !unindexed.is_empty() {
+        let mut unindexed_tensors = vec![];
+        for (id, embeddings) in unindexed {
+            let (num_docs, _) = embeddings.dims2()?;
+            unindexed_tensors.push(embeddings.clone());
+            for _ in 0..num_docs {
+                all.push(((*id, 0), count));
+                count += 1;
+            }
+        }
+        let all_unindexed = Tensor::cat(&unindexed_tensors, 0)?;
         let all_unindexed = all_unindexed.to_device(device)?;
 
         let unindexed_sims =
@@ -1164,6 +1116,10 @@ pub fn match_centroids(
         let unindexed_sims = unindexed_sims.to_dtype(DType::F32)?.contiguous()?;
         let unindexed_sims_flat = unindexed_sims.flatten_all()?.to_vec1::<f32>()?;
         sim.extend_from_slice(&unindexed_sims_flat);
+    }
+
+    if count == 0 {
+        return Ok(vec![]);
     }
 
     let missing_similarities = missing;
@@ -1233,59 +1189,101 @@ pub fn match_centroids(
     }
 
     scored_results.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-
-
-    let results = match sql_filter {
-        Some(filter) => {
-            let (filter_sql, filter_params) = build_filter_sql_and_params(Some(filter))?;
-            db.execute("DROP TABLE IF EXISTS temp2")?;
-        db.execute(
-            "CREATE TEMPORARY TABLE temp2(rowid INTEGER, sub_idx INTEGER, score FLOAT, UNIQUE(rowid, sub_idx))",
-        )?;
-        let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
-        for &(score, rowid, sub_idx) in &scored_results {
-            let _ = insert_temp_query.execute((rowid, sub_idx, score));
-        }
-        drop(insert_temp_query);
-
-        let sql = format!(
-            "SELECT score,document.rowid,sub_idx
-            FROM document,temp2
-            WHERE document.rowid = temp2.rowid
-            AND {filter_sql}
-            ORDER BY score DESC
-            LIMIT ?",
-        );
-        let mut scored_documents_query = db.query(&sql)?;
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = filter_params;
-        params.push(Box::new(top_k as i64));
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let filtered = scored_documents_query
-            .query_map(param_refs.as_slice(), |row| {
-                Ok((
-                    row.get::<_, f32>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, u32>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(scored_documents_query);
-        db.execute("DROP TABLE temp2")?;
-        filtered
-        }
-        None => {
-            scored_results.truncate(top_k);
-            scored_results
-        }
-    };
+    scored_results.truncate(top_k);
 
     debug!(
-        "match_centroids: {} embeddings in {} ms.",
+        "match_centroids_raw: {} embeddings in {} ms.",
         count,
         total_start.elapsed().as_millis()
     );
-    Ok(results)
+    Ok(scored_results)
+}
+
+/// DB-backed wrapper: loads generations from cache, fetches unindexed chunks,
+/// and optionally applies SQL filter postprocessing.
+pub fn match_centroids(
+    db: &DB,
+    query_embeddings: &Tensor,
+    threshold: f32,
+    top_k: usize,
+    sql_filter: Option<&SqlStatementInternal>,
+) -> Result<Vec<(f32, u32, u32)>> {
+    let mut gen_query =
+        db.query("SELECT bucket_data_file FROM generation ORDER BY level, id")?;
+    let generation_files: Vec<PathBuf> = gen_query
+        .query_map((), |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|f| !f.is_empty())
+        .map(|f| db.bucket_data_path(&f))
+        .collect();
+
+    let max_indexed_rowid = max_indexed_chunk_rowid(db)?;
+    let mut unindexed: Vec<(u32, Tensor)> = vec![];
+    {
+        let mut unindexed_query = db.query(
+            "SELECT d.rowid, c.embeddings
+             FROM document AS d
+             JOIN chunk AS c ON c.hash = d.hash
+             WHERE c.rowid > ?1
+             ORDER BY d.rowid",
+        )?;
+        let results = unindexed_query.query_map((max_indexed_rowid,), |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for result in results {
+            let (id, embeddings) = result?;
+            let embeddings =
+                Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
+            unindexed.push((id, embeddings));
+        }
+    }
+
+    let scored_results = match_centroids_raw(
+        &generation_files, query_embeddings, &unindexed, threshold, top_k,
+    )?;
+
+    match sql_filter {
+        Some(filter) => {
+            let (filter_sql, filter_params) = build_filter_sql_and_params(Some(filter))?;
+            db.execute("DROP TABLE IF EXISTS temp2")?;
+            db.execute(
+                "CREATE TEMPORARY TABLE temp2(rowid INTEGER, sub_idx INTEGER, score FLOAT, UNIQUE(rowid, sub_idx))",
+            )?;
+            let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
+            for &(score, rowid, sub_idx) in &scored_results {
+                let _ = insert_temp_query.execute((rowid, sub_idx, score));
+            }
+            drop(insert_temp_query);
+
+            let sql = format!(
+                "SELECT score,document.rowid,sub_idx
+                FROM document,temp2
+                WHERE document.rowid = temp2.rowid
+                AND {filter_sql}
+                ORDER BY score DESC
+                LIMIT ?",
+            );
+            let mut scored_documents_query = db.query(&sql)?;
+            let mut params: Vec<Box<dyn rusqlite::ToSql>> = filter_params;
+            params.push(Box::new(top_k as i64));
+            let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+            let filtered = scored_documents_query
+                .query_map(param_refs.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, f32>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(scored_documents_query);
+            db.execute("DROP TABLE temp2")?;
+            Ok(filtered)
+        }
+        None => Ok(scored_results),
+    }
 }
 
 fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
@@ -1813,8 +1811,8 @@ fn write_buckets_for_range(
 
 pub fn full_index(db: &DB, device: &Device) -> Result<()> {
     db.execute("DELETE FROM generation")?;
+    clear_generations_cache();
     db.remove_all_bucket_data_sidecars();
-    invalidate_center_cache(db);
     index_chunks(db, device)
 }
 
@@ -1894,8 +1892,8 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     }
 
     db.commit_transaction()?;
+    clear_generations_cache();
     db.remove_bucket_data_files(&stale_bucket_data_files);
-    invalidate_center_cache(db);
     db.checkpoint();
     Ok(())
 }
