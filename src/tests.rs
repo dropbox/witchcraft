@@ -23,7 +23,7 @@ mod tests {
         "There's a gas cloud in space that smells like rum and tastes like raspberries.",
         "Cows have best friends and get stressed when separated.",
         "A group of flamingos is called a 'flamboyance'.",
-        "Bananas are berries, but strawberries aren't.",
+        "A single strand of spaghetti is called a spaghetto.",
         "There's a species of fungus that can turn ants into zombies.",
         "Sharks existed before trees.",
         "Scotland has 421 words for 'snow'.",

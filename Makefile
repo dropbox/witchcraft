@@ -153,6 +153,7 @@ module: prereqs
 	ln -sf target/release/warp-macos-universal.node warp.node
 
 test: prereqs download
+	rm -rf mydb.sqlite*
 	RUST_LOG=debug cargo llvm-cov nextest --release --features napi,$(CLI_FEATURES) --lcov --output-path lcov.info
 	genhtml lcov.info
 

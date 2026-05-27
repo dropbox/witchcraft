@@ -1,7 +1,7 @@
 use log::{debug, info, warn};
 use memmap2::Mmap;
 use once_cell::sync::Lazy;
-#[cfg(feature = "deterministic")]
+#[cfg(any(test, feature = "deterministic"))]
 use rand::SeedableRng;
 use rusqlite::{OptionalExtension, Statement};
 use std::collections::HashMap;
@@ -232,9 +232,9 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
     let bar = progress::new_with_label(total, "kmeans");
     let device = data.device();
 
-    #[cfg(feature = "deterministic")]
+    #[cfg(any(test, feature = "deterministic"))]
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    #[cfg(not(feature = "deterministic"))]
+    #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let centroid_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
     let centroid_idx: Vec<u32> = centroid_idx.iter().map(|&i| i as u32).collect();
@@ -1588,9 +1588,9 @@ fn bucket_data_files_for_generations(db: &DB, where_clause: &str) -> Result<Vec<
 fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(Tensor, usize)> {
     let mut kmeans_query = db.query(sql)?;
     let mut total_embeddings = 0;
-    #[cfg(feature = "deterministic")]
+    #[cfg(any(test, feature = "deterministic"))]
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    #[cfg(not(feature = "deterministic"))]
+    #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
     for embeddings in kmeans_query.query_map((), |row| row.get::<_, Vec<u8>>(0))? {
