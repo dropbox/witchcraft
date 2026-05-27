@@ -392,34 +392,34 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes[offset..offset + 8].try_into()?))
 }
 
-fn bucket_data_header(bucket_data: &[u8], generation_id: i64) -> Result<BucketDataHeader> {
+fn bucket_data_header(bucket_data: &[u8]) -> Result<BucketDataHeader> {
     anyhow::ensure!(
         bucket_data.len() >= BUCKET_DATA_HEADER_BYTES,
-        "generation {generation_id} bucket sidecar is too small: {} bytes",
+        "bucket sidecar is too small: {} bytes",
         bucket_data.len()
     );
     let version = read_u32_le(bucket_data, 0)?;
     anyhow::ensure!(
         version == BUCKET_DATA_VERSION,
-        "generation {generation_id} bucket sidecar version {version} is not supported; run ./warp-cli reindex"
+        "bucket sidecar version {version} is not supported; run ./warp-cli reindex"
     );
     let magic_offset = std::mem::size_of::<u32>();
     anyhow::ensure!(
         &bucket_data[magic_offset..magic_offset + BUCKET_DATA_MAGIC.len()]
             == BUCKET_DATA_MAGIC.as_slice(),
-        "generation {generation_id} bucket sidecar has an invalid header; run ./warp-cli reindex"
+        "bucket sidecar has an invalid header; run ./warp-cli reindex"
     );
     let centroid_count: usize = read_u64_le(bucket_data, 12)?.try_into()?;
     let meta_offset: usize = read_u64_le(bucket_data, 20)?.try_into()?;
     let payload_offset: usize = read_u64_le(bucket_data, 28)?.try_into()?;
     let meta_bytes = centroid_count
         .checked_mul(BUCKET_META_BYTES)
-        .ok_or_else(|| anyhow::anyhow!("generation {generation_id} bucket metadata length overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("bucket metadata length overflow"))?;
     anyhow::ensure!(
         meta_offset >= BUCKET_DATA_HEADER_BYTES
             && payload_offset >= meta_offset + meta_bytes
             && payload_offset <= bucket_data.len(),
-        "generation {generation_id} bucket sidecar layout is invalid"
+        "bucket sidecar layout is invalid"
     );
     Ok(BucketDataHeader {
         centroid_count,
@@ -431,7 +431,6 @@ fn bucket_data_header(bucket_data: &[u8], generation_id: i64) -> Result<BucketDa
 fn bucket_data_bucket_meta(
     bucket_data: &[u8],
     header: &BucketDataHeader,
-    generation_id: i64,
 ) -> Result<Vec<BucketSidecarMeta>> {
     let mut metas = Vec::with_capacity(header.centroid_count);
     for bucket_idx in 0..header.centroid_count {
@@ -444,15 +443,15 @@ fn bucket_data_bucket_meta(
         let center_end = offset + BUCKET_META_BYTES;
         anyhow::ensure!(
             data_offset >= header.payload_offset as u64,
-            "generation {generation_id} bucket {bucket_idx} data offset is before payload block"
+            "bucket {bucket_idx} data offset is before payload block"
         );
         let bucket_end = data_offset
             .checked_add(u64::try_from(indices_len)?)
             .and_then(|offset| offset.checked_add(u64::try_from(residual_len).ok()?))
-            .ok_or_else(|| anyhow::anyhow!("generation {generation_id} bucket {bucket_idx} data length overflow"))?;
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_idx} data length overflow"))?;
         anyhow::ensure!(
             bucket_end <= bucket_data.len() as u64,
-            "generation {generation_id} bucket {bucket_idx} data ends beyond sidecar length"
+            "bucket {bucket_idx} data ends beyond sidecar length"
         );
         metas.push(BucketSidecarMeta {
             size,
@@ -839,7 +838,6 @@ mod reciprocal_rank_fusion_tests {
 
 /// Per-generation centroid data loaded from the database.
 struct GenerationCentroids {
-    generation_id: i64,
     bucket_indices: Vec<usize>,
     sizes: Vec<usize>,
     data_offsets: Vec<usize>,
@@ -872,14 +870,14 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
     }
 
     let mut gen_query =
-        db.query("SELECT id, bucket_data_file FROM generation ORDER BY level, id")?;
-    let generations: Vec<(i64, String)> = gen_query
-        .query_map((), |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+        db.query("SELECT bucket_data_file FROM generation ORDER BY level, id")?;
+    let generations: Vec<String> = gen_query
+        .query_map((), |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut all = Vec::with_capacity(generations.len());
 
-    for (gen_id, bucket_data_file) in generations {
+    for bucket_data_file in generations {
         let mut bucket_indices = vec![];
         let mut sizes = vec![];
         let mut data_offsets = vec![];
@@ -888,10 +886,6 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
         let bucket_data = if bucket_data_file.is_empty() {
             None
         } else {
-            anyhow::ensure!(
-                !bucket_data_file.is_empty(),
-                "generation {gen_id} has no bucket data sidecar file"
-            );
             let path = db.bucket_data_path(&bucket_data_file);
             let file = File::open(&path)?;
             // The mapped file is immutable after generation creation.
@@ -900,8 +894,8 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
         };
         let mut centers = vec![];
         if let Some(bucket_data) = &bucket_data {
-            let header = bucket_data_header(bucket_data, gen_id)?;
-            let metas = bucket_data_bucket_meta(bucket_data, &header, gen_id)?;
+            let header = bucket_data_header(bucket_data)?;
+            let metas = bucket_data_bucket_meta(bucket_data, &header)?;
             for (bucket_idx, meta) in metas.into_iter().enumerate() {
                 if meta.size == 0 {
                     continue;
@@ -921,7 +915,6 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
             Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?
         };
         all.push(GenerationCentroids {
-            generation_id: gen_id,
             bucket_indices,
             sizes,
             data_offsets,
@@ -946,7 +939,6 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
 impl Clone for GenerationCentroids {
     fn clone(&self) -> Self {
         Self {
-            generation_id: self.generation_id,
             bucket_indices: self.bucket_indices.clone(),
             sizes: self.sizes.clone(),
             data_offsets: self.data_offsets.clone(),
@@ -1057,10 +1049,7 @@ pub fn match_centroids(
             let indices_len = gen.indices_lens[bucket_idx];
             let residual_len = gen.residual_lens[bucket_idx];
             let bucket_data = gen.bucket_data.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "generation {} has no mapped bucket data sidecar",
-                    gen.generation_id
-                )
+                anyhow::anyhow!("generation has no mapped bucket data sidecar")
             })?;
             let indices_end = data_offset + indices_len;
             let residual_end = indices_end + residual_len;
