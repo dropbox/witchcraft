@@ -9,9 +9,24 @@ const MAX_WINDOW_ROWS: usize = 1024;
 const RANS_BITS: u32 = 12;
 const RANGE: f32 = 29.0;
 #[cfg(feature = "polar-quant")]
-const POLAR_RADIUS_SCALE: f32 = 4.0;
-#[cfg(feature = "polar-quant")]
 const POLAR_COMPANDING_PARAM: f32 = 255.0;
+
+#[cfg(feature = "polar-quant")]
+fn quantize_polar_radius_with_scale(radius: f32, scale: f32, max_code: u8) -> u8 {
+    let normalized = (radius * scale).clamp(0.0, 1.0);
+    let companded =
+        (1.0 + POLAR_COMPANDING_PARAM * normalized).ln() / (1.0 + POLAR_COMPANDING_PARAM).ln();
+    let max_code = max_code as f32;
+    (companded * max_code).round().clamp(0.0, max_code) as u8
+}
+
+#[cfg(feature = "polar-quant")]
+fn dequantize_polar_radius_with_scale(code: u8, scale: f32, max_code: u8) -> f32 {
+    let companded = (code.min(max_code) as f32) / (max_code as f32);
+    let normalized =
+        ((1.0 + POLAR_COMPANDING_PARAM).powf(companded) - 1.0) / POLAR_COMPANDING_PARAM;
+    normalized / scale
+}
 
 #[cfg(feature = "polar-quant")]
 pub(crate) trait PolarMode {
@@ -19,6 +34,7 @@ pub(crate) trait PolarMode {
 
     const RADIUS_MAX_CODE: u8;
     const ANGLE_MAX_CODE: u8;
+    const RADIUS_SCALE: f32;
     const RADIUS_SHIFT: u8;
     const ANGLE_MASK: u8;
 
@@ -44,18 +60,11 @@ pub(crate) trait PolarMode {
     }
 
     fn quantize_radius(radius: f32) -> u8 {
-        let normalized = (radius * POLAR_RADIUS_SCALE).clamp(0.0, 1.0);
-        let companded =
-            (1.0 + POLAR_COMPANDING_PARAM * normalized).ln() / (1.0 + POLAR_COMPANDING_PARAM).ln();
-        let max_code = Self::RADIUS_MAX_CODE as f32;
-        (companded * max_code).round().clamp(0.0, max_code) as u8
+        quantize_polar_radius_with_scale(radius, Self::RADIUS_SCALE, Self::RADIUS_MAX_CODE)
     }
 
     fn dequantize_radius(code: u8) -> f32 {
-        let companded = (code.min(Self::RADIUS_MAX_CODE) as f32) / (Self::RADIUS_MAX_CODE as f32);
-        let normalized =
-            ((1.0 + POLAR_COMPANDING_PARAM).powf(companded) - 1.0) / POLAR_COMPANDING_PARAM;
-        normalized / POLAR_RADIUS_SCALE
+        dequantize_polar_radius_with_scale(code, Self::RADIUS_SCALE, Self::RADIUS_MAX_CODE)
     }
 
     fn quantize_angle(angle: f32) -> u8 {
@@ -89,6 +98,7 @@ impl PolarMode for Polar2Bit {
 
     const RADIUS_MAX_CODE: u8 = 3;
     const ANGLE_MAX_CODE: u8 = 3;
+    const RADIUS_SCALE: f32 = 1.0;
     const RADIUS_SHIFT: u8 = 2;
     const ANGLE_MASK: u8 = 0x03;
 
@@ -158,6 +168,7 @@ impl PolarMode for Polar3Bit {
 
     const RADIUS_MAX_CODE: u8 = 7;
     const ANGLE_MAX_CODE: u8 = 7;
+    const RADIUS_SCALE: f32 = 1.0;
     const RADIUS_SHIFT: u8 = 3;
     const ANGLE_MASK: u8 = 0x07;
 
@@ -246,6 +257,7 @@ impl PolarMode for Polar4Bit {
 
     const RADIUS_MAX_CODE: u8 = 15;
     const ANGLE_MAX_CODE: u8 = 15;
+    const RADIUS_SCALE: f32 = 4.0;
     const RADIUS_SHIFT: u8 = 4;
     const ANGLE_MASK: u8 = 0x0f;
 
