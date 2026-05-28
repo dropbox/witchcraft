@@ -16,8 +16,8 @@ use tokenizers::Tokenizer;
 
 use crate::embed_asset;
 
-embed_asset!(pub CONFIG,    "config.json");
-embed_asset!(pub TOKENIZER, "tokenizer.json");
+embed_asset!(pub CONFIG,    "modernbert-config.json");
+embed_asset!(pub TOKENIZER, "modernbert-tokenizer.json");
 embed_asset!(pub MODEL,     "modernbert.gguf");
 
 #[derive(Debug, Deserialize)]
@@ -431,12 +431,12 @@ impl T5ModelBuilder {
     pub fn load(assets: &std::path::Path) -> candle_core::Result<(Self, Tokenizer)> {
         let cfg_bytes = CONFIG
             .bytes(assets)
-            .map_err(|_| Error::other("failed to read config.json"))?;
+            .map_err(|_| Error::other("failed to read modernbert-config.json"))?;
         let config: Config = serde_json::from_slice(cfg_bytes)
             .map_err(|e| Error::other(format!("failed to parse config: {e}")))?;
         let tok_bytes = TOKENIZER
             .bytes(assets)
-            .map_err(|_| Error::other("failed to read tokenizer.json"))?;
+            .map_err(|_| Error::other("failed to read modernbert-tokenizer.json"))?;
         let tokenizer = Tokenizer::from_bytes(tok_bytes)
             .map_err(|e| Error::other(format!("failed to parse tokenizer: {e}")))?;
         Ok((Self { config }, tokenizer))

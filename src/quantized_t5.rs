@@ -32,8 +32,8 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 use crate::embed_asset;
-embed_asset!(pub CONFIG,    "config.json");
-embed_asset!(pub TOKENIZER, "tokenizer.json");
+embed_asset!(pub CONFIG,    "xtr-config.json");
+embed_asset!(pub TOKENIZER, "xtr-tokenizer.json");
 embed_asset!(pub MODEL,     "xtr.gguf");
 
 #[cfg(not(feature = "hybrid-dequant"))]

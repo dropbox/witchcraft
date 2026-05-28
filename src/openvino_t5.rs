@@ -18,7 +18,7 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 use crate::embed_asset;
-embed_asset!(pub TOKENIZER, "tokenizer.json");
+embed_asset!(pub TOKENIZER, "xtr-tokenizer.json");
 
 pub struct T5ModelBuilder {}
 

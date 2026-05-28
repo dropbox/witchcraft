@@ -24,7 +24,7 @@ impl T5ModelBuilder {
     /// Load the T5 model configuration and tokenizer from assets.
     pub fn load(assets: &PathBuf) -> Result<(Self, Tokenizer)> {
         // Load tokenizer from file
-        let tok_bytes = std::fs::read(assets.join("tokenizer.json"))?;
+        let tok_bytes = std::fs::read(assets.join("xtr-tokenizer.json"))?;
         let tokenizer = Tokenizer::from_bytes(&tok_bytes)
             .map_err(|e| anyhow!("failed to create tokenizer: {}", e))?;
 

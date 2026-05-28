@@ -19,7 +19,7 @@ struct EmbeddingComparison {
 }
 
 fn load_tokenizer(assets: &PathBuf) -> Result<Tokenizer> {
-    let bytes = std::fs::read(assets.join("tokenizer.json"))?;
+    let bytes = std::fs::read(assets.join("xtr-tokenizer.json"))?;
     let tokenizer = Tokenizer::from_bytes(&bytes)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     Ok(tokenizer)
@@ -106,7 +106,7 @@ fn compare_quantized_backends(
     let device = Device::Cpu;
 
     // Load config
-    let cfg_bytes = std::fs::read(assets.join("config.json"))?;
+    let cfg_bytes = std::fs::read(assets.join("xtr-config.json"))?;
     let config: quantized_t5::Config = serde_json::from_slice(&cfg_bytes)?;
 
     // Load model once (we'll use it twice to verify comparison works)
@@ -204,7 +204,7 @@ fn compare_quantized_vs_openvino(
     let device = Device::Cpu;
 
     // Load quantized model
-    let cfg_bytes = std::fs::read(assets.join("config.json"))?;
+    let cfg_bytes = std::fs::read(assets.join("xtr-config.json"))?;
     let config_q: quantized_t5::Config = serde_json::from_slice(&cfg_bytes)?;
     let model_path = assets.join("xtr.gguf");
     let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
@@ -361,7 +361,7 @@ fn compare_vanilla_vs_fbgemm(
     let device = Device::Cpu;
 
     // Load config
-    let cfg_bytes = std::fs::read(assets.join("config.json"))?;
+    let cfg_bytes = std::fs::read(assets.join("xtr-config.json"))?;
 
     // Load vanilla model (this crate's quantized_t5 — standard candle QMatMul)
     let config_v: quantized_t5::Config = serde_json::from_slice(&cfg_bytes)?;

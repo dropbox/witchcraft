@@ -5,7 +5,7 @@ use std::time::Instant;
 use witchcraft::quantized_t5;
 
 fn load_tokenizer(assets: &PathBuf) -> Result<tokenizers::Tokenizer> {
-    let bytes = std::fs::read(assets.join("tokenizer.json"))?;
+    let bytes = std::fs::read(assets.join("xtr-tokenizer.json"))?;
     let tokenizer = tokenizers::Tokenizer::from_bytes(&bytes)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     Ok(tokenizer)
@@ -27,7 +27,7 @@ fn make_input(tokenizer: &tokenizers::Tokenizer, base: &str, min_tokens: usize) 
 fn bench_candle(assets: &PathBuf, tokenizer: &tokenizers::Tokenizer, sizes: &[usize]) -> Result<()> {
     let device = witchcraft::make_device();
 
-    let cfg_bytes = std::fs::read(assets.join("config.json"))?;
+    let cfg_bytes = std::fs::read(assets.join("xtr-config.json"))?;
     let config: quantized_t5::Config = serde_json::from_slice(&cfg_bytes)?;
 
     let t0 = Instant::now();

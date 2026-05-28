@@ -11,26 +11,16 @@ ENCODER ?= t5-quantized
 ifeq ($(UNAME_S),Darwin)
   ifeq ($(UNAME_M),arm64)
     # Apple Silicon: Metal GPU + Accelerate BLAS
-<<<<<<< HEAD
-    CLI_FEATURES := t5-quantized,metal,progress
-    NAPI_FEATURES := t5-quantized,metal,napi
-    PYTHON_FEATURES := t5-quantized,metal,python
-=======
     CLI_FEATURES := $(ENCODER),metal,progress
     NAPI_FEATURES := $(ENCODER),metal,napi
->>>>>>> 7b649dc (Add ModernBERT GraniteV2 encoder support)
+    PYTHON_FEATURES := $(ENCODER),metal,python
     RUSTFLAGS_EXTRA :=
     TARGET := aarch64-apple-darwin
   else
     # Intel Mac: CPU-only with FBGEMM + hybrid-dequant
-<<<<<<< HEAD
-    CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
-    NAPI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,napi
-    PYTHON_FEATURES := t5-quantized,fbgemm,hybrid-dequant,python
-=======
     CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress
     NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
->>>>>>> 7b649dc (Add ModernBERT GraniteV2 encoder support)
+    PYTHON_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,python
     RUSTFLAGS_EXTRA := -C target-feature=+avx2,+fma
     TARGET := x86_64-apple-darwin
   endif
@@ -38,27 +28,19 @@ ifeq ($(UNAME_S),Darwin)
 else ifeq ($(UNAME_S),Linux)
   NVCC := $(or $(shell which nvcc 2>/dev/null),$(wildcard /usr/local/cuda/bin/nvcc),$(wildcard /opt/cuda/bin/nvcc))
   ifneq ($(NVCC),)
-<<<<<<< HEAD
-    CLI_FEATURES := t5-quantized,cuda,progress
-    NAPI_FEATURES := t5-quantized,cuda,napi
-    PYTHON_FEATURES := t5-quantized,cuda,python
-  else ifeq ($(UNAME_M),aarch64)
-    # Linux ARM (Graviton, Pi, Ampere): fbgemm/hybrid-dequant are x86-only
-    CLI_FEATURES := t5-quantized,progress
-    NAPI_FEATURES := t5-quantized,napi
-    PYTHON_FEATURES := t5-quantized,python
-  else
-    # Linux x86_64 CPU-only
-    CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
-    NAPI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,napi
-    PYTHON_FEATURES := t5-quantized,fbgemm,hybrid-dequant,python
-=======
     CLI_FEATURES := $(ENCODER),cuda,progress
     NAPI_FEATURES := $(ENCODER),cuda,napi
+    PYTHON_FEATURES := $(ENCODER),cuda,python
+  else ifeq ($(UNAME_M),aarch64)
+    # Linux ARM (Graviton, Pi, Ampere): fbgemm/hybrid-dequant are x86-only
+    CLI_FEATURES := $(ENCODER),progress
+    NAPI_FEATURES := $(ENCODER),napi
+    PYTHON_FEATURES := $(ENCODER),python
   else
+    # Linux x86_64 CPU-only
     CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress
     NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
->>>>>>> 7b649dc (Add ModernBERT GraniteV2 encoder support)
+    PYTHON_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,python
   endif
   PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
   RUSTFLAGS_EXTRA :=
@@ -115,23 +97,23 @@ python-build-deps: env/pyvenv.cfg | prereqs
 assets:
 	mkdir -p assets
 
-assets/config.json assets/tokenizer.json xtr.safetensors: env/bin/transformers | assets
+assets/xtr-config.json assets/xtr-tokenizer.json xtr.safetensors: env/bin/transformers | assets
 	$(PYTHON_BIN) downloadweights.py
 
 assets/xtr.gguf: xtr.safetensors | assets prereqs
 	cargo run -p quantize-tool xtr.safetensors assets/xtr.gguf
 
 modernbert-assets: | assets
-	@test -f assets/config.json || (echo "missing assets/config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
-	@test -f assets/tokenizer.json || (echo "missing assets/tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
-	@test -f assets/model.safetensors || (echo "missing assets/model.safetensors; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+	@test -f assets/modernbert-config.json || (echo "missing assets/modernbert-config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+	@test -f assets/modernbert-tokenizer.json || (echo "missing assets/modernbert-tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+	@test -f assets/modernbert.safetensors || (echo "missing assets/modernbert.safetensors; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
 
 modernbert-quantized-assets: | assets
-	@test -f assets/config.json || (echo "missing assets/config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
-	@test -f assets/tokenizer.json || (echo "missing assets/tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+	@test -f assets/modernbert-config.json || (echo "missing assets/modernbert-config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+	@test -f assets/modernbert-tokenizer.json || (echo "missing assets/modernbert-tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
 	@if [ ! -f assets/modernbert.gguf ]; then \
-		if [ -f assets/model.safetensors ]; then \
-			cargo run -p quantize-tool --release -- assets/model.safetensors assets/modernbert.gguf; \
+		if [ -f assets/modernbert.safetensors ]; then \
+			cargo run -p quantize-tool --release -- assets/modernbert.safetensors assets/modernbert.gguf; \
 		else \
 			echo "missing assets/modernbert.gguf; run scripts/export_modernbert.py <checkpoint> assets, then make ENCODER=modernbert-quantized" >&2; \
 			exit 1; \
@@ -146,14 +128,14 @@ DOWNLOAD_TARGETS := modernbert-assets
 else ifeq ($(ENCODER),modernbert-quantized)
 DOWNLOAD_TARGETS := modernbert-quantized-assets
 else ifeq ($(ENCODER),t5-openvino)
-DOWNLOAD_TARGETS := assets assets/config.json assets/tokenizer.json assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
+DOWNLOAD_TARGETS := assets assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
 else
-DOWNLOAD_TARGETS := assets assets/config.json assets/tokenizer.json assets/xtr.gguf
+DOWNLOAD_TARGETS := assets assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr.gguf
 endif
 
 download: prereqs $(DOWNLOAD_TARGETS)
 
-ovdownload: prereqs assets/config.json assets/tokenizer.json assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
+ovdownload: prereqs assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
 
 # === Build targets ===
 

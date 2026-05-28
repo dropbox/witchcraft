@@ -63,7 +63,7 @@ def main():
         else:
             tensors[k] = v.contiguous()
 
-    save_file(tensors, out_dir / "model.safetensors")
+    save_file(tensors, out_dir / "modernbert.safetensors")
 
     # Infer config from tensor shapes
     embed_w = tensors["encoder.embeddings.tok_embeddings.weight"]
@@ -127,13 +127,13 @@ def main():
     if projection_mlp is not None:
         config["projection_mlp"] = projection_mlp
 
-    (out_dir / "config.json").write_text(json.dumps(config, indent=2))
+    (out_dir / "modernbert-config.json").write_text(json.dumps(config, indent=2))
 
     tok_src = ckpt_dir / "tokenizer.json"
     if tok_src.exists():
-        shutil.copy(tok_src, out_dir / "tokenizer.json")
+        shutil.copy(tok_src, out_dir / "modernbert-tokenizer.json")
     else:
-        print(f"WARNING: {tok_src} not found, copy tokenizer.json manually")
+        print(f"WARNING: {tok_src} not found, copy modernbert-tokenizer.json manually")
 
     print(f"Exported to {out_dir}/")
     print(f"  config: {json.dumps(config, indent=2)}")
