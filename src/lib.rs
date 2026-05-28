@@ -56,6 +56,9 @@ compile_error!("Cannot enable multiple encoder backends simultaneously");
 #[cfg(all(feature = "hybrid-dequant", feature = "metal"))]
 compile_error!("hybrid-dequant is incompatible with metal (use accelerate only for CPU, or metal without hybrid-dequant for GPU)");
 
+#[cfg(all(feature = "polar-quant-2bit", feature = "polar-quant-3bit"))]
+compile_error!("polar-quant-2bit and polar-quant-3bit are mutually exclusive");
+
 mod db;
 pub use db::DB;
 
@@ -124,15 +127,11 @@ fn bucket_meta_bytes_for_dim(dim: usize) -> usize {
 }
 
 fn residual_bytes_for_dim(dim: usize) -> usize {
-    #[cfg(all(feature = "polar-quant", feature = "polar-quant-2bit"))]
+    #[cfg(feature = "polar-quant")]
     {
-        assert!(
-            dim % 4 == 0,
-            "embedding dimension must be divisible by four for 2-bit polar residuals"
-        );
-        dim / 4
+        packops::polar_row_bytes(dim)
     }
-    #[cfg(not(all(feature = "polar-quant", feature = "polar-quant-2bit")))]
+    #[cfg(not(feature = "polar-quant"))]
     {
         assert!(
             dim % 2 == 0,
