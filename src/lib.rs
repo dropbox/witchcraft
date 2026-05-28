@@ -1032,21 +1032,6 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
 /// Pure index search: scores query embeddings against generation sidecar files.
 /// No database access — loads generations from mmap files directly.
 /// `unindexed` contains (doc_rowid, embeddings) for documents not yet in any generation.
-#[cfg(all(feature = "polar-quant", any(feature = "polar-quant-2bit", feature = "polar-quant-3bit")))]
-fn residual_centroid_confidence_weight(centroid_score: f32, score_range: (f32, f32)) -> f32 {
-    let (best_score, tail_score) = score_range;
-    let span = best_score - tail_score;
-    if span <= f32::EPSILON {
-        return 1.0;
-    }
-    ((centroid_score - tail_score) / span).clamp(0.0, 1.0)
-}
-
-#[cfg(not(all(feature = "polar-quant", any(feature = "polar-quant-2bit", feature = "polar-quant-3bit"))))]
-fn residual_centroid_confidence_weight(_centroid_score: f32, _score_range: (f32, f32)) -> f32 {
-    1.0
-}
-
 pub fn match_centroids_raw(
     generation_files: &[PathBuf],
     query_embeddings: &Tensor,
@@ -1071,10 +1056,7 @@ pub fn match_centroids_raw(
     let mut count = 0;
     let mut missing = vec![0.0f32; m];
 
-    #[cfg(not(feature = "polar-quant"))]
-    let table: [f32; 16] = packops::make_residual_dequant_table()?;
-    #[cfg(feature = "polar-quant")]
-    let table: packops::PolarDequantTable = packops::make_residual_dequant_table()?;
+    let table = packops::make_residual_dequant_table()?;
 
     for gen in generations.iter() {
         if gen.sizes.is_empty() {
@@ -1161,12 +1143,8 @@ pub fn match_centroids_raw(
                 residual_bytes.len(),
                 gen.residual_bytes
             );
-            #[cfg(feature = "polar-quant")]
-            let residuals =
-                Tensor::from_polar_q4_bytes(&residual_bytes, gen.dim, &table, &Device::Cpu)?;
-            #[cfg(not(feature = "polar-quant"))]
-            let residuals = Tensor::from_companded_q4_bytes(
-                &residual_bytes,
+            let residuals = packops::residuals_from_bytes(
+                residual_bytes,
                 gen.dim,
                 &table,
                 &Device::Cpu,
@@ -1212,8 +1190,10 @@ pub fn match_centroids_raw(
             for (query_idx, scores) in centroid_scores.iter().enumerate().take(n) {
                 let offset = doc_idx * n + query_idx;
                 let centroid_score = scores[cluster_idx];
-                let residual_weight =
-                    residual_centroid_confidence_weight(centroid_score, centroid_score_ranges[query_idx]);
+                let residual_weight = packops::residual_centroid_confidence_weight(
+                    centroid_score,
+                    centroid_score_ranges[query_idx],
+                );
                 residual_sims_flat[offset] =
                     centroid_score + residual_weight * residual_sims_flat[offset];
             }
@@ -1842,7 +1822,7 @@ fn write_buckets_for_range(
     let mut tmpfiles = vec![];
     let centers_cpu = centers.to_device(&Device::Cpu)?;
     let (_, center_dim) = centers_cpu.dims2()?;
-    let residual_bytes = residual_bytes_for_dim(center_dim);
+    let residual_bytes = packops::temp_residual_bytes_for_dim(center_dim);
     let packed_centers = fast_ops::PackedRight::new(centers)?;
     while !done {
         match results.next() {
@@ -1934,10 +1914,7 @@ fn write_buckets_for_range(
 
                 let center = centers_cpu.get(bucket as usize)?;
                 let residual = (embeddings[sample].get(0) - &center)?;
-                #[cfg(feature = "polar-quant")]
-                let residual_quantized = residual.to_polar_q4_bytes()?;
-                #[cfg(not(feature = "polar-quant"))]
-                let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
+                let residual_quantized = packops::residual_to_temp_bytes(&residual)?;
                 residuals_bytes.extend(&residual_quantized);
             }
             tmpfiles.push(writer.finish()?);

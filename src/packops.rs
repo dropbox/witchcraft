@@ -28,6 +28,16 @@ fn dequantize_polar_radius_with_scale(code: u8, scale: f32, max_code: u8) -> f32
     normalized / scale
 }
 
+#[cfg(all(feature = "polar-quant", any(feature = "polar-quant-2bit", feature = "polar-quant-3bit")))]
+fn centroid_confidence_weight(centroid_score: f32, score_range: (f32, f32)) -> f32 {
+    let (best_score, tail_score) = score_range;
+    let span = best_score - tail_score;
+    if span <= f32::EPSILON {
+        return 1.0;
+    }
+    ((centroid_score - tail_score) / span).clamp(0.0, 1.0)
+}
+
 #[cfg(feature = "polar-quant")]
 pub(crate) trait PolarMode {
     type DequantTable;
@@ -77,6 +87,13 @@ pub(crate) trait PolarMode {
     fn dequantize_angle(code: u8) -> f32 {
         let levels = Self::ANGLE_MAX_CODE as u8 + 1;
         (code.min(Self::ANGLE_MAX_CODE) as f32) * std::f32::consts::TAU / levels as f32
+    }
+
+    fn residual_centroid_confidence_weight(
+        _centroid_score: f32,
+        _score_range: (f32, f32),
+    ) -> f32 {
+        1.0
     }
 }
 
@@ -148,6 +165,13 @@ impl PolarMode for Polar2Bit {
             out.push(y1);
         }
         out
+    }
+
+    fn residual_centroid_confidence_weight(
+        centroid_score: f32,
+        score_range: (f32, f32),
+    ) -> f32 {
+        centroid_confidence_weight(centroid_score, score_range)
     }
 }
 
@@ -240,6 +264,13 @@ impl PolarMode for Polar3Bit {
         }
         out
     }
+
+    fn residual_centroid_confidence_weight(
+        centroid_score: f32,
+        score_range: (f32, f32),
+    ) -> f32 {
+        centroid_confidence_weight(centroid_score, score_range)
+    }
 }
 
 #[cfg(all(
@@ -311,10 +342,32 @@ pub(crate) type CurrentPolarMode = Polar4Bit;
 #[cfg(feature = "polar-quant")]
 pub(crate) type PolarDequantTable = <CurrentPolarMode as PolarMode>::DequantTable;
 
+#[cfg(feature = "polar-quant")]
+pub(crate) type ResidualDequantTable = PolarDequantTable;
+
+#[cfg(not(feature = "polar-quant"))]
+pub(crate) type ResidualDequantTable = [f32; 16];
+
+#[cfg(feature = "polar-quant")]
+pub(crate) fn residual_centroid_confidence_weight(
+    centroid_score: f32,
+    score_range: (f32, f32),
+) -> f32 {
+    CurrentPolarMode::residual_centroid_confidence_weight(centroid_score, score_range)
+}
+
+#[cfg(not(feature = "polar-quant"))]
+pub(crate) fn residual_centroid_confidence_weight(
+    _centroid_score: f32,
+    _score_range: (f32, f32),
+) -> f32 {
+    1.0
+}
+
 ///////////////////////////////////////////////////////////////////////////
 
 #[cfg(not(feature = "polar-quant"))]
-pub(crate) fn make_residual_dequant_table() -> Result<[f32; 16]> {
+pub(crate) fn make_residual_dequant_table() -> Result<ResidualDequantTable> {
     let x = Tensor::arange(0f32, 16f32, &Device::Cpu)?;
     let x = x.dequantize(4)?.inv_compand()?;
 
@@ -327,8 +380,60 @@ pub(crate) fn make_residual_dequant_table() -> Result<[f32; 16]> {
 }
 
 #[cfg(feature = "polar-quant")]
-pub(crate) fn make_residual_dequant_table() -> Result<PolarDequantTable> {
+pub(crate) fn make_residual_dequant_table() -> Result<ResidualDequantTable> {
     Ok(CurrentPolarMode::make_dequant_table())
+}
+
+#[cfg(not(feature = "polar-quant"))]
+pub(crate) fn temp_residual_bytes_for_dim(dim: usize) -> usize {
+    assert!(
+        dim % 2 == 0,
+        "embedding dimension must be even for q4 residuals"
+    );
+    dim / 2
+}
+
+#[cfg(feature = "polar-quant")]
+pub(crate) fn temp_residual_bytes_for_dim(dim: usize) -> usize {
+    CurrentPolarMode::row_bytes(dim)
+}
+
+#[cfg(not(feature = "polar-quant"))]
+pub(crate) fn residual_to_temp_bytes(residual: &Tensor) -> Result<Vec<u8>> {
+    residual.compand()?.quantize(4)?.to_q4_bytes()
+}
+
+#[cfg(feature = "polar-quant")]
+pub(crate) fn residual_to_temp_bytes(residual: &Tensor) -> Result<Vec<u8>> {
+    residual.to_polar_q4_bytes()
+}
+
+#[cfg(not(feature = "polar-quant"))]
+pub(crate) fn residuals_from_bytes(
+    bytes: &[u8],
+    cols: usize,
+    table: &ResidualDequantTable,
+    device: &Device,
+) -> Result<Tensor> {
+    Tensor::from_companded_q4_bytes(bytes, cols, table, device)
+}
+
+#[cfg(feature = "polar-quant")]
+pub(crate) fn residuals_from_bytes(
+    bytes: &[u8],
+    cols: usize,
+    table: &ResidualDequantTable,
+    device: &Device,
+) -> Result<Tensor> {
+    let out = CurrentPolarMode::decode_rows(bytes, cols, table);
+    assert!(
+        out.len() % cols == 0,
+        "Unpacked data length ({}) must be divisible by cols ({})",
+        out.len(),
+        cols
+    );
+    let rows = out.len() / cols;
+    Ok(Tensor::from_vec(out, &[rows, cols], device)?)
 }
 
 #[cfg(feature = "polar-quant")]
@@ -439,13 +544,6 @@ pub trait TensorPackOps {
     ) -> Result<Tensor>;
     #[cfg(feature = "polar-quant")]
     fn to_polar_q4_bytes(&self) -> Result<Vec<u8>>;
-    #[cfg(feature = "polar-quant")]
-    fn from_polar_q4_bytes(
-        bytes: &[u8],
-        cols: usize,
-        table: &PolarDequantTable,
-        device: &Device,
-    ) -> Result<Tensor>;
 
     fn from_f32_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
     fn to_f32_bytes(&self) -> Result<Vec<u8>>;
@@ -851,24 +949,6 @@ impl TensorPackOps for Tensor {
     fn to_polar_q4_bytes(&self) -> Result<Vec<u8>> {
         let flat = self.flatten_all()?.to_vec1::<f32>()?;
         Ok(CurrentPolarMode::encode_row(&flat))
-    }
-
-    #[cfg(feature = "polar-quant")]
-    fn from_polar_q4_bytes(
-        bytes: &[u8],
-        cols: usize,
-        table: &PolarDequantTable,
-        device: &Device,
-    ) -> Result<Tensor> {
-        let out = CurrentPolarMode::decode_rows(bytes, cols, table);
-        assert!(
-            out.len() % cols == 0,
-            "Unpacked data length ({}) must be divisible by cols ({})",
-            out.len(),
-            cols
-        );
-        let rows = out.len() / cols;
-        Ok(Tensor::from_vec(out, &[rows, cols], device)?)
     }
 
     /*
