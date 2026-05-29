@@ -4,6 +4,7 @@ use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "deterministic"))]
 use rand::SeedableRng;
 use rusqlite::OptionalExtension;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
@@ -102,6 +103,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const DEFAULT_EMBEDDING_DIM: usize = 128;
+const DOCUMENT_CACHE_HASH_CHARS: usize = 32;
 const BUCKET_DATA_VERSION: u32 = 2;
 const BUCKET_DATA_MAGIC: [u8; 8] = *b"WRPBKT02";
 const BUCKET_META_PREFIX_BYTES: usize = 20;
@@ -181,6 +183,18 @@ fn dim_from_model_id(model: &str) -> usize {
 
 fn cached_embeddings_match_current_encoder(embeddings: &CachedEmbeddings) -> bool {
     embeddings.model == model_id_for_dim(dim_from_model_id(&embeddings.model))
+}
+
+pub(crate) fn document_cache_hash(body: &str, lens: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    hasher.update(lens.as_bytes());
+    let hash: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    hash[..DOCUMENT_CACHE_HASH_CHARS].to_string()
 }
 
 fn load_cached_embeddings(
@@ -1418,7 +1432,7 @@ fn match_centroids_from_cache(
     let mut unindexed: Vec<(Vec<DocPtr>, Tensor)> = vec![];
     {
         let mut unindexed_query = db.query(
-            "SELECT rowid, hash, body, lens FROM document
+            "SELECT rowid, body, lens FROM document
              WHERE rowid > ?1 AND length(body) > 0
              ORDER BY rowid",
         )?;
@@ -1427,11 +1441,11 @@ fn match_centroids_from_cache(
                 row.get::<_, u32>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
             ))
         })?;
         for result in results {
-            let (id, hash, body, lens) = result?;
+            let (id, body, lens) = result?;
+            let hash = document_cache_hash(&body, &lens);
             if let Some(cached) =
                 cached_embeddings_for_document(cache, embedder, &hash, &body, &lens)?
             {
@@ -1701,9 +1715,9 @@ pub fn embed_chunks_with_cache(
     let mut progress = {
         let count_sql = format!(
             "SELECT COUNT(*) FROM (
-                SELECT document.hash FROM document
+                SELECT rowid FROM document
                 WHERE length(document.body) > 0
-                ORDER BY document.hash
+                ORDER BY rowid
                 {}
             )",
             match limit {
@@ -1719,10 +1733,10 @@ pub fn embed_chunks_with_cache(
 
     let sql = format!(
         "SELECT
-        document.hash,document.body,document.lens
+        document.body,document.lens
         FROM document
         WHERE length(document.body) > 0
-        ORDER BY document.hash
+        ORDER BY rowid
         {}",
         match limit {
             Some(limit) => format!("LIMIT {limit}"),
@@ -1735,13 +1749,13 @@ pub fn embed_chunks_with_cache(
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
         ))
     })?;
 
     let mut count = 0;
     for result in documents.by_ref() {
-        let (hash, body, lens) = result?;
+        let (body, lens) = result?;
+        let hash = document_cache_hash(&body, &lens);
         let (_cached, computed) =
             load_or_compute_cached_embeddings(cache, &hash, &body, &lens, embedder)?;
         if computed {
@@ -1820,7 +1834,7 @@ fn count_document_embeddings_after(
     min_rowid_exclusive: i64,
 ) -> Result<usize> {
     let mut query = db.query(
-        "SELECT rowid, hash, body, lens FROM document
+        "SELECT rowid, body, lens FROM document
          WHERE rowid > ?1 AND length(body) > 0
          ORDER BY rowid",
     )?;
@@ -1829,13 +1843,13 @@ fn count_document_embeddings_after(
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
         ))
     })?;
 
     let mut count = 0usize;
     for row in rows {
-        let (_rowid, hash, body, lens) = row?;
+        let (_rowid, body, lens) = row?;
+        let hash = document_cache_hash(&body, &lens);
         if let Some(embeddings) =
             cached_embeddings_for_document(cache, embedder, &hash, &body, &lens)?
         {
@@ -1872,7 +1886,7 @@ fn sample_embeddings_for_kmeans(
     device: &Device,
 ) -> Result<(Tensor, usize)> {
     let mut kmeans_query = db.query(
-        "SELECT rowid, hash, body, lens FROM document
+        "SELECT rowid, body, lens FROM document
          WHERE rowid >= ?1 AND rowid <= ?2 AND length(body) > 0
          ORDER BY rowid",
     )?;
@@ -1887,10 +1901,10 @@ fn sample_embeddings_for_kmeans(
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
         ))
     })? {
-        let (_rowid, hash, body, lens) = result?;
+        let (_rowid, body, lens) = result?;
+        let hash = document_cache_hash(&body, &lens);
         let Some(embeddings) =
             cached_embeddings_for_document(cache, embedder, &hash, &body, &lens)?
         else {
@@ -2008,7 +2022,7 @@ fn write_buckets_for_range(
     let mut all_embeddings = vec![];
 
     let mut query = db.query(
-        "SELECT rowid, hash, body, lens FROM document
+        "SELECT rowid, body, lens FROM document
          WHERE rowid >= ?1 AND rowid <= ?2 AND length(body) > 0
          ORDER BY rowid",
     )?;
@@ -2018,7 +2032,6 @@ fn write_buckets_for_range(
             row.get::<_, u32>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
         ))
     })?;
 
@@ -2032,7 +2045,8 @@ fn write_buckets_for_range(
     while !done {
         match results.next() {
             Some(result) => {
-                let (id, hash, body, lens) = result?;
+                let (id, body, lens) = result?;
+                let hash = document_cache_hash(&body, &lens);
                 let Some(embeddings) =
                     cached_embeddings_for_document(cache, embedder, &hash, &body, &lens)?
                 else {

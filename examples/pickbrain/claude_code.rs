@@ -373,7 +373,7 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
         .to_string();
 
         let date = iso8601_timestamp::Timestamp::parse(&interaction[0].timestamp);
-        db.add_doc(&uuid, date, &metadata, &body, Some(lengths))?;
+        db.add_doc(None, &uuid, date, &metadata, &body, Some(lengths))?;
         count += 1;
     }
 
@@ -421,7 +421,7 @@ fn ingest_memory_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i6
     })
     .to_string();
 
-    db.add_doc(&uuid, None, &metadata, &body, Some(lengths))?;
+    db.add_doc(None, &uuid, None, &metadata, &body, Some(lengths))?;
     Ok(true)
 }
 
@@ -520,7 +520,7 @@ fn ingest_authored_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: 
     })
     .to_string();
 
-    db.add_doc(&uuid, None, &metadata, &body, Some(lengths))?;
+    db.add_doc(None, &uuid, None, &metadata, &body, Some(lengths))?;
     Ok(true)
 }
 

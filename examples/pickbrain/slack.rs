@@ -877,7 +877,7 @@ fn ingest_conversations(db: &mut DB, conversations: Vec<Conversation>) -> Result
             .unwrap_or(true);
 
         if body_changed || metadata_changed {
-            db.add_doc(&uuid, ts, &metadata, &body, Some(lens))?;
+            db.add_doc(None, &uuid, ts, &metadata, &body, Some(lens))?;
         }
         if body_changed {
             count += 1;

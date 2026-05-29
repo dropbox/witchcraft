@@ -317,7 +317,7 @@ fn ingest_session(
         .to_string();
 
         let date = iso8601_timestamp::Timestamp::parse(&interaction[0].timestamp);
-        db.add_doc(&uuid, date, &metadata, &body, Some(lengths))?;
+        db.add_doc(None, &uuid, date, &metadata, &body, Some(lengths))?;
         count += 1;
     }
 

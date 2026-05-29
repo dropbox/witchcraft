@@ -68,7 +68,7 @@ pub fn read_csv(db: &mut DB, csvname: std::path::PathBuf) -> Result<()> {
         let lens = bodies.iter().map(|b| b.chars().count()).collect();
         let body = bodies.join("");
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-        db.add_doc(&uuid, None, &metadata, &body, Some(lens))
+        db.add_doc(None, &uuid, None, &metadata, &body, Some(lens))
             .unwrap();
     }
 

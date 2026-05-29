@@ -70,7 +70,7 @@ mod tests {
         for body in FACTS {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
             uuids.push(uuid.clone());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
         for round in 0..3 {
@@ -151,7 +151,7 @@ mod tests {
             "Chunk hashes make stable filenames for cached embedding records.",
         ] {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
 
@@ -188,7 +188,7 @@ mod tests {
         }
         let body = FACTS.join("");
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-        db.add_doc(&uuid, None, &uuid.to_string(), &body, Some(lens))
+        db.add_doc(None, &uuid, None, &uuid.to_string(), &body, Some(lens))
             .unwrap();
 
         for (q, pos) in QUERIES {
@@ -244,7 +244,7 @@ mod tests {
         for body in FACTS {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
             uuids.push(uuid.clone());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
@@ -277,7 +277,7 @@ mod tests {
         for body in new_facts {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
             new_uuids.push(uuid.clone());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
@@ -342,7 +342,7 @@ mod tests {
         ];
         for body in more_facts {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
@@ -405,7 +405,7 @@ mod tests {
         // Phase 1: bulk insert
         for &body in &FACTS {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            db.add_doc(&uuid, None, &uuid.to_string(), body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
@@ -419,7 +419,7 @@ mod tests {
         ];
         for body in extra_facts {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            db.add_doc(&uuid, None, &uuid.to_string(), body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
@@ -569,18 +569,26 @@ mod tests {
 
         let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"counts-1");
         let uuid2 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"counts-2");
-        db.add_doc(&uuid1, None, "{}", "first count document", None)?;
-        db.add_doc(&uuid2, None, "{}", "second count document", None)?;
+        db.add_doc(None, &uuid1, None, "{}", "first count document", None)?;
+        db.add_doc(None, &uuid2, None, "{}", "second count document", None)?;
 
         let rows = db
-            .query("SELECT rowid, hash FROM document ORDER BY rowid")?
-            .query_map((), |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .query("SELECT rowid, body, lens FROM document ORDER BY rowid")?
+            .query_map((), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
+        let hash0 = crate::document_cache_hash(&rows[0].1, &rows[0].2);
+        let hash1 = crate::document_cache_hash(&rows[1].1, &rows[1].2);
         let model = crate::model_id_for_dim(crate::DEFAULT_EMBEDDING_DIM);
         let cache =
             crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
         cache.put(
-            &rows[0].1,
+            &hash0,
             &crate::CachedEmbeddings {
                 model: model.clone(),
                 counts: "not,a,count".to_string(),
@@ -589,7 +597,7 @@ mod tests {
             },
         )?;
         cache.put(
-            &rows[1].1,
+            &hash1,
             &crate::CachedEmbeddings {
                 model,
                 counts: "".to_string(),
@@ -620,7 +628,7 @@ mod tests {
 
         let mut db = DB::new(path.clone())?;
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"only-doc");
-        db.add_doc(&uuid, None, &uuid.to_string(), "Honey never spoils", None)?;
+        db.add_doc(None, &uuid, None, &uuid.to_string(), "Honey never spoils", None)?;
         crate::embed_chunks(&db, &embedder, None)?;
         crate::index_chunks(&db, &device)?;
 
@@ -638,10 +646,17 @@ mod tests {
         let path = dir.path().join("batch_test.sqlite");
         let mut db = DB::new(path)?;
 
-        let docs: Vec<(Uuid, Option<iso8601_timestamp::Timestamp>, &str, &str, Option<Vec<usize>>)> = vec![
-            (Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc1"), None, r#"{"title":"one"}"#, "first document body", None),
-            (Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc2"), None, r#"{"title":"two"}"#, "second document body", None),
-            (Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc3"), None, r#"{"title":"three"}"#, "third document body", None),
+        let docs: Vec<(
+            Option<u64>,
+            Uuid,
+            Option<iso8601_timestamp::Timestamp>,
+            &str,
+            &str,
+            Option<Vec<usize>>,
+        )> = vec![
+            (None, Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc1"), None, r#"{"title":"one"}"#, "first document body", None),
+            (None, Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc2"), None, r#"{"title":"two"}"#, "second document body", None),
+            (None, Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc3"), None, r#"{"title":"three"}"#, "third document body", None),
         ];
 
         let count = db.add_docs_batch(&docs)?;
@@ -654,14 +669,14 @@ mod tests {
 
         // Verify add_doc delegates to add_docs_batch correctly
         let uuid4 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc4");
-        db.add_doc(&uuid4, None, r#"{"title":"four"}"#, "fourth body", None)?;
+        db.add_doc(None, &uuid4, None, r#"{"title":"four"}"#, "fourth body", None)?;
         let row_count: i64 = db.query("SELECT COUNT(*) FROM document")?
             .query_row((), |row| row.get(0))?;
         assert_eq!(row_count, 4);
 
         // Verify upsert: re-add doc1 with different body
         let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc1");
-        db.add_doc(&uuid1, None, r#"{"title":"one-updated"}"#, "updated body", None)?;
+        db.add_doc(None, &uuid1, None, r#"{"title":"one-updated"}"#, "updated body", None)?;
         let row_count: i64 = db.query("SELECT COUNT(*) FROM document")?
             .query_row((), |row| row.get(0))?;
         assert_eq!(row_count, 4); // still 4, not 5
@@ -669,6 +684,80 @@ mod tests {
         let metadata: String = db.query("SELECT metadata FROM document WHERE uuid = ?1")?
             .query_row((uuid1.to_string(),), |row| row.get(0))?;
         assert!(metadata.contains("one-updated"));
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_docs_with_explicit_rowids() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("rowid_test.sqlite");
+        let mut db = DB::new(path)?;
+
+        let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc1");
+        let uuid2 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc2");
+        let docs = [
+            (Some(10), uuid1, None, r#"{"title":"one"}"#, "first body", None),
+            (Some(20), uuid2, None, r#"{"title":"two"}"#, "second body", None),
+        ];
+
+        assert_eq!(db.add_docs_batch(&docs)?, 2);
+        let rowids = db
+            .query("SELECT rowid FROM document ORDER BY rowid")?
+            .query_map((), |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rowids, vec![10, 20]);
+
+        let uuid3 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc3");
+        db.add_doc(None, &uuid3, None, "{}", "automatic rowid", None)?;
+        let auto_rowid: i64 = db
+            .query("SELECT rowid FROM document WHERE uuid = ?1")?
+            .query_row((uuid3.to_string(),), |row| row.get(0))?;
+        assert!(auto_rowid > 20);
+
+        db.add_doc(
+            Some(30),
+            &uuid1,
+            None,
+            r#"{"title":"one-updated"}"#,
+            "updated body",
+            None,
+        )?;
+        let moved_rowid: i64 = db
+            .query("SELECT rowid FROM document WHERE uuid = ?1")?
+            .query_row((uuid1.to_string(),), |row| row.get(0))?;
+        assert_eq!(moved_rowid, 30);
+
+        let uuid4 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc4");
+        assert!(db
+            .add_doc(Some(30), &uuid4, None, "{}", "duplicate rowid", None)
+            .is_err());
+        assert!(db
+            .add_doc(
+                Some(i64::MAX as u64 + 1),
+                &uuid4,
+                None,
+                "{}",
+                "too large",
+                None,
+            )
+            .is_err());
+
+        let uuid5 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc5");
+        let uuid6 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc6");
+        let non_monotonic = [
+            (Some(40), uuid5, None, "{}", "higher", None),
+            (Some(39), uuid6, None, "{}", "lower", None),
+        ];
+        assert!(db.add_docs_batch(&non_monotonic).is_err());
+
+        db.add_generation(0, 1, 1, 100)?;
+        assert!(db
+            .add_doc(Some(99), &uuid4, None, "{}", "below indexed max", None)
+            .is_err());
+        db.add_doc(Some(101), &uuid4, None, "{}", "above indexed max", None)?;
 
         db.clear();
         db.shutdown();
@@ -689,8 +778,8 @@ mod tests {
         // Insert two documents that would both match "flamingos"
         let uuid_a = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"filter-a");
         let uuid_b = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"filter-b");
-        db.add_doc(&uuid_a, None, &uuid_a.to_string(), "A group of flamingos is called a flamboyance", None)?;
-        db.add_doc(&uuid_b, None, &uuid_b.to_string(), "Flamingos are pink because of their diet of shrimp and algae", None)?;
+        db.add_doc(None, &uuid_a, None, &uuid_a.to_string(), "A group of flamingos is called a flamboyance", None)?;
+        db.add_doc(None, &uuid_b, None, &uuid_b.to_string(), "Flamingos are pink because of their diet of shrimp and algae", None)?;
 
         crate::embed_chunks(&db, &embedder, None)?;
         crate::index_chunks(&db, &device)?;
@@ -738,7 +827,7 @@ mod tests {
         let mut baseline = DB::new(baseline_path.clone())?;
         for &body in &FACTS {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            baseline.add_doc(&uuid, None, &uuid.to_string(), body, None)?;
+            baseline.add_doc(None, &uuid, None, &uuid.to_string(), body, None)?;
         }
         crate::embed_chunks(&baseline, &embedder, None)?;
         crate::index_chunks(&baseline, &device)?;
@@ -782,8 +871,8 @@ mod tests {
         // Add one doc with empty body and one with real content
         let uuid_empty = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"empty");
         let uuid_real = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"real");
-        db.add_doc(&uuid_empty, None, "{}", "", None)?;
-        db.add_doc(&uuid_real, None, "{}", "Octopuses have three hearts", None)?;
+        db.add_doc(None, &uuid_empty, None, "{}", "", None)?;
+        db.add_doc(None, &uuid_real, None, "{}", "Octopuses have three hearts", None)?;
 
         let embedding_cache =
             crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));

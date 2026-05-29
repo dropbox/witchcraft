@@ -1,17 +1,34 @@
 use super::types::SqlStatementInternal;
 use iso8601_timestamp::Timestamp;
 use log::{error, warn};
-use rusqlite::{params_from_iter, Connection, OpenFlags, Result as SQLResult, Statement};
-use sha2::{Digest, Sha256};
+use rusqlite::{
+    params_from_iter, Connection, OpenFlags, OptionalExtension, Result as SQLResult, Statement,
+};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::sql_generator::build_filter_sql_and_params;
 
-const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
 const APP_ID: i32 = 0x07DB_DA55;
-const SCHEMA_VERSION: i32 = 11;
+const SCHEMA_VERSION: i32 = 12;
+const MAX_SQLITE_ROWID: u64 = i64::MAX as u64;
+
+fn invalid_input_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    )))
+}
+
+fn sqlite_rowid_from_u64(rowid: u64) -> SQLResult<i64> {
+    if rowid == 0 || rowid > MAX_SQLITE_ROWID {
+        return Err(invalid_input_error(format!(
+            "document rowid {rowid} must be between 1 and {MAX_SQLITE_ROWID}"
+        )));
+    }
+    Ok(rowid as i64)
+}
 
 pub struct DB {
     db_fn: PathBuf,
@@ -111,11 +128,8 @@ impl DB {
                  uuid TEXT NOT NULL PRIMARY KEY,
                  date TEXT NOT NULL,
                  metadata JSON,
-                 hash TEXT CHECK (length(hash) = {HASH_CHARS}),
                  body TEXT,
                  lens TEXT);
-
-             CREATE INDEX document_index ON document(hash);
 
              CREATE VIRTUAL TABLE document_fts
                  USING fts5(body, content='document', content_rowid='rowid');
@@ -377,13 +391,14 @@ impl DB {
 
     pub fn add_doc(
         &mut self,
+        rowid: Option<u64>,
         uuid: &Uuid,
         date: Option<Timestamp>,
         metadata: &str,
         body: &str,
         lens: Option<Vec<usize>>,
     ) -> SQLResult<()> {
-        self.add_docs_batch(&[(*uuid, date, metadata, body, lens)])?;
+        self.add_docs_batch(&[(rowid, *uuid, date, metadata, body, lens)])?;
         Ok(())
     }
 
@@ -391,20 +406,22 @@ impl DB {
     /// and reuses it for all inserts. Much faster than individual add_doc calls.
     pub fn add_docs_batch(
         &mut self,
-        docs: &[(Uuid, Option<Timestamp>, &str, &str, Option<Vec<usize>>)],
+        docs: &[(Option<u64>, Uuid, Option<Timestamp>, &str, &str, Option<Vec<usize>>)],
     ) -> SQLResult<usize> {
         if docs.is_empty() {
             return Ok(0);
         }
+        let rowids = self.resolve_document_rowids(docs)?;
         self.conn().execute("BEGIN", ())?;
         let mut stmt = self.conn().prepare(
-            "INSERT INTO document VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO document(rowid, uuid, date, metadata, body, lens)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(uuid) DO UPDATE SET
-                date = ?2, metadata = ?3, hash = ?4, body = ?5, lens = ?6",
+                rowid = ?1, date = ?3, metadata = ?4, body = ?5, lens = ?6",
         )?;
 
         let mut count = 0;
-        for (uuid, date, metadata, body, lens) in docs {
+        for ((_, uuid, date, metadata, body, lens), rowid) in docs.iter().zip(rowids.iter()) {
             let lens = match lens {
                 Some(lens) => lens.clone(),
                 None => vec![body.chars().count()],
@@ -419,22 +436,12 @@ impl DB {
                 .collect::<Vec<_>>()
                 .join(",");
 
-            let mut hasher = Sha256::new();
-            hasher.update(body.as_bytes());
-            hasher.update(lens_str.as_bytes());
-            let hash: String = hasher
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
-            let hash = &hash[..HASH_CHARS];
-
             let date = date.unwrap_or_else(Timestamp::now_utc);
             stmt.execute((
+                rowid,
                 &uuid.to_string(),
                 date.to_string(),
                 *metadata,
-                hash,
                 *body,
                 &lens_str,
             ))?;
@@ -444,6 +451,61 @@ impl DB {
         self.conn().execute("COMMIT", ())?;
         self.remove_on_shutdown = false;
         Ok(count)
+    }
+
+    fn resolve_document_rowids(
+        &self,
+        docs: &[(Option<u64>, Uuid, Option<Timestamp>, &str, &str, Option<Vec<usize>>)],
+    ) -> SQLResult<Vec<i64>> {
+        let mut previous = self.max_known_document_rowid()?;
+        let mut rowid_query = self
+            .conn()
+            .prepare("SELECT rowid FROM document WHERE uuid = ?1")?;
+        let mut rowids = Vec::with_capacity(docs.len());
+
+        for (rowid, uuid, _, _, _, _) in docs {
+            let rowid = match rowid {
+                Some(rowid) => {
+                    let rowid = sqlite_rowid_from_u64(*rowid)?;
+                    if rowid <= previous {
+                        return Err(invalid_input_error(format!(
+                            "document rowid {rowid} must be greater than previous rowid {previous}"
+                        )));
+                    }
+                    previous = rowid;
+                    rowid
+                }
+                None => match rowid_query
+                    .query_row((uuid.to_string(),), |row| row.get::<_, i64>(0))
+                    .optional()?
+                {
+                    Some(existing) => existing,
+                    None => {
+                        previous = previous.checked_add(1).ok_or_else(|| {
+                            invalid_input_error("document rowid space exhausted".to_string())
+                        })?;
+                        previous
+                    }
+                },
+            };
+            rowids.push(rowid);
+        }
+
+        Ok(rowids)
+    }
+
+    fn max_known_document_rowid(&self) -> SQLResult<i64> {
+        let document_rowid: i64 = self
+            .conn()
+            .query_row("SELECT IFNULL(MAX(rowid), 0) FROM document", (), |row| {
+                row.get(0)
+            })?;
+        let indexed_rowid: i64 = self.conn().query_row(
+            "SELECT IFNULL(MAX(max_document_rowid), 0) FROM generation",
+            (),
+            |row| row.get(0),
+        )?;
+        Ok(document_rowid.max(indexed_rowid))
     }
 
     pub fn remove_doc(&mut self, uuid: &Uuid) -> SQLResult<()> {
