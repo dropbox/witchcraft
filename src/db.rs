@@ -11,7 +11,7 @@ use super::sql_generator::build_filter_sql_and_params;
 
 const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
 const APP_ID: i32 = 0x07DB_DA55;
-const SCHEMA_VERSION: i32 = 10;
+const SCHEMA_VERSION: i32 = 11;
 
 pub struct DB {
     db_fn: PathBuf,
@@ -139,33 +139,12 @@ impl DB {
                  INSERT INTO document_fts(rowid, body) VALUES (new.rowid, new.body);
              END;
 
-             CREATE TABLE chunk(
-                 hash TEXT PRIMARY KEY CHECK (length(hash) = {HASH_CHARS}),
-                 model TEXT,
-                 embeddings BLOB NOT NULL,
-                 counts TEXT NOT NULL,
-                 embedding_count INTEGER NOT NULL);
-
-             CREATE TRIGGER document_after_delete AFTER DELETE ON document
-             BEGIN
-                 DELETE FROM chunk
-                     WHERE hash = OLD.hash
-                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
-             END;
-
-             CREATE TRIGGER document_after_update AFTER UPDATE ON document
-             BEGIN
-                 DELETE FROM chunk
-                     WHERE hash = OLD.hash
-                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
-             END;
-
              CREATE TABLE generation(
                  id INTEGER PRIMARY KEY,
                  level INTEGER NOT NULL,
                  num_embeddings INTEGER NOT NULL,
-                 min_chunk_rowid INTEGER NOT NULL,
-                 max_chunk_rowid INTEGER NOT NULL,
+                 min_document_rowid INTEGER NOT NULL,
+                 max_document_rowid INTEGER NOT NULL,
                  bucket_data_file TEXT NOT NULL);"
         ))?;
         Ok(())
@@ -243,7 +222,6 @@ impl DB {
 
     fn clear_inner(&mut self) -> SQLResult<()> {
         self.execute("DELETE FROM document")?;
-        self.execute("DELETE FROM chunk")?;
         self.execute("DELETE FROM generation")?;
         self.remove_all_bucket_data_sidecars();
         self.execute("VACUUM")?;
@@ -474,33 +452,17 @@ impl DB {
         Ok(())
     }
 
-    pub fn add_chunk(
-        &self,
-        hash: &str,
-        model: &str,
-        embeddings: &Vec<u8>,
-        counts: &str,
-        embedding_count: usize,
-    ) -> SQLResult<()> {
-        self.conn().execute(
-            "INSERT OR IGNORE INTO chunk(hash, model, embeddings, counts, embedding_count)
-             VALUES(?1, ?2, ?3, ?4, ?5)",
-            (&hash, &model, embeddings, counts, embedding_count as i64),
-        )?;
-        Ok(())
-    }
-
     pub fn add_generation(
         &self,
         level: u32,
         num_embeddings: u64,
-        min_chunk_rowid: i64,
-        max_chunk_rowid: i64,
+        min_document_rowid: i64,
+        max_document_rowid: i64,
     ) -> SQLResult<i64> {
         self.conn().execute(
-            "INSERT INTO generation(level, num_embeddings, min_chunk_rowid, max_chunk_rowid, bucket_data_file)
+            "INSERT INTO generation(level, num_embeddings, min_document_rowid, max_document_rowid, bucket_data_file)
              VALUES(?1, ?2, ?3, ?4, '')",
-            (level, num_embeddings as i64, min_chunk_rowid, max_chunk_rowid),
+            (level, num_embeddings as i64, min_document_rowid, max_document_rowid),
         )?;
         Ok(self.conn().last_insert_rowid())
     }

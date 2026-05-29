@@ -3,7 +3,7 @@ use memmap2::Mmap;
 use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "deterministic"))]
 use rand::SeedableRng;
-use rusqlite::{OptionalExtension, Statement};
+use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
@@ -61,6 +61,9 @@ compile_error!("polar-quant-2bit and polar-quant-3bit are mutually exclusive");
 
 mod db;
 pub use db::DB;
+
+mod embedding_cache;
+pub use embedding_cache::{CachedEmbeddings, EmbeddingCache, FileEmbeddingCache};
 
 mod embedder;
 pub use embedder::Embedder;
@@ -141,19 +144,63 @@ fn residual_bytes_for_dim(dim: usize) -> usize {
     }
 }
 
-fn model_id_for_dim(dim: usize) -> String {
-    if dim == DEFAULT_EMBEDDING_DIM {
-        "xtr-base-en".to_string()
-    } else {
-        format!("xtr-base-en-d{dim}")
+fn model_id_prefix() -> &'static str {
+    #[cfg(any(feature = "t5-quantized", feature = "t5-openvino"))]
+    {
+        "xtr-base-en"
     }
+    #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+    {
+        "modernbert"
+    }
+}
+
+fn model_id_for_dim(dim: usize) -> String {
+    let prefix = model_id_prefix();
+    if dim == DEFAULT_EMBEDDING_DIM {
+        prefix.to_string()
+    } else {
+        format!("{prefix}-d{dim}")
+    }
+}
+
+pub fn default_embedding_cache_dir() -> PathBuf {
+    PathBuf::from(".embeddings-cache").join(model_id_prefix())
+}
+
+pub fn default_embedding_cache() -> FileEmbeddingCache {
+    FileEmbeddingCache::new(default_embedding_cache_dir())
 }
 
 fn dim_from_model_id(model: &str) -> usize {
     model
-        .strip_prefix("xtr-base-en-d")
-        .and_then(|s| s.parse::<usize>().ok())
+        .rsplit_once("-d")
+        .and_then(|(_, dim)| dim.parse::<usize>().ok())
         .unwrap_or(DEFAULT_EMBEDDING_DIM)
+}
+
+fn cached_embeddings_match_current_encoder(embeddings: &CachedEmbeddings) -> bool {
+    embeddings.model == model_id_for_dim(dim_from_model_id(&embeddings.model))
+}
+
+fn load_cached_embeddings(
+    cache: &dyn EmbeddingCache,
+    hash: &str,
+) -> Result<Option<CachedEmbeddings>> {
+    match cache.get(hash)? {
+        Some(embeddings) if cached_embeddings_match_current_encoder(&embeddings) => {
+            debug!("embedding cache hit for chunk {hash}");
+            Ok(Some(embeddings))
+        }
+        Some(embeddings) => {
+            debug!(
+                "embedding cache entry for chunk {hash} has stale model {}; recomputing",
+                embeddings.model
+            );
+            Ok(None)
+        }
+        None => Ok(None),
+    }
 }
 
 pub fn make_device() -> Device {
@@ -1035,7 +1082,7 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
 pub fn match_centroids_raw(
     generation_files: &[PathBuf],
     query_embeddings: &Tensor,
-    unindexed: &[(u32, Tensor)],
+    unindexed: &[(Vec<DocPtr>, Tensor)],
     threshold: f32,
     top_k: usize,
 ) -> Result<Vec<(f32, u32, u32)>> {
@@ -1204,15 +1251,20 @@ pub fn match_centroids_raw(
     // Process unindexed embeddings: full similarities (no centroid boost)
     if !unindexed.is_empty() {
         let mut unindexed_tensors = vec![];
-        for (id, embeddings) in unindexed {
+        for (indices, embeddings) in unindexed {
             let (num_docs, dim) = embeddings.dims2()?;
             anyhow::ensure!(
                 dim == query_dim,
                 "unindexed embedding dimension {dim} does not match query dimension {query_dim}; re-embed with the selected encoder"
             );
+            anyhow::ensure!(
+                indices.len() == num_docs,
+                "unindexed embedding has {num_docs} rows but {} document indices",
+                indices.len()
+            );
             unindexed_tensors.push(embeddings.clone());
-            for _ in 0..num_docs {
-                all.push(((*id, 0), count));
+            for idx in indices {
+                all.push((*idx, count));
                 count += 1;
             }
         }
@@ -1308,14 +1360,49 @@ pub fn match_centroids_raw(
     Ok(scored_results)
 }
 
-/// DB-backed wrapper: loads generations from cache, fetches unindexed chunks,
-/// and optionally applies SQL filter postprocessing.
+/// DB-backed wrapper: loads generations from cache and fetches any unindexed
+/// documents that already have cached embeddings.
 pub fn match_centroids(
     db: &DB,
     query_embeddings: &Tensor,
     threshold: f32,
     top_k: usize,
     sql_filter: Option<&SqlStatementInternal>,
+) -> Result<Vec<(f32, u32, u32)>> {
+    let cache = default_embedding_cache();
+    match_centroids_from_cache(db, query_embeddings, threshold, top_k, sql_filter, None, &cache)
+}
+
+/// DB-backed wrapper that can demand-populate missing unindexed document
+/// embeddings through the supplied cache.
+pub fn match_centroids_with_cache(
+    db: &DB,
+    query_embeddings: &Tensor,
+    threshold: f32,
+    top_k: usize,
+    sql_filter: Option<&SqlStatementInternal>,
+    embedder: &Embedder,
+    cache: &dyn EmbeddingCache,
+) -> Result<Vec<(f32, u32, u32)>> {
+    match_centroids_from_cache(
+        db,
+        query_embeddings,
+        threshold,
+        top_k,
+        sql_filter,
+        Some(embedder),
+        cache,
+    )
+}
+
+fn match_centroids_from_cache(
+    db: &DB,
+    query_embeddings: &Tensor,
+    threshold: f32,
+    top_k: usize,
+    sql_filter: Option<&SqlStatementInternal>,
+    embedder: Option<&Embedder>,
+    cache: &dyn EmbeddingCache,
 ) -> Result<Vec<(f32, u32, u32)>> {
     let mut gen_query =
         db.query("SELECT bucket_data_file FROM generation ORDER BY level, id")?;
@@ -1327,28 +1414,35 @@ pub fn match_centroids(
         .map(|f| db.bucket_data_path(&f))
         .collect();
 
-    let max_indexed_rowid = max_indexed_chunk_rowid(db)?;
-    let mut unindexed: Vec<(u32, Tensor)> = vec![];
+    let max_indexed_rowid = max_indexed_document_rowid(db)?;
+    let mut unindexed: Vec<(Vec<DocPtr>, Tensor)> = vec![];
     {
         let mut unindexed_query = db.query(
-            "SELECT d.rowid, c.model, c.embeddings
-             FROM document AS d
-             JOIN chunk AS c ON c.hash = d.hash
-             WHERE c.rowid > ?1
-             ORDER BY d.rowid",
+            "SELECT rowid, hash, body, lens FROM document
+             WHERE rowid > ?1 AND length(body) > 0
+             ORDER BY rowid",
         )?;
         let results = unindexed_query.query_map((max_indexed_rowid,), |row| {
             Ok((
                 row.get::<_, u32>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         for result in results {
-            let (id, model, embeddings) = result?;
-            let embeddings =
-                Tensor::embeddings_from_packed(&embeddings, dim_from_model_id(&model), &Device::Cpu)?;
-            unindexed.push((id, embeddings));
+            let (id, hash, body, lens) = result?;
+            if let Some(cached) =
+                cached_embeddings_for_document(cache, embedder, &hash, &body, &lens)?
+            {
+                let embeddings = Tensor::embeddings_from_packed(
+                    &cached.embeddings,
+                    dim_from_model_id(&cached.model),
+                    &Device::Cpu,
+                )?;
+                let indices = docptrs_for_counts(id, &cached.counts);
+                unindexed.push((indices, embeddings));
+            }
         }
     }
 
@@ -1412,107 +1506,76 @@ fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
         .collect()
 }
 
-pub struct Gatherer<'a> {
-    documents: Box<dyn Iterator<Item = (String, String, String)> + 'a>,
-    embedder: &'a Embedder,
-}
-
-impl<'a> Gatherer<'a> {
-    fn new(stmt: &'a mut Statement, embedder: &'a Embedder) -> Self {
-        let documents = Box::new(
-            stmt.query_map((), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap),
-        );
-
-        Self {
-            documents,
-            embedder,
+fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
+    let mut document_indices = Vec::new();
+    for (i, count) in counts
+        .split(',')
+        .filter_map(|s| s.parse::<u32>().ok())
+        .enumerate()
+    {
+        for _ in 0..count {
+            document_indices.push((id, i as u32));
         }
     }
+    document_indices
 }
 
-impl<'a> Iterator for Gatherer<'a> {
-    type Item = (String, Tensor, Vec<u32>);
+fn token_counts_for_lens(lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u32>> {
+    let mut lengths: Vec<usize> = lens
+        .split(',')
+        .filter_map(|s| s.parse::<usize>().ok())
+        .collect();
+    anyhow::ensure!(!lengths.is_empty(), "document chunk lens are empty");
 
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.documents.next() {
-            Some((hash, body, lens)) => {
-                let now = std::time::Instant::now();
-                let (embeddings, offsets) = self.embedder.embed(&body).unwrap();
-                let embeddings = embeddings
-                    .squeeze(0)
-                    .unwrap()
-                    .to_device(&Device::Cpu)
-                    .unwrap();
-                let (m, _n) = embeddings.dims2().unwrap();
-                let dt = now.elapsed().as_secs_f64();
-                debug!(
-                    "embedder took {} ms ({} rows/s).",
-                    now.elapsed().as_millis(),
-                    ((m as f64) / dt).round()
-                );
+    for i in 1..lengths.len() {
+        lengths[i] += lengths[i - 1];
+    }
 
-                let mut lengths: Vec<usize> = lens
-                    .split(',')
-                    .filter_map(|s| s.parse::<usize>().ok())
-                    .collect();
-                for i in 1..lengths.len() {
-                    lengths[i] += lengths[i - 1];
-                }
+    let mut i = 0;
+    let mut j = 0;
 
-                let mut i = 0;
-                let mut j = 0;
+    let i_end = offsets.len();
+    let j_end = lengths.len();
+    let mut count: u32 = 0;
+    let mut done = false;
+    let mut flush = false;
+    let mut counts = vec![];
 
-                let i_end = offsets.len();
-                let j_end = lengths.len();
-                let mut count: u32 = 0;
-                let mut done = false;
-                let mut flush = false;
-                let mut counts = vec![];
+    while !done {
+        let o = if i < offsets.len() {
+            offsets[i].1
+        } else {
+            usize::MAX
+        };
 
-                while !done {
-                    let o = if i < offsets.len() {
-                        offsets[i].1
-                    } else {
-                        usize::MAX
-                    };
+        let l = if j < lengths.len() {
+            lengths[j]
+        } else {
+            usize::MAX
+        };
 
-                    let l = if j < lengths.len() {
-                        lengths[j]
-                    } else {
-                        usize::MAX
-                    };
+        if o <= l {
+            i += 1;
+            count += 1;
+        } else {
+            j += 1;
+            flush = true;
+        }
 
-                    if o <= l {
-                        i += 1;
-                        count += 1;
-                    } else {
-                        j += 1;
-                        flush = true;
-                    }
+        done = i == i_end && j == j_end;
 
-                    done = i == i_end && j == j_end;
-
-                    if flush || done {
-                        counts.push(count);
-                        count = 0;
-                        flush = false;
-                    }
-                }
-                assert!(count == 0);
-                assert!(counts.iter().sum::<u32>() == offsets.len() as u32);
-                Some((hash, embeddings, counts))
-            }
-            None => None,
+        if flush || done {
+            counts.push(count);
+            count = 0;
+            flush = false;
         }
     }
+    anyhow::ensure!(count == 0, "unfinished token count while splitting chunks");
+    anyhow::ensure!(
+        counts.iter().sum::<u32>() == offsets.len() as u32,
+        "token counts do not cover all offsets"
+    );
+    Ok(counts)
 }
 
 #[cfg(debug_assertions)]
@@ -1555,16 +1618,94 @@ fn stretch_rows(a: &Tensor) -> Result<Tensor> {
     Ok(Tensor::stack(&scaled_rows, 0)?)
 }
 
-pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
+fn compute_cached_embeddings(
+    embedder: &Embedder,
+    body: &str,
+    lens: &str,
+) -> Result<CachedEmbeddings> {
+    let now = std::time::Instant::now();
+    let (embeddings, offsets) = embedder.embed(body)?;
+    let embeddings = embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
+    let (rows, cols) = embeddings.dims2()?;
+    let dt = now.elapsed().as_secs_f64();
+    debug!(
+        "embedder took {} ms ({} rows/s).",
+        now.elapsed().as_millis(),
+        ((rows as f64) / dt).round()
+    );
+
+    let counts = token_counts_for_lens(lens, &offsets)?;
+    debug!(
+        "got embedding for chunk {:?} {:?}",
+        embeddings.dims2()?,
+        counts,
+    );
+
+    let now = std::time::Instant::now();
+    let bytes = embeddings.embeddings_to_packed()?;
+    let pct = 100.0 * (bytes.len() as f32) / ((rows * cols) as f32);
+    let bpe = 8.0 * (bytes.len() as f32) / ((rows * cols) as f32);
+    debug!(
+        "compressing to {pct:.2}% {bpe:.2}bpe took {} ms.",
+        now.elapsed().as_millis()
+    );
+
+    #[cfg(debug_assertions)]
+    {
+        let t = Tensor::embeddings_from_packed(&bytes, cols, &Device::Cpu)?;
+        let min_acc = rowwise_cosine_min(&embeddings, &t)?;
+
+        let n = bpe.ceil() as u32;
+        let qn = stretch_rows(&embeddings)?.quantize(n)?.dequantize(n)?;
+        let min_qn_acc = rowwise_cosine_min(&embeddings, &qn)?;
+        debug!("haar reconstruction accuracy={min_acc} compare at q{n}_acc={min_qn_acc}");
+    }
+
+    Ok(CachedEmbeddings {
+        model: model_id_for_dim(cols),
+        counts: counts
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        embedding_count: rows,
+        embeddings: bytes,
+    })
+}
+
+fn load_or_compute_cached_embeddings(
+    cache: &dyn EmbeddingCache,
+    hash: &str,
+    body: &str,
+    lens: &str,
+    embedder: &Embedder,
+) -> Result<(CachedEmbeddings, bool)> {
+    if let Some(embeddings) = load_cached_embeddings(cache, hash)? {
+        return Ok((embeddings, false));
+    }
+
+    let embeddings = compute_cached_embeddings(embedder, body, lens)?;
+    cache.put(hash, &embeddings)?;
+    Ok((embeddings, true))
+}
+
+pub fn embed_chunks_with_cache(
+    db: &DB,
+    embedder: &Embedder,
+    cache: &dyn EmbeddingCache,
+    limit: Option<usize>,
+) -> Result<usize> {
     let _priority_mgr = PriorityManager::new();
 
     // Count total documents to embed for progress reporting
     let mut progress = {
         let count_sql = format!(
-            "SELECT COUNT(*) FROM document
-            LEFT JOIN chunk ON document.hash = chunk.hash
-            WHERE chunk.hash IS NULL AND length(document.body) > 0
-            {}",
+            "SELECT COUNT(*) FROM (
+                SELECT document.hash FROM document
+                WHERE length(document.body) > 0
+                ORDER BY document.hash
+                {}
+            )",
             match limit {
                 Some(limit) => format!("LIMIT {limit}"),
                 _ => String::new(),
@@ -1580,8 +1721,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
         "SELECT
         document.hash,document.body,document.lens
         FROM document
-        LEFT JOIN chunk ON document.hash = chunk.hash
-        WHERE chunk.hash IS NULL AND length(document.body) > 0
+        WHERE length(document.body) > 0
         ORDER BY document.hash
         {}",
         match limit {
@@ -1591,81 +1731,118 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
     );
     let mut query = db.query(&sql)?;
 
-    let embedding_iter = Gatherer::new(&mut query, embedder);
+    let mut documents = query.query_map((), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
     let mut count = 0;
-    for (hash, embeddings, counts) in embedding_iter {
-        debug!(
-            "got embedding for chunk with hash {} {:?} {:?}",
-            hash,
-            embeddings.dims2()?,
-            counts,
-        );
-
-        let now = std::time::Instant::now();
-        let bytes = embeddings.embeddings_to_packed()?;
-        let (rows, cols) = embeddings.dims2()?;
-        let pct = 100.0 * (bytes.len() as f32) / ((rows * cols) as f32);
-        let bpe = 8.0 * (bytes.len() as f32) / ((rows * cols) as f32);
-        debug!(
-            "compressing to {pct:.2}% {bpe:.2}bpe took {} ms.",
-            now.elapsed().as_millis()
-        );
-
-        #[cfg(debug_assertions)]
-        {
-            let t = Tensor::embeddings_from_packed(&bytes, cols, &Device::Cpu)?;
-            let min_acc = rowwise_cosine_min(&embeddings, &t)?;
-
-            let n = bpe.ceil() as u32;
-            let qn = stretch_rows(&embeddings)?.quantize(n)?.dequantize(n)?;
-            let min_qn_acc = rowwise_cosine_min(&embeddings, &qn)?;
-            debug!("haar reconstruction accuracy={min_acc} compare at q{n}_acc={min_qn_acc}");
+    for result in documents.by_ref() {
+        let (hash, body, lens) = result?;
+        let (_cached, computed) =
+            load_or_compute_cached_embeddings(cache, &hash, &body, &lens, embedder)?;
+        if computed {
+            count += 1;
         }
-
-        let counts = counts
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let model_id = model_id_for_dim(cols);
-        match db.add_chunk(&hash, &model_id, &bytes, &counts, rows) {
-            Ok(()) => {
-                count += 1;
-                progress.inc(1);
-            }
-            Err(v) => {
-                return Err(anyhow::anyhow!("add_chunk failed: {v}"));
-            }
-        };
+        progress.inc(1);
     }
     progress.finish();
 
-    debug!("embedded {count} chunks");
+    debug!("computed {count} embedding cache entries");
     if count > 0 {
         db.checkpoint();
     }
     Ok(count)
 }
 
-
-pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
-    let max_indexed_rowid = max_indexed_chunk_rowid(db)?;
-    count_chunk_embeddings_after(db, max_indexed_rowid)
+pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
+    let cache = default_embedding_cache();
+    embed_chunks_with_cache(db, embedder, &cache, limit)
 }
 
-fn max_indexed_chunk_rowid(db: &DB) -> Result<i64> {
+pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
+    let cache = default_embedding_cache();
+    let max_indexed_rowid = max_indexed_document_rowid(db)?;
+    count_document_embeddings_after(db, &cache, None, max_indexed_rowid)
+}
+
+pub fn count_unindexed_embeddings_with_cache(
+    db: &DB,
+    embedder: &Embedder,
+    cache: &dyn EmbeddingCache,
+) -> Result<usize> {
+    let max_indexed_rowid = max_indexed_document_rowid(db)?;
+    count_document_embeddings_after(db, cache, Some(embedder), max_indexed_rowid)
+}
+
+pub fn count_unindexed_cached_embeddings(db: &DB, cache: &dyn EmbeddingCache) -> Result<usize> {
+    let max_indexed_rowid = max_indexed_document_rowid(db)?;
+    count_document_embeddings_after(db, cache, None, max_indexed_rowid)
+}
+
+fn max_indexed_document_rowid(db: &DB) -> Result<i64> {
     let rowid = db
-        .query("SELECT IFNULL(MAX(max_chunk_rowid), 0) FROM generation")?
+        .query("SELECT IFNULL(MAX(max_document_rowid), 0) FROM generation")?
         .query_row((), |row| row.get(0))?;
     Ok(rowid)
 }
 
-fn count_chunk_embeddings_after(db: &DB, min_rowid_exclusive: i64) -> Result<usize> {
-    let count: i64 = db
-        .query("SELECT IFNULL(SUM(embedding_count), 0) FROM chunk WHERE rowid > ?1")?
-        .query_row((min_rowid_exclusive,), |row| row.get(0))?;
-    Ok(count.try_into()?)
+fn max_document_rowid(db: &DB) -> Result<i64> {
+    let rowid = db
+        .query("SELECT IFNULL(MAX(rowid), 0) FROM document WHERE length(body) > 0")?
+        .query_row((), |row| row.get(0))?;
+    Ok(rowid)
+}
+
+fn cached_embeddings_for_document(
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+    hash: &str,
+    body: &str,
+    lens: &str,
+) -> Result<Option<CachedEmbeddings>> {
+    if let Some(embedder) = embedder {
+        let (embeddings, _computed) =
+            load_or_compute_cached_embeddings(cache, hash, body, lens, embedder)?;
+        Ok(Some(embeddings))
+    } else {
+        load_cached_embeddings(cache, hash)
+    }
+}
+
+fn count_document_embeddings_after(
+    db: &DB,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+    min_rowid_exclusive: i64,
+) -> Result<usize> {
+    let mut query = db.query(
+        "SELECT rowid, hash, body, lens FROM document
+         WHERE rowid > ?1 AND length(body) > 0
+         ORDER BY rowid",
+    )?;
+    let rows = query.query_map((min_rowid_exclusive,), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    let mut count = 0usize;
+    for row in rows {
+        let (_rowid, hash, body, lens) = row?;
+        if let Some(embeddings) =
+            cached_embeddings_for_document(cache, embedder, &hash, &body, &lens)?
+        {
+            count += embeddings.embedding_count;
+        }
+    }
+    Ok(count)
 }
 
 fn count_indexed_embeddings(db: &DB) -> Result<usize> {
@@ -1686,20 +1863,44 @@ fn bucket_data_files_for_generations(db: &DB, where_clause: &str) -> Result<Vec<
     Ok(files)
 }
 
-fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(Tensor, usize)> {
-    let mut kmeans_query = db.query(sql)?;
+fn sample_embeddings_for_kmeans(
+    db: &DB,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+    min_rowid: i64,
+    max_rowid: i64,
+    device: &Device,
+) -> Result<(Tensor, usize)> {
+    let mut kmeans_query = db.query(
+        "SELECT rowid, hash, body, lens FROM document
+         WHERE rowid >= ?1 AND rowid <= ?2 AND length(body) > 0
+         ORDER BY rowid",
+    )?;
     let mut total_embeddings = 0;
     #[cfg(any(test, feature = "deterministic"))]
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
-    for result in kmeans_query.query_map((), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    for result in kmeans_query.query_map((min_rowid, max_rowid), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
     })? {
-        let (model, embeddings) = result?;
-        let t =
-            Tensor::embeddings_from_packed(&embeddings, dim_from_model_id(&model), &Device::Cpu)?;
+        let (_rowid, hash, body, lens) = result?;
+        let Some(embeddings) =
+            cached_embeddings_for_document(cache, embedder, &hash, &body, &lens)?
+        else {
+            continue;
+        };
+        let t = Tensor::embeddings_from_packed(
+            &embeddings.embeddings,
+            dim_from_model_id(&embeddings.model),
+            &Device::Cpu,
+        )?;
         let (m, _) = t.dims2()?;
         let k = ((m as f32).sqrt().ceil()) as usize;
         let subset_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
@@ -1734,34 +1935,41 @@ fn level_capacity(level: u32) -> usize {
     L0_CAPACITY * LSM_FANOUT.pow(level + 1)
 }
 
-/// Build one generation for a range of chunks, reading original embeddings from
-/// the chunk table and running full k-means.
+/// Build one generation for a document rowid range, reading original embeddings
+/// through the cache and running full k-means.
 fn build_layer(
     db: &DB,
     device: &Device,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
     level: u32,
     min_rowid: i64,
     max_rowid: i64,
 ) -> Result<()> {
-    let sql = format!(
-        "SELECT chunk.model, chunk.embeddings FROM chunk
-         WHERE chunk.rowid >= {} AND chunk.rowid <= {}",
-        min_rowid, max_rowid
-    );
-    let (matrix, total_embeddings) = sample_embeddings_for_kmeans(db, &sql, device)?;
+    let (matrix, total_embeddings) =
+        sample_embeddings_for_kmeans(db, cache, embedder, min_rowid, max_rowid, device)?;
     if total_embeddings == 0 {
         return Ok(());
     }
 
     info!(
-        "building L{} with {} embeddings (chunks {}..={})",
+        "building L{} with {} embeddings (documents {}..={})",
         level, total_embeddings, min_rowid, max_rowid
     );
     let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
     drop(matrix); // Free kmeans sample matrix before write_buckets
 
     let (tmpfiles, centers_cpu) =
-        write_buckets_for_range(db, &centers, device, total_embeddings as u64, min_rowid, max_rowid)?;
+        write_buckets_for_range(
+            db,
+            cache,
+            embedder,
+            &centers,
+            device,
+            total_embeddings as u64,
+            min_rowid,
+            max_rowid,
+        )?;
 
     let gen_id = db.add_generation(level, total_embeddings as u64, min_rowid, max_rowid)?;
     let bucket_data_file = db.bucket_data_file_name(gen_id);
@@ -1779,9 +1987,11 @@ fn build_layer(
     Ok(())
 }
 
-/// Like write_buckets but only processes chunks in [min_rowid, max_rowid].
+/// Like write_buckets but only processes documents in [min_rowid, max_rowid].
 fn write_buckets_for_range(
     db: &DB,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
     centers: &Tensor,
     device: &Device,
     expected_count: u64,
@@ -1797,22 +2007,17 @@ fn write_buckets_for_range(
     let mut document_indices = Vec::<(u32, u32)>::new();
     let mut all_embeddings = vec![];
 
-    let embeddings_sql = format!(
-        "SELECT document.rowid, chunk.model, chunk.embeddings, chunk.counts
-         FROM document, chunk
-         WHERE document.hash = chunk.hash
-         AND chunk.rowid >= {} AND chunk.rowid <= {}
-         ORDER BY document.rowid",
-        min_rowid, max_rowid
-    );
+    let mut query = db.query(
+        "SELECT rowid, hash, body, lens FROM document
+         WHERE rowid >= ?1 AND rowid <= ?2 AND length(body) > 0
+         ORDER BY rowid",
+    )?;
 
-    let mut query = db.query(&embeddings_sql)?;
-
-    let mut results = query.query_map((), |row| {
+    let mut results = query.query_map((min_rowid, max_rowid), |row| {
         Ok((
             row.get::<_, u32>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
         ))
     })?;
@@ -1827,26 +2032,29 @@ fn write_buckets_for_range(
     while !done {
         match results.next() {
             Some(result) => {
-                let (id, model, embeddings, counts) = result?;
+                let (id, hash, body, lens) = result?;
+                let Some(embeddings) =
+                    cached_embeddings_for_document(cache, embedder, &hash, &body, &lens)?
+                else {
+                    continue;
+                };
 
-                let dim = dim_from_model_id(&model);
+                let dim = dim_from_model_id(&embeddings.model);
                 anyhow::ensure!(
                     dim == center_dim,
-                    "chunk embedding dimension {dim} does not match index center dimension {center_dim}"
+                    "document embedding dimension {dim} does not match index center dimension {center_dim}"
                 );
-                let t = Tensor::embeddings_from_packed(&embeddings, dim, &Device::Cpu)?;
+                let t = Tensor::embeddings_from_packed(&embeddings.embeddings, dim, &Device::Cpu)?;
                 let split = split_tensor(&t);
                 let m = split.len();
 
-                for (i, count) in counts
-                    .split(',')
-                    .filter_map(|s| s.parse::<u32>().ok())
-                    .enumerate()
-                {
-                    for _ in 0..count {
-                        document_indices.push((id, i as u32));
-                    }
-                }
+                let docptrs = docptrs_for_counts(id, &embeddings.counts);
+                anyhow::ensure!(
+                    docptrs.len() == m,
+                    "document {id} has {m} embedding rows but {} document indices",
+                    docptrs.len()
+                );
+                document_indices.extend(docptrs);
                 all_embeddings.extend(split);
                 batch += m;
             }
@@ -1932,6 +2140,18 @@ fn write_buckets_for_range(
     Ok((tmpfiles, centers_cpu))
 }
 
+pub fn full_index_with_cache(
+    db: &DB,
+    device: &Device,
+    embedder: &Embedder,
+    cache: &dyn EmbeddingCache,
+) -> Result<()> {
+    db.execute("DELETE FROM generation")?;
+    clear_generations_cache();
+    db.remove_all_bucket_data_sidecars();
+    index_chunks_with_cache(db, device, embedder, cache)
+}
+
 pub fn full_index(db: &DB, device: &Device) -> Result<()> {
     db.execute("DELETE FROM generation")?;
     clear_generations_cache();
@@ -1939,8 +2159,28 @@ pub fn full_index(db: &DB, device: &Device) -> Result<()> {
     index_chunks(db, device)
 }
 
+pub fn index_chunks_with_cache(
+    db: &DB,
+    device: &Device,
+    embedder: &Embedder,
+    cache: &dyn EmbeddingCache,
+) -> Result<()> {
+    index_chunks_inner(db, device, cache, Some(embedder))
+}
+
 pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
-    let x = count_unindexed_embeddings(db)?;
+    let cache = default_embedding_cache();
+    index_chunks_inner(db, device, &cache, None)
+}
+
+fn index_chunks_inner(
+    db: &DB,
+    device: &Device,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+) -> Result<()> {
+    let max_indexed_rowid = max_indexed_document_rowid(db)?;
+    let x = count_document_embeddings_after(db, cache, embedder, max_indexed_rowid)?;
     if x == 0 {
         return Ok(());
     }
@@ -1953,11 +2193,8 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
         return Ok(());
     }
 
-    // Find the max indexed chunk rowid — unindexed chunks are above this
-    let max_indexed_rowid = max_indexed_chunk_rowid(db)?;
-    let max_chunk_rowid: i64 = db
-        .query("SELECT MAX(rowid) FROM chunk")?
-        .query_row((), |row| row.get(0))?;
+    // Find the max indexed document rowid — unindexed documents are above this.
+    let max_document_rowid = max_document_rowid(db)?;
 
     // Cascade: accumulate x through levels until we find one with room
     let mut total = x;
@@ -1981,18 +2218,18 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
         target_level += 1;
     }
 
-    // Find the min chunk rowid across all levels being merged + unindexed
+    // Find the min document rowid across all levels being merged + unindexed
     let min_rowid: i64 = db
         .query(&format!(
-            "SELECT IFNULL(MIN(min_chunk_rowid), {}) FROM generation WHERE level <= {}",
+            "SELECT IFNULL(MIN(min_document_rowid), {}) FROM generation WHERE level <= {}",
             max_indexed_rowid + 1,
             target_level
         ))?
         .query_row((), |row| row.get(0))?;
 
     info!(
-        "cascading {} embeddings into L{} (chunks {}..={})",
-        total, target_level, min_rowid, max_chunk_rowid
+        "cascading {} embeddings into L{} (documents {}..={})",
+        total, target_level, min_rowid, max_document_rowid
     );
 
     let stale_bucket_data_files =
@@ -2005,7 +2242,15 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
         let delete_sql = format!("DELETE FROM generation WHERE level <= {}", target_level);
         db.execute(&delete_sql)?;
 
-        build_layer(db, device, target_level, min_rowid, max_chunk_rowid)?;
+        build_layer(
+            db,
+            device,
+            cache,
+            embedder,
+            target_level,
+            min_rowid,
+            max_document_rowid,
+        )?;
         Ok(())
     })();
 
@@ -2075,7 +2320,16 @@ pub fn search(
                 qe
             }
         };
-        match match_centroids(db, &qe, threshold, top_k, sql_filter) {
+        let embedding_cache = default_embedding_cache();
+        match match_centroids_with_cache(
+            db,
+            &qe,
+            threshold,
+            top_k,
+            sql_filter,
+            embedder,
+            &embedding_cache,
+        ) {
             Ok(result) => result,
             Err(v) => {
                 warn!("match_centroids failed {v}");

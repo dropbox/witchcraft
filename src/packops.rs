@@ -603,8 +603,11 @@ impl TensorPackOps for Tensor {
     fn embeddings_to_packed(&self) -> Result<Vec<u8>> {
         let (rows, cols) = self.dims2()?;
         assert!(cols <= 255, "column count must fit in u8");
+        let scaled_range = (256.0 * RANGE).round() as u16;
+        let range = scaled_range as f32 / 256.0;
 
-        let mut bytes = Vec::with_capacity(rows * cols);
+        let mut bytes = Vec::with_capacity(2 + 4 + rows * cols);
+        bytes.extend_from_slice(&scaled_range.to_ne_bytes());
         bytes.extend_from_slice(&(rows as u32).to_ne_bytes());
 
         let all_data = self.flatten_all()?.to_vec1::<f32>()?;
@@ -679,7 +682,7 @@ impl TensorPackOps for Tensor {
             let mut max_symbol = 0u16;
 
             for &x in &raw {
-                let q = (RANGE * x).round();
+                let q = (range * x).round();
                 let s = (2.0 * q.abs() + if q < 0.0 { 1.0 } else { 0.0 }) as usize;
                 let symbol = if s > 0 { s - 1 } else { 0 } as u16;
                 qs.push(symbol);
@@ -732,8 +735,9 @@ impl TensorPackOps for Tensor {
     }
 
     fn embeddings_from_packed(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
-        let scale = 1.0 / RANGE;
-
+        let (head, bytes) = bytes.split_at(2);
+        let scaled_range = u16::from_ne_bytes(head.try_into().unwrap()) as f32;
+        let scale = 256.0 / scaled_range;
         let (head, mut bytes) = bytes.split_at(4);
         let rows = u32::from_ne_bytes(head.try_into().unwrap()) as usize;
 

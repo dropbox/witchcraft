@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::DB;
+    use crate::{DB, EmbeddingCache};
     use std::path::PathBuf;
     use tempfile::tempdir;
     use test_log::test;
@@ -131,6 +131,44 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_index_materializes_embeddings_through_file_cache() {
+        let dir = tempdir().unwrap();
+        let path: PathBuf = dir.path().join("warp");
+        let mut db = DB::new(path.clone()).unwrap();
+
+        let device = crate::make_device();
+        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let embedder = crate::Embedder::new(&device, &assets).unwrap();
+
+        for body in [
+            "Quartz lenses focus bright laboratory light for calibration.",
+            "Careful indexing should compute cached vectors only when needed.",
+            "The semantic index groups token embeddings by centroid proximity.",
+            "A compact cache entry stores packed vectors and per-span counts.",
+            "Chunk hashes make stable filenames for cached embedding records.",
+        ] {
+            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
+            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+                .unwrap();
+        }
+
+        let chunk_table_count: i64 = db
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'chunk'")
+            .unwrap()
+            .query_row((), |row| row.get(0))
+            .unwrap();
+        assert_eq!(chunk_table_count, 0);
+
+        let embedding_cache =
+            crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
+        assert!(!embedding_cache.root().exists());
+        crate::index_chunks_with_cache(&db, &device, &embedder, &embedding_cache).unwrap();
+
+        let cache_entries = std::fs::read_dir(embedding_cache.root()).unwrap().count();
+        assert_eq!(cache_entries, 5);
     }
 
     #[test]
@@ -524,19 +562,45 @@ mod tests {
     }
 
     #[test]
-    fn test_unindexed_embedding_count_uses_chunk_metadata() -> anyhow::Result<()> {
+    fn test_unindexed_embedding_count_uses_cache_metadata() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("counts.sqlite");
-        let db = DB::new(path)?;
+        let mut db = DB::new(path)?;
 
-        let hash1 = "a".repeat(32);
-        let hash2 = "b".repeat(32);
-        db.add_chunk(&hash1, "xtr-base-en", &vec![0], "not,a,count", 7)?;
-        db.add_chunk(&hash2, "xtr-base-en", &vec![0], "", 11)?;
+        let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"counts-1");
+        let uuid2 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"counts-2");
+        db.add_doc(&uuid1, None, "{}", "first count document", None)?;
+        db.add_doc(&uuid2, None, "{}", "second count document", None)?;
 
-        assert_eq!(crate::count_unindexed_embeddings(&db)?, 18);
-        db.add_generation(0, 7, 1, 1)?;
-        assert_eq!(crate::count_unindexed_embeddings(&db)?, 11);
+        let rows = db
+            .query("SELECT rowid, hash FROM document ORDER BY rowid")?
+            .query_map((), |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let model = crate::model_id_for_dim(crate::DEFAULT_EMBEDDING_DIM);
+        let cache =
+            crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
+        cache.put(
+            &rows[0].1,
+            &crate::CachedEmbeddings {
+                model: model.clone(),
+                counts: "not,a,count".to_string(),
+                embedding_count: 7,
+                embeddings: vec![],
+            },
+        )?;
+        cache.put(
+            &rows[1].1,
+            &crate::CachedEmbeddings {
+                model,
+                counts: "".to_string(),
+                embedding_count: 11,
+                embeddings: vec![],
+            },
+        )?;
+
+        assert_eq!(crate::count_unindexed_cached_embeddings(&db, &cache)?, 18);
+        db.add_generation(0, 7, rows[0].0, rows[0].0)?;
+        assert_eq!(crate::count_unindexed_cached_embeddings(&db, &cache)?, 11);
         Ok(())
     }
 
@@ -721,13 +785,17 @@ mod tests {
         db.add_doc(&uuid_empty, None, "{}", "", None)?;
         db.add_doc(&uuid_real, None, "{}", "Octopuses have three hearts", None)?;
 
-        let count = crate::embed_chunks(&db, &embedder, None)?;
+        let embedding_cache =
+            crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
+        let count = crate::embed_chunks_with_cache(&db, &embedder, &embedding_cache, None)?;
         assert_eq!(count, 1, "only the non-empty doc should be embedded");
 
-        // Verify the chunk table has exactly one entry
-        let chunk_count: i64 = db.query("SELECT COUNT(*) FROM chunk")?
+        let cache_entries = std::fs::read_dir(embedding_cache.root())?.count();
+        assert_eq!(cache_entries, 1);
+
+        let chunk_table_count: i64 = db.query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'chunk'")?
             .query_row((), |row| row.get(0))?;
-        assert_eq!(chunk_count, 1);
+        assert_eq!(chunk_table_count, 0);
 
         db.clear();
         db.shutdown();

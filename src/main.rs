@@ -124,7 +124,16 @@ pub fn bulk_search(
             embedder_histogram.record(embedder_latency_ms);
 
             let match_start = std::time::Instant::now();
-            let matches = witchcraft::match_centroids(db, &qe, 0.0, top_k, None)?;
+            let embedding_cache = witchcraft::default_embedding_cache();
+            let matches = witchcraft::match_centroids_with_cache(
+                db,
+                &qe,
+                0.0,
+                top_k,
+                None,
+                embedder,
+                &embedding_cache,
+            )?;
             debug!(
                 "match_centroids call took {} ms.",
                 match_start.elapsed().as_millis()
@@ -199,15 +208,21 @@ fn main() -> Result<()> {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_fast(db_name).unwrap();
-        let _got = witchcraft::embed_chunks(&db, &embedder, None).unwrap();
+        let embedding_cache = witchcraft::default_embedding_cache();
+        let _got =
+            witchcraft::embed_chunks_with_cache(&db, &embedder, &embedding_cache, None).unwrap();
     } else if args.len() == 2 && &args[1] == "index" {
         let device = witchcraft::make_device();
+        let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_fast(db_name).unwrap();
-        witchcraft::index_chunks(&db, &device).unwrap();
+        let embedding_cache = witchcraft::default_embedding_cache();
+        witchcraft::index_chunks_with_cache(&db, &device, &embedder, &embedding_cache).unwrap();
     } else if args.len() == 2 && &args[1] == "reindex" {
         let device = witchcraft::make_device();
+        let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_fast(db_name).unwrap();
-        witchcraft::full_index(&db, &device).unwrap();
+        let embedding_cache = witchcraft::default_embedding_cache();
+        witchcraft::full_index_with_cache(&db, &device, &embedder, &embedding_cache).unwrap();
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
