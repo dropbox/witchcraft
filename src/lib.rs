@@ -2154,45 +2154,19 @@ fn write_buckets_for_range(
     Ok((tmpfiles, centers_cpu))
 }
 
-pub fn full_index_with_cache(
-    db: &DB,
-    device: &Device,
-    embedder: &Embedder,
-    cache: &dyn EmbeddingCache,
-) -> Result<()> {
-    db.execute("DELETE FROM generation")?;
-    clear_generations_cache();
-    db.remove_all_bucket_data_sidecars();
-    index_chunks_with_cache(db, device, embedder, cache)
-}
-
-pub fn full_index(db: &DB, device: &Device) -> Result<()> {
-    db.execute("DELETE FROM generation")?;
-    clear_generations_cache();
-    db.remove_all_bucket_data_sidecars();
-    index_chunks(db, device)
-}
-
-pub fn index_chunks_with_cache(
-    db: &DB,
-    device: &Device,
-    embedder: &Embedder,
-    cache: &dyn EmbeddingCache,
-) -> Result<()> {
-    index_chunks_inner(db, device, cache, Some(embedder))
-}
-
-pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
-    let cache = default_embedding_cache();
-    index_chunks_inner(db, device, &cache, None)
-}
-
-fn index_chunks_inner(
+pub fn index_chunks(
     db: &DB,
     device: &Device,
     cache: &dyn EmbeddingCache,
     embedder: Option<&Embedder>,
+    reset: bool,
 ) -> Result<()> {
+    if reset {
+        db.execute("DELETE FROM generation")?;
+        clear_generations_cache();
+        db.remove_all_bucket_data_sidecars();
+    }
+
     let max_indexed_rowid = max_indexed_document_rowid(db)?;
     let x = count_document_embeddings_after(db, cache, embedder, max_indexed_rowid)?;
     if x == 0 {

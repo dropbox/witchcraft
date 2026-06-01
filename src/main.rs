@@ -216,13 +216,13 @@ fn main() -> Result<()> {
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_fast(db_name).unwrap();
         let embedding_cache = witchcraft::default_embedding_cache();
-        witchcraft::index_chunks_with_cache(&db, &device, &embedder, &embedding_cache).unwrap();
+        witchcraft::index_chunks(&db, &device, &embedding_cache, Some(&embedder), false).unwrap();
     } else if args.len() == 2 && &args[1] == "reindex" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_fast(db_name).unwrap();
         let embedding_cache = witchcraft::default_embedding_cache();
-        witchcraft::full_index_with_cache(&db, &device, &embedder, &embedding_cache).unwrap();
+        witchcraft::index_chunks(&db, &device, &embedding_cache, Some(&embedder), true).unwrap();
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();

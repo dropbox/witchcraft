@@ -54,6 +54,11 @@ mod tests {
     ];
     const THRESHOLD: f32 = 0.7;
 
+    fn index_chunks(db: &DB, device: &candle_core::Device) -> anyhow::Result<()> {
+        let cache = crate::default_embedding_cache();
+        crate::index_chunks(db, device, &cache, None, false)
+    }
+
     #[test]
     fn test_end_to_end() -> std::io::Result<()> {
         let dir = tempdir().unwrap();
@@ -106,7 +111,7 @@ mod tests {
                 }
             }
             db.remove_doc(&uuids[0].clone()).unwrap();
-            crate::index_chunks(&db, &device).unwrap();
+            index_chunks(&db, &device).unwrap();
         }
         let _ = crate::search(
             &reader_db,
@@ -165,7 +170,7 @@ mod tests {
         let embedding_cache =
             crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
         assert!(!embedding_cache.root().exists());
-        crate::index_chunks_with_cache(&db, &device, &embedder, &embedding_cache).unwrap();
+        crate::index_chunks(&db, &device, &embedding_cache, Some(&embedder), false).unwrap();
 
         let cache_entries = std::fs::read_dir(embedding_cache.root()).unwrap().count();
         assert_eq!(cache_entries, 5);
@@ -248,7 +253,7 @@ mod tests {
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap();
+        index_chunks(&db, &device).unwrap();
 
         // Verify search works after full index
         let results = crate::search(
@@ -281,7 +286,7 @@ mod tests {
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap(); // should trigger incremental
+        index_chunks(&db, &device).unwrap(); // should trigger incremental
 
         // Verify search finds both old and new documents
         let results = crate::search(
@@ -346,7 +351,7 @@ mod tests {
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap(); // should trigger full re-index (compaction)
+        index_chunks(&db, &device).unwrap(); // should trigger full re-index (compaction)
 
         // Verify search still works after compaction
         let results = crate::search(
@@ -409,7 +414,7 @@ mod tests {
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap();
+        index_chunks(&db, &device).unwrap();
 
         // Phase 2: add more docs to create a second level
         let extra_facts = [
@@ -423,7 +428,7 @@ mod tests {
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap();
+        index_chunks(&db, &device).unwrap();
 
         // Verify generations span multiple levels
         let levels: Vec<(u32, i64)> = {
@@ -630,7 +635,7 @@ mod tests {
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"only-doc");
         db.add_doc(None, &uuid, None, &uuid.to_string(), "Honey never spoils", None)?;
         crate::embed_chunks(&db, &embedder, None)?;
-        crate::index_chunks(&db, &device)?;
+        index_chunks(&db, &device)?;
 
         let results = crate::search(
             &db, &embedder, &mut cache,
@@ -782,7 +787,7 @@ mod tests {
         db.add_doc(None, &uuid_b, None, &uuid_b.to_string(), "Flamingos are pink because of their diet of shrimp and algae", None)?;
 
         crate::embed_chunks(&db, &embedder, None)?;
-        crate::index_chunks(&db, &device)?;
+        index_chunks(&db, &device)?;
 
         // Unfiltered search should return both
         let results = crate::search(
@@ -830,7 +835,7 @@ mod tests {
             baseline.add_doc(None, &uuid, None, &uuid.to_string(), body, None)?;
         }
         crate::embed_chunks(&baseline, &embedder, None)?;
-        crate::index_chunks(&baseline, &device)?;
+        index_chunks(&baseline, &device)?;
 
         // Empty DB (simulates an overlay with 0 generations)
         let overlay_path = dir.path().join("overlay.sqlite");
