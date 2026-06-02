@@ -918,8 +918,8 @@ mod tests {
         let distractor = "This paragraph says what is the origin of an unrelated weather report.";
         let relevant_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, relevant.as_bytes());
         let distractor_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, distractor.as_bytes());
-        db.add_doc(&relevant_uuid, None, "relevant", relevant, None)?;
-        db.add_doc(&distractor_uuid, None, "distractor", distractor, None)?;
+        db.add_doc(None, &relevant_uuid, None, "relevant", relevant, None)?;
+        db.add_doc(None, &distractor_uuid, None, "distractor", distractor, None)?;
 
         let relevant_rowid: u32 = db
             .query("SELECT rowid FROM document WHERE metadata = 'relevant'")?
@@ -933,6 +933,130 @@ mod tests {
 
         db.clear();
         db.shutdown();
+        Ok(())
+    }
+
+    fn test_capi_add_search_rowids() -> anyhow::Result<()> {
+        use std::ffi::{CStr, CString};
+        use std::os::raw::c_void;
+
+        struct EmbeddingStore {
+            blobs: std::collections::HashMap<u64, Vec<u8>>,
+            callback_calls: usize,
+        }
+
+        fn embedding_rows(blob: &[u8]) -> u32 {
+            u64::from_le_bytes(blob[16..24].try_into().unwrap())
+                .try_into()
+                .unwrap()
+        }
+
+        unsafe fn last_error(handle: *mut crate::capi::WitchcraftHandle) -> String {
+            let ptr = crate::capi::witchcraft_last_error(handle);
+            if ptr.is_null() {
+                return "no error".to_string();
+            }
+            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+
+        unsafe extern "C" fn embedding_callback(
+            rowid: u64,
+            user_data: *mut c_void,
+            dst: *mut u8,
+            dst_cap: usize,
+            out_len: *mut usize,
+        ) -> i32 {
+            let store = &mut *(user_data as *mut EmbeddingStore);
+            store.callback_calls += 1;
+            let Some(blob) = store.blobs.get(&rowid) else {
+                return -1;
+            };
+            if out_len.is_null() {
+                return -1;
+            }
+            *out_len = blob.len();
+            if dst.is_null() {
+                return 0;
+            }
+            if dst_cap < blob.len() {
+                return -1;
+            }
+            std::ptr::copy_nonoverlapping(blob.as_ptr(), dst, blob.len());
+            0
+        }
+
+        let dir = tempdir()?;
+        let path = dir.path().join("capi.sqlite");
+        let db_path = CString::new(path.to_string_lossy().as_bytes())?;
+        let assets = CString::new("assets")?;
+        let mut store = EmbeddingStore {
+            blobs: std::collections::HashMap::new(),
+            callback_calls: 0,
+        };
+
+        unsafe {
+            let handle = crate::capi::witchcraft_open(db_path.as_ptr(), assets.as_ptr());
+            assert!(!handle.is_null(), "{}", last_error(std::ptr::null_mut()));
+
+            let honey = "Honey never spoils";
+            let blob = crate::capi::witchcraft_embed(
+                handle,
+                honey.as_ptr(),
+                honey.len(),
+            );
+            assert_eq!(blob.status, 0, "{}", last_error(handle));
+            store.blobs.insert(42, std::slice::from_raw_parts(blob.ptr, blob.len).to_vec());
+            crate::capi::witchcraft_bytes_free(blob.ptr, blob.len);
+
+            let octopus = "Octopuses have three hearts";
+            let blob = crate::capi::witchcraft_embed(
+                handle,
+                octopus.as_ptr(),
+                octopus.len(),
+            );
+            assert_eq!(blob.status, 0, "{}", last_error(handle));
+            store.blobs.insert(43, std::slice::from_raw_parts(blob.ptr, blob.len).to_vec());
+            crate::capi::witchcraft_bytes_free(blob.ptr, blob.len);
+
+            let user_data = &mut store as *mut _ as *mut c_void;
+            let honey_rows = embedding_rows(&store.blobs[&42]);
+            assert_eq!(
+                crate::capi::witchcraft_add(handle, 42, honey_rows),
+                0,
+                "{}",
+                last_error(handle)
+            );
+            let octopus_rows = embedding_rows(&store.blobs[&43]);
+            assert_eq!(
+                crate::capi::witchcraft_add(handle, 43, octopus_rows),
+                0,
+                "{}",
+                last_error(handle)
+            );
+            assert_eq!(
+                crate::capi::witchcraft_index(handle, Some(embedding_callback), user_data),
+                0,
+                "{}",
+                last_error(handle)
+            );
+
+            let query = "honey never spoils";
+            let result = crate::capi::witchcraft_search(
+                handle,
+                query.as_ptr(),
+                query.len(),
+                0.0,
+                10,
+            );
+            assert_eq!(result.status, 0, "{}", last_error(handle));
+            let rowids = std::slice::from_raw_parts(result.ptr, result.len).to_vec();
+            crate::capi::witchcraft_rowids_free(result.ptr, result.len);
+            crate::capi::witchcraft_close(handle);
+
+            assert!(store.callback_calls > 0);
+            assert_eq!(rowids.first(), Some(&42));
+        }
+
         Ok(())
     }
 }

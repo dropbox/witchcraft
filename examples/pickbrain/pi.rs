@@ -344,7 +344,7 @@ fn ingest_session(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize> {
         .to_string();
 
         let date = iso8601_timestamp::Timestamp::parse(&interaction[0].timestamp);
-        db.add_doc(&uuid, date, &metadata, &body, Some(lengths))?;
+        db.add_doc(None, &uuid, date, &metadata, &body, Some(lengths))?;
         count += 1;
     }
 

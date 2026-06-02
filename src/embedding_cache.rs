@@ -17,6 +17,9 @@ pub struct CachedEmbeddings {
 
 pub trait EmbeddingCache {
     fn get(&self, hash: &str) -> Result<Option<CachedEmbeddings>>;
+    fn get_for_document(&self, _rowid: u64, hash: &str) -> Result<Option<CachedEmbeddings>> {
+        self.get(hash)
+    }
     fn put(&self, hash: &str, embeddings: &CachedEmbeddings) -> Result<()>;
 }
 

@@ -13,7 +13,7 @@ candle-core = { git = "https://github.com/huggingface/candle", rev = "5bd5618" }
 candle-nn = { git = "https://github.com/huggingface/candle", rev = "5bd5618" }
 candle-transformers = { git = "https://github.com/huggingface/candle", rev = "5bd5618" }
 openvino = { version = "0.10.0", features = ["runtime-linking"], optional = true }
-tokenizers = "*"
+tokenizers = { version = "0.22", default-features = false }
 anyhow = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"

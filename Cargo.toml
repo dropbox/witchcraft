@@ -25,7 +25,7 @@ candle-core = { git = "https://github.com/huggingface/candle", rev="5bd5618" }
 candle-nn = { git = "https://github.com/huggingface/candle", rev="5bd5618" }
 candle-transformers = { git = "https://github.com/huggingface/candle", rev="5bd5618" }
 
-tokenizers = "*"
+tokenizers = { version = "0.22", default-features = false }
 serde_plain = "1.0.2"
 rand = "0.10.1"
 sha2 = "0.11.0"
