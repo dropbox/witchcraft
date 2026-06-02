@@ -242,6 +242,28 @@ fn decode_embedding_blob(bytes: &[u8]) -> Result<CachedEmbeddings> {
     })
 }
 
+fn embedding_blob_row_count(bytes: &[u8]) -> Result<u32> {
+    let mut offset = 0usize;
+    let magic = read_bytes(bytes, &mut offset, EMBEDDING_BLOB_MAGIC.len())?;
+    if magic != EMBEDDING_BLOB_MAGIC {
+        return Err(anyhow!("bad packed embedding blob magic"));
+    }
+
+    let model_len = read_u32(bytes, &mut offset)? as usize;
+    let counts_len = read_u32(bytes, &mut offset)? as usize;
+    let embedding_count = read_u64(bytes, &mut offset)?;
+    let embeddings_len = read_u64(bytes, &mut offset)? as usize;
+
+    read_bytes(bytes, &mut offset, model_len)?;
+    read_bytes(bytes, &mut offset, counts_len)?;
+    read_bytes(bytes, &mut offset, embeddings_len)?;
+    if offset != bytes.len() {
+        return Err(anyhow!("packed embedding blob has trailing bytes"));
+    }
+
+    Ok(embedding_count.try_into()?)
+}
+
 unsafe fn fetch_embedding_blob(
     callback: WitchcraftEmbeddingCallback,
     user_data: *mut c_void,
@@ -408,7 +430,8 @@ pub unsafe extern "C" fn witchcraft_embed(
 pub unsafe extern "C" fn witchcraft_add(
     handle: *mut WitchcraftHandle,
     rowid: u64,
-    rows: u32,
+    embedding_blob: *const u8,
+    embedding_blob_len: usize,
 ) -> i32 {
     let handle = match handle_ref(handle) {
         Ok(handle) => handle,
@@ -419,6 +442,8 @@ pub unsafe extern "C" fn witchcraft_add(
     };
 
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+        let embedding_blob = bytes_from_ptr(embedding_blob, embedding_blob_len, "embedding_blob")?;
+        let rows = embedding_blob_row_count(embedding_blob)?;
         let state = handle
             .state
             .lock()

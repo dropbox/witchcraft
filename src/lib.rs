@@ -80,14 +80,14 @@ pub mod rans64;
 
 mod merger;
 
-mod direct_io;
-use direct_io::DirectFileWriter;
+mod file_writer;
+use file_writer::NewFileWriter;
 
 mod file_index;
 use file_index::{
     active_rowid_records, nway_merge_rowid_records, read_rowid_records,
-    rowid_records_embedding_count, sort_dedup_rowid_records, sync_parent_dir, write_rowid_records,
-    FileBackedIndex, FileIndexGeneration, RowidRecord,
+    rowid_records_embedding_count, sort_dedup_rowid_records, sync_parent_dir,
+    write_rowid_records_to_writer, FileBackedIndex, FileIndexGeneration, RowidRecord,
 };
 
 mod priority;
@@ -116,11 +116,14 @@ use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const DEFAULT_EMBEDDING_DIM: usize = 128;
 const DOCUMENT_CACHE_HASH_CHARS: usize = 32;
-const BUCKET_DATA_VERSION: u32 = 2;
-const BUCKET_DATA_MAGIC: [u8; 8] = *b"WRPBKT02";
+const BUCKET_DATA_VERSION: u32 = file_index::GENERATION_DATA_VERSION;
+const BUCKET_DATA_MAGIC: [u8; 8] = file_index::GENERATION_DATA_MAGIC;
+const LEGACY_BUCKET_DATA_VERSION: u32 = 2;
+const LEGACY_BUCKET_DATA_MAGIC: [u8; 8] = *b"WRPBKT02";
 const BUCKET_META_PREFIX_BYTES: usize = 20;
-const BUCKET_DATA_HEADER_BYTES: usize =
+const LEGACY_BUCKET_DATA_HEADER_BYTES: usize =
     std::mem::size_of::<u32>() + BUCKET_DATA_MAGIC.len() + 3 * std::mem::size_of::<u64>();
+const BUCKET_DATA_HEADER_BYTES: usize = file_index::GENERATION_DATA_HEADER_BYTES;
 #[cfg(not(test))]
 const L0_CAPACITY: usize = 1024;
 #[cfg(test)]
@@ -509,6 +512,7 @@ struct BucketDataHeader {
     meta_bytes: usize,
     meta_offset: usize,
     payload_offset: usize,
+    rowids_offset: usize,
 }
 
 fn write_bucket_data_header(
@@ -516,12 +520,14 @@ fn write_bucket_data_header(
     centroid_count: usize,
     meta_offset: usize,
     payload_offset: usize,
+    rowids_offset: usize,
 ) -> Result<()> {
     writer.write_all(&BUCKET_DATA_VERSION.to_le_bytes())?;
     writer.write_all(&BUCKET_DATA_MAGIC)?;
     writer.write_all(&(centroid_count as u64).to_le_bytes())?;
     writer.write_all(&(meta_offset as u64).to_le_bytes())?;
     writer.write_all(&(payload_offset as u64).to_le_bytes())?;
+    writer.write_all(&(rowids_offset as u64).to_le_bytes())?;
     Ok(())
 }
 
@@ -535,26 +541,45 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
 
 fn bucket_data_header(bucket_data: &[u8]) -> Result<BucketDataHeader> {
     anyhow::ensure!(
-        bucket_data.len() >= BUCKET_DATA_HEADER_BYTES,
+        bucket_data.len() >= LEGACY_BUCKET_DATA_HEADER_BYTES,
         "bucket sidecar is too small: {} bytes",
         bucket_data.len()
     );
     let version = read_u32_le(bucket_data, 0)?;
+    let header_bytes = match version {
+        BUCKET_DATA_VERSION => BUCKET_DATA_HEADER_BYTES,
+        LEGACY_BUCKET_DATA_VERSION => LEGACY_BUCKET_DATA_HEADER_BYTES,
+        _ => anyhow::bail!(
+            "bucket sidecar version {version} is not supported; run ./warp-cli reindex"
+        ),
+    };
     anyhow::ensure!(
-        version == BUCKET_DATA_VERSION,
-        "bucket sidecar version {version} is not supported; run ./warp-cli reindex"
+        bucket_data.len() >= header_bytes,
+        "bucket sidecar is too small: {} bytes",
+        bucket_data.len()
     );
-    let magic_offset = std::mem::size_of::<u32>();
     anyhow::ensure!(
-        &bucket_data[magic_offset..magic_offset + BUCKET_DATA_MAGIC.len()]
-            == BUCKET_DATA_MAGIC.as_slice(),
+        if version == BUCKET_DATA_VERSION {
+            &bucket_data[4..4 + BUCKET_DATA_MAGIC.len()] == BUCKET_DATA_MAGIC.as_slice()
+        } else {
+            &bucket_data[4..4 + LEGACY_BUCKET_DATA_MAGIC.len()]
+                == LEGACY_BUCKET_DATA_MAGIC.as_slice()
+        },
         "bucket sidecar has an invalid header; run ./warp-cli reindex"
     );
     let centroid_count: usize = read_u64_le(bucket_data, 12)?.try_into()?;
     let meta_offset: usize = read_u64_le(bucket_data, 20)?.try_into()?;
     let payload_offset: usize = read_u64_le(bucket_data, 28)?.try_into()?;
+    let rowids_offset: usize = if version == BUCKET_DATA_VERSION {
+        read_u64_le(bucket_data, 36)?.try_into()?
+    } else {
+        bucket_data.len()
+    };
     anyhow::ensure!(
-        meta_offset >= BUCKET_DATA_HEADER_BYTES && payload_offset >= meta_offset,
+        meta_offset >= header_bytes
+            && payload_offset >= meta_offset
+            && rowids_offset >= payload_offset
+            && rowids_offset <= bucket_data.len(),
         "bucket sidecar layout is invalid"
     );
     let meta_block_len = payload_offset - meta_offset;
@@ -578,7 +603,7 @@ fn bucket_data_header(bucket_data: &[u8]) -> Result<BucketDataHeader> {
     );
     let embedding_dim = center_bytes / std::mem::size_of::<f32>();
     anyhow::ensure!(
-        payload_offset <= bucket_data.len(),
+        payload_offset <= rowids_offset,
         "bucket sidecar layout is invalid"
     );
     Ok(BucketDataHeader {
@@ -587,6 +612,7 @@ fn bucket_data_header(bucket_data: &[u8]) -> Result<BucketDataHeader> {
         meta_bytes,
         meta_offset,
         payload_offset,
+        rowids_offset,
     })
 }
 
@@ -612,8 +638,8 @@ fn bucket_data_bucket_meta(
             .and_then(|offset| offset.checked_add(u64::try_from(residual_len).ok()?))
             .ok_or_else(|| anyhow::anyhow!("bucket {bucket_idx} data length overflow"))?;
         anyhow::ensure!(
-            bucket_end <= bucket_data.len() as u64,
-            "bucket {bucket_idx} data ends beyond sidecar length"
+            bucket_end <= header.rowids_offset as u64,
+            "bucket {bucket_idx} data ends beyond bucket payload"
         );
         metas.push(BucketSidecarMeta {
             size,
@@ -640,19 +666,10 @@ fn write_bucket_meta(writer: &mut impl Write, meta: &BucketSidecarMeta) -> Resul
     Ok(())
 }
 
-fn merge_and_write_buckets(
-    db: &DB,
-    tmpfiles: Vec<tempfile::NamedTempFile>,
-    centers_cpu: &Tensor,
-    bucket_data_file: &str,
-) -> Result<()> {
-    let final_path = db.bucket_data_path(bucket_data_file);
-    merge_and_write_buckets_to_path(tmpfiles, centers_cpu, &final_path)
-}
-
 fn merge_and_write_buckets_to_path(
     tmpfiles: Vec<tempfile::NamedTempFile>,
     centers_cpu: &Tensor,
+    rowid_records: &[RowidRecord],
     final_path: &Path,
 ) -> Result<()> {
     let mut tmp_path = final_path.as_os_str().to_os_string();
@@ -738,14 +755,18 @@ fn merge_and_write_buckets_to_path(
         .checked_add(meta_block_len)
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload start overflow"))?;
     let payload_start = u64::try_from(payload_start)?;
+    let rowids_offset = payload_start
+        .checked_add(data_offset)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar rowid offset overflow"))?;
 
-    let mut bucket_data_writer = DirectFileWriter::create_append_new(&tmp_path)?;
+    let mut bucket_data_writer = NewFileWriter::create_new(&tmp_path)?;
 
     write_bucket_data_header(
         &mut bucket_data_writer,
         centroid_count,
         meta_offset,
         payload_start.try_into()?,
+        rowids_offset.try_into()?,
     )?;
     for meta in &mut bucket_meta {
         meta.data_offset = payload_start
@@ -755,6 +776,7 @@ fn merge_and_write_buckets_to_path(
     }
     let mut data_reader = data_tmp.reopen()?;
     std::io::copy(&mut data_reader, &mut bucket_data_writer)?;
+    write_rowid_records_to_writer(&mut bucket_data_writer, rowid_records)?;
     bucket_data_writer.finish()?;
     std::fs::rename(&tmp_path, &final_path)?;
     sync_parent_dir(final_path)?;
@@ -1448,47 +1470,16 @@ fn match_centroids_from_cache(
     embedder: Option<&Embedder>,
     cache: &dyn EmbeddingCache,
 ) -> Result<Vec<(f32, u32, u32)>> {
-    let mut gen_query =
-        db.query("SELECT bucket_data_file FROM generation ORDER BY level, id")?;
-    let generation_files: Vec<PathBuf> = gen_query
-        .query_map((), |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|f| !f.is_empty())
-        .map(|f| db.bucket_data_path(&f))
-        .collect();
-
-    let max_indexed_rowid = max_indexed_document_rowid(db)?;
-    let mut unindexed: Vec<(Vec<DocPtr>, Tensor)> = vec![];
-    {
-        let mut unindexed_query = db.query(
-            "SELECT rowid, body, lens FROM document
-             WHERE rowid > ?1 AND length(body) > 0
-             ORDER BY rowid",
-        )?;
-        let results = unindexed_query.query_map((max_indexed_rowid,), |row| {
-            Ok((
-                row.get::<_, u32>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        for result in results {
-            let (id, body, lens) = result?;
-            let hash = document_cache_hash(&body, &lens);
-            if let Some(cached) =
-                cached_embeddings_for_document(cache, embedder, id as u64, &hash, &body, &lens)?
-            {
-                let embeddings = Tensor::embeddings_from_packed(
-                    &cached.embeddings,
-                    dim_from_model_id(&cached.model),
-                    &Device::Cpu,
-                )?;
-                let indices = docptrs_for_counts(id, &cached.counts);
-                unindexed.push((indices, embeddings));
-            }
-        }
-    }
+    let index = file_index_for_db(db);
+    let generation_files = index.generation_files()?;
+    let buffered = index.buffered_rowid_records()?;
+    let unindexed = if !buffered.is_empty() {
+        buffered_unindexed_embeddings(db, &buffered, cache, embedder)?
+    } else if generation_files.is_empty() {
+        current_unindexed_embeddings(db, cache, embedder)?
+    } else {
+        vec![]
+    };
 
     let scored_results = match_centroids_raw(
         &generation_files, query_embeddings, &unindexed, threshold, top_k,
@@ -1564,12 +1555,240 @@ fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
     document_indices
 }
 
+fn buffered_unindexed_embeddings(
+    db: &DB,
+    records: &[RowidRecord],
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+) -> Result<Vec<(Vec<DocPtr>, Tensor)>> {
+    let records: Vec<RowidRecord> = active_rowid_records(records).collect();
+    if records.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut query = db.query(
+        "SELECT body, lens FROM document
+         WHERE rowid = ?1 AND length(body) > 0",
+    )?;
+    let mut unindexed = vec![];
+    for record in records {
+        let rowid: i64 = record.rowid.try_into()?;
+        let row = query
+            .query_row((rowid,), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()?;
+        let Some((body, lens)) = row else {
+            continue;
+        };
+        let hash = document_cache_hash(&body, &lens);
+        let Some(cached) =
+            cached_embeddings_for_document(cache, embedder, record.rowid, &hash, &body, &lens)?
+        else {
+            continue;
+        };
+        anyhow::ensure!(
+            cached.embedding_count == record.rows as usize,
+            "rowid {} catalog says {} vectors but embedding blob has {}",
+            record.rowid,
+            record.rows,
+            cached.embedding_count
+        );
+        let embeddings = Tensor::embeddings_from_packed(
+            &cached.embeddings,
+            dim_from_model_id(&cached.model),
+            &Device::Cpu,
+        )?;
+        let id: u32 = record.rowid.try_into()?;
+        let indices = docptrs_for_counts(id, &cached.counts);
+        anyhow::ensure!(
+            indices.len() == cached.embedding_count,
+            "rowid {} has {} embedding rows but {} document indices",
+            record.rowid,
+            cached.embedding_count,
+            indices.len()
+        );
+        unindexed.push((indices, embeddings));
+    }
+    Ok(unindexed)
+}
+
+fn current_unindexed_embeddings(
+    db: &DB,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+) -> Result<Vec<(Vec<DocPtr>, Tensor)>> {
+    let mut query = db.query(
+        "SELECT rowid, body, lens FROM document
+         WHERE length(body) > 0
+         ORDER BY rowid",
+    )?;
+    let results = query.query_map((), |row| {
+        Ok((
+            row.get::<_, u32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut unindexed = vec![];
+    for result in results {
+        let (id, body, lens) = result?;
+        let hash = document_cache_hash(&body, &lens);
+        let Some(cached) =
+            cached_embeddings_for_document(cache, embedder, id as u64, &hash, &body, &lens)?
+        else {
+            continue;
+        };
+        let embeddings = Tensor::embeddings_from_packed(
+            &cached.embeddings,
+            dim_from_model_id(&cached.model),
+            &Device::Cpu,
+        )?;
+        let indices = docptrs_for_counts(id, &cached.counts);
+        anyhow::ensure!(
+            indices.len() == cached.embedding_count,
+            "document {id} has {} embedding rows but {} document indices",
+            cached.embedding_count,
+            indices.len()
+        );
+        unindexed.push((indices, embeddings));
+    }
+    Ok(unindexed)
+}
+
+fn file_index_for_db(db: &DB) -> FileBackedIndex {
+    FileBackedIndex::new(db.path().clone())
+}
+
 fn cached_embeddings_for_rowid(
     cache: &dyn EmbeddingCache,
     rowid: u64,
 ) -> Result<CachedEmbeddings> {
     load_cached_embeddings(cache, rowid, "")?
         .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))
+}
+
+fn current_document_rowid_records(
+    db: &DB,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+) -> Result<Vec<RowidRecord>> {
+    let mut query = db.query(
+        "SELECT rowid, body, lens FROM document
+         WHERE length(body) > 0
+         ORDER BY rowid",
+    )?;
+    let rows = query.query_map((), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut records = vec![];
+    for row in rows {
+        let (rowid, body, lens) = row?;
+        let rowid_u64: u64 = rowid.try_into()?;
+        let hash = document_cache_hash(&body, &lens);
+        let Some(embeddings) =
+            cached_embeddings_for_document(cache, embedder, rowid_u64, &hash, &body, &lens)?
+        else {
+            continue;
+        };
+        records.push(RowidRecord {
+            rowid: rowid_u64,
+            rows: embeddings.embedding_count.try_into()?,
+        });
+    }
+    Ok(records)
+}
+
+fn pending_rowid_records(
+    db: &DB,
+    index: &FileBackedIndex,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+) -> Result<Vec<RowidRecord>> {
+    let current_records = current_document_rowid_records(db, cache, embedder)?;
+    let mut known = index.all_rowid_map()?;
+    let mut pending = vec![];
+
+    for record in current_records {
+        match known.remove(&record.rowid) {
+            Some(rows) if rows == record.rows => {}
+            _ => pending.push(record),
+        }
+    }
+
+    for (rowid, rows) in known {
+        if rows > 0 {
+            pending.push(RowidRecord { rowid, rows: 0 });
+        }
+    }
+    pending.sort_unstable_by_key(|record| record.rowid);
+    Ok(pending)
+}
+
+struct DocumentEmbeddingSource<'a> {
+    cache: &'a dyn EmbeddingCache,
+    hashes: HashMap<u64, String>,
+}
+
+impl<'a> DocumentEmbeddingSource<'a> {
+    fn new(db: &DB, cache: &'a dyn EmbeddingCache) -> Result<Self> {
+        let mut query = db.query(
+            "SELECT rowid, body, lens FROM document
+             WHERE length(body) > 0",
+        )?;
+        let rows = query.query_map((), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut hashes = HashMap::new();
+        for row in rows {
+            let (rowid, body, lens) = row?;
+            hashes.insert(rowid.try_into()?, document_cache_hash(&body, &lens));
+        }
+        Ok(Self { cache, hashes })
+    }
+}
+
+impl EmbeddingCache for DocumentEmbeddingSource<'_> {
+    fn get(&self, hash: &str) -> Result<Option<CachedEmbeddings>> {
+        self.cache.get(hash)
+    }
+
+    fn get_for_document(&self, rowid: u64, _hash: &str) -> Result<Option<CachedEmbeddings>> {
+        let Some(hash) = self.hashes.get(&rowid) else {
+            return Ok(None);
+        };
+        self.cache.get(hash)
+    }
+
+    fn put(&self, hash: &str, embeddings: &CachedEmbeddings) -> Result<()> {
+        self.cache.put(hash, embeddings)
+    }
+}
+
+fn unmaterialized_embedding_count(
+    db: &DB,
+    index: &FileBackedIndex,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+) -> Result<usize> {
+    let indexed = index.indexed_rowid_map()?;
+    let mut count = 0usize;
+    for record in current_document_rowid_records(db, cache, embedder)? {
+        if indexed.get(&record.rowid).copied() != Some(record.rows) {
+            count += record.rows as usize;
+        }
+    }
+    Ok(count)
 }
 
 fn sample_embeddings_for_rowids(
@@ -1862,8 +2081,8 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
 
 pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
     let cache = default_embedding_cache();
-    let max_indexed_rowid = max_indexed_document_rowid(db)?;
-    count_document_embeddings_after(db, &cache, None, max_indexed_rowid)
+    let index = file_index_for_db(db);
+    unmaterialized_embedding_count(db, &index, &cache, None)
 }
 
 pub fn count_unindexed_embeddings_with_cache(
@@ -1871,27 +2090,18 @@ pub fn count_unindexed_embeddings_with_cache(
     embedder: &Embedder,
     cache: &dyn EmbeddingCache,
 ) -> Result<usize> {
-    let max_indexed_rowid = max_indexed_document_rowid(db)?;
-    count_document_embeddings_after(db, cache, Some(embedder), max_indexed_rowid)
+    let index = file_index_for_db(db);
+    unmaterialized_embedding_count(
+        db,
+        &index,
+        cache,
+        Some(embedder),
+    )
 }
 
 pub fn count_unindexed_cached_embeddings(db: &DB, cache: &dyn EmbeddingCache) -> Result<usize> {
-    let max_indexed_rowid = max_indexed_document_rowid(db)?;
-    count_document_embeddings_after(db, cache, None, max_indexed_rowid)
-}
-
-fn max_indexed_document_rowid(db: &DB) -> Result<i64> {
-    let rowid = db
-        .query("SELECT IFNULL(MAX(max_document_rowid), 0) FROM generation")?
-        .query_row((), |row| row.get(0))?;
-    Ok(rowid)
-}
-
-fn max_document_rowid(db: &DB) -> Result<i64> {
-    let rowid = db
-        .query("SELECT IFNULL(MAX(rowid), 0) FROM document WHERE length(body) > 0")?
-        .query_row((), |row| row.get(0))?;
-    Ok(rowid)
+    let index = file_index_for_db(db);
+    unmaterialized_embedding_count(db, &index, cache, None)
 }
 
 fn cached_embeddings_for_document(
@@ -1911,110 +2121,6 @@ fn cached_embeddings_for_document(
     }
 }
 
-fn count_document_embeddings_after(
-    db: &DB,
-    cache: &dyn EmbeddingCache,
-    embedder: Option<&Embedder>,
-    min_rowid_exclusive: i64,
-) -> Result<usize> {
-    let mut query = db.query(
-        "SELECT rowid, body, lens FROM document
-         WHERE rowid > ?1 AND length(body) > 0
-         ORDER BY rowid",
-    )?;
-    let rows = query.query_map((min_rowid_exclusive,), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-
-    let mut count = 0usize;
-    for row in rows {
-        let (rowid, body, lens) = row?;
-        let hash = document_cache_hash(&body, &lens);
-        if let Some(embeddings) =
-            cached_embeddings_for_document(cache, embedder, rowid.try_into()?, &hash, &body, &lens)?
-        {
-            count += embeddings.embedding_count;
-        }
-    }
-    Ok(count)
-}
-
-fn count_indexed_embeddings(db: &DB) -> Result<usize> {
-    let count: i64 = db
-        .query("SELECT IFNULL(SUM(num_embeddings), 0) FROM generation")?
-        .query_row((), |row| row.get(0))?;
-    Ok(count.try_into()?)
-}
-
-fn bucket_data_files_for_generations(db: &DB, where_clause: &str) -> Result<Vec<String>> {
-    let sql = format!(
-        "SELECT bucket_data_file FROM generation WHERE bucket_data_file != '' AND {where_clause}"
-    );
-    let mut query = db.query(&sql)?;
-    let files = query
-        .query_map((), |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(files)
-}
-
-fn sample_embeddings_for_kmeans(
-    db: &DB,
-    cache: &dyn EmbeddingCache,
-    embedder: Option<&Embedder>,
-    min_rowid: i64,
-    max_rowid: i64,
-    device: &Device,
-) -> Result<(Tensor, usize)> {
-    let mut kmeans_query = db.query(
-        "SELECT rowid, body, lens FROM document
-         WHERE rowid >= ?1 AND rowid <= ?2 AND length(body) > 0
-         ORDER BY rowid",
-    )?;
-    let mut total_embeddings = 0;
-    #[cfg(any(test, feature = "deterministic"))]
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    #[cfg(not(any(test, feature = "deterministic")))]
-    let mut rng = rand::rng();
-    let mut all_embeddings = vec![];
-    for result in kmeans_query.query_map((min_rowid, max_rowid), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })? {
-        let (rowid, body, lens) = result?;
-        let hash = document_cache_hash(&body, &lens);
-        let Some(embeddings) =
-            cached_embeddings_for_document(cache, embedder, rowid.try_into()?, &hash, &body, &lens)?
-        else {
-            continue;
-        };
-        let t = Tensor::embeddings_from_packed(
-            &embeddings.embeddings,
-            dim_from_model_id(&embeddings.model),
-            &Device::Cpu,
-        )?;
-        let (m, _) = t.dims2()?;
-        let k = ((m as f32).sqrt().ceil()) as usize;
-        let subset_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
-        for i in subset_idx {
-            let row = t.get(i)?;
-            all_embeddings.push(row);
-        }
-        total_embeddings += m;
-    }
-    if all_embeddings.is_empty() {
-        return Ok((Tensor::zeros(&[0, DEFAULT_EMBEDDING_DIM], DType::F32, device)?, 0));
-    }
-    let matrix = Tensor::stack(&all_embeddings, 0)?.to_device(device)?;
-    Ok((matrix, total_embeddings))
-}
-
 fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tensor> {
     let now = std::time::Instant::now();
     let mut k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
@@ -2031,211 +2137,6 @@ fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tens
 
 fn level_capacity(level: u32) -> usize {
     L0_CAPACITY * LSM_FANOUT.pow(level + 1)
-}
-
-/// Build one generation for a document rowid range, reading original embeddings
-/// through the cache and running full k-means.
-fn build_layer(
-    db: &DB,
-    device: &Device,
-    cache: &dyn EmbeddingCache,
-    embedder: Option<&Embedder>,
-    level: u32,
-    min_rowid: i64,
-    max_rowid: i64,
-) -> Result<()> {
-    let (matrix, total_embeddings) =
-        sample_embeddings_for_kmeans(db, cache, embedder, min_rowid, max_rowid, device)?;
-    if total_embeddings == 0 {
-        return Ok(());
-    }
-
-    info!(
-        "building L{} with {} embeddings (documents {}..={})",
-        level, total_embeddings, min_rowid, max_rowid
-    );
-    let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
-    drop(matrix); // Free kmeans sample matrix before write_buckets
-
-    let (tmpfiles, centers_cpu) =
-        write_buckets_for_range(
-            db,
-            cache,
-            embedder,
-            &centers,
-            device,
-            total_embeddings as u64,
-            min_rowid,
-            max_rowid,
-        )?;
-
-    let gen_id = db.add_generation(level, total_embeddings as u64, min_rowid, max_rowid)?;
-    let bucket_data_file = db.bucket_data_file_name(gen_id);
-    if let Err(err) = merge_and_write_buckets(
-        db,
-        tmpfiles,
-        &centers_cpu,
-        &bucket_data_file,
-    ) {
-        db.remove_bucket_data_file(&bucket_data_file);
-        return Err(err);
-    }
-    db.set_generation_bucket_data_file(gen_id, &bucket_data_file)?;
-
-    Ok(())
-}
-
-/// Like write_buckets but only processes documents in [min_rowid, max_rowid].
-fn write_buckets_for_range(
-    db: &DB,
-    cache: &dyn EmbeddingCache,
-    embedder: Option<&Embedder>,
-    centers: &Tensor,
-    device: &Device,
-    expected_count: u64,
-    min_rowid: i64,
-    max_rowid: i64,
-) -> Result<(Vec<tempfile::NamedTempFile>, Tensor)> {
-    let _priority_mgr = PriorityManager::new();
-    let mut mmuls_total = 0;
-    let mut writes_total = 0;
-
-    let bar = progress::new_with_label(expected_count, "indexing");
-
-    let mut document_indices = Vec::<(u32, u32)>::new();
-    let mut all_embeddings = vec![];
-
-    let mut query = db.query(
-        "SELECT rowid, body, lens FROM document
-         WHERE rowid >= ?1 AND rowid <= ?2 AND length(body) > 0
-         ORDER BY rowid",
-    )?;
-
-    let mut results = query.query_map((min_rowid, max_rowid), |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-
-    let mut done = false;
-    let mut batch = 0;
-    let mut tmpfiles = vec![];
-    let centers_cpu = centers.to_device(&Device::Cpu)?;
-    let (_, center_dim) = centers_cpu.dims2()?;
-    let residual_bytes = packops::temp_residual_bytes_for_dim(center_dim);
-    let packed_centers = fast_ops::PackedRight::new(centers)?;
-    while !done {
-        match results.next() {
-            Some(result) => {
-                let (id, body, lens) = result?;
-                let hash = document_cache_hash(&body, &lens);
-                let Some(embeddings) =
-                    cached_embeddings_for_document(cache, embedder, id as u64, &hash, &body, &lens)?
-                else {
-                    continue;
-                };
-
-                let dim = dim_from_model_id(&embeddings.model);
-                anyhow::ensure!(
-                    dim == center_dim,
-                    "document embedding dimension {dim} does not match index center dimension {center_dim}"
-                );
-                let t = Tensor::embeddings_from_packed(&embeddings.embeddings, dim, &Device::Cpu)?;
-                let split = split_tensor(&t);
-                let m = split.len();
-
-                let docptrs = docptrs_for_counts(id, &embeddings.counts);
-                anyhow::ensure!(
-                    docptrs.len() == m,
-                    "document {id} has {m} embedding rows but {} document indices",
-                    docptrs.len()
-                );
-                document_indices.extend(docptrs);
-                all_embeddings.extend(split);
-                batch += m;
-            }
-            None => {
-                done = true;
-            }
-        }
-
-        let batch_size = 0x10000;
-
-        if batch >= batch_size || done {
-            let now = std::time::Instant::now();
-
-            let take = batch.min(batch_size);
-            let left = batch - take;
-
-            let embeddings = all_embeddings.split_off(left);
-            let indices = document_indices.split_off(left);
-            let data = Tensor::cat(&embeddings, 0)?.to_device(device)?;
-
-            let cluster_assignments =
-                matmul_argmax_batched(&data, &packed_centers, 1024)?.to_device(&Device::Cpu)?;
-            mmuls_total += now.elapsed().as_millis();
-
-            let now = std::time::Instant::now();
-            let mut writer = merger::Writer::new(residual_bytes)?;
-
-            let mut pairs: Vec<(usize, u32)> = cluster_assignments
-                .to_vec1::<u32>()?
-                .iter()
-                .enumerate()
-                .map(|(i, &bucket)| (i, bucket))
-                .collect();
-            pairs.sort_by_key(|&(_, bucket)| bucket);
-
-            let mut keys: Vec<(u32, u32)> = Vec::with_capacity(take);
-            let mut residuals_bytes: Vec<u8> = Vec::with_capacity(take * residual_bytes);
-            let (_, mut prev_bucket) = pairs[0];
-
-            for (sample, bucket) in pairs.iter().copied().chain(std::iter::once((0, u32::MAX))) {
-                let bucket_done = bucket == u32::MAX;
-
-                if (bucket != prev_bucket || bucket_done) && !keys.is_empty() {
-                    assert!(prev_bucket < bucket);
-                    writer.write_record(prev_bucket, &keys, &residuals_bytes)?;
-
-                    keys.clear();
-                    residuals_bytes.clear();
-                    prev_bucket = bucket;
-                }
-
-                if bucket_done {
-                    break;
-                }
-
-                match indices.get(sample) {
-                    Some(pair) => {
-                        keys.push(*pair);
-                    }
-                    None => {
-                        warn!("unable to get key pair from indices @{sample}");
-                        keys.push((0, 0));
-                    }
-                }
-
-                let center = centers_cpu.get(bucket as usize)?;
-                let residual = (embeddings[sample].get(0) - &center)?;
-                let residual_quantized = packops::residual_to_temp_bytes(&residual)?;
-                residuals_bytes.extend(&residual_quantized);
-            }
-            tmpfiles.push(writer.finish()?);
-            writes_total += now.elapsed().as_millis();
-            bar.inc(take as u64);
-
-            batch = left;
-        }
-    }
-    bar.finish();
-
-    debug!("mmuls took {} ms.", mmuls_total);
-    debug!("writes took {} ms.", writes_total);
-
-    Ok((tmpfiles, centers_cpu))
 }
 
 fn write_buckets_for_rowids(
@@ -2409,25 +2310,21 @@ fn build_file_backed_generation(
     let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
     drop(matrix);
 
-    let bucket_data_file = index.bucket_data_file_name(level);
-    let bucket_path = index.path_for(&bucket_data_file);
-    let rowids_file = index.rowids_file_name(level);
-    let rowids_path = index.path_for(&rowids_file);
+    let data_file = index.generation_file_name(level);
+    let data_path = index.path_for(&data_file);
 
-    write_rowid_records(&rowids_path, records)?;
     let (tmpfiles, centers_cpu) =
         write_buckets_for_rowids(records, cache, &centers, device, total_embeddings as u64)?;
-    if let Err(err) = merge_and_write_buckets_to_path(tmpfiles, &centers_cpu, &bucket_path) {
-        let _ = std::fs::remove_file(&rowids_path);
-        let _ = std::fs::remove_file(&bucket_path);
+    if let Err(err) = merge_and_write_buckets_to_path(tmpfiles, &centers_cpu, records, &data_path) {
+        let _ = std::fs::remove_file(&data_path);
         return Err(err);
     }
 
     Ok(Some(FileIndexGeneration {
         level,
         num_embeddings: total_embeddings,
-        bucket_data_file,
-        rowids_file,
+        data_file,
+        rowids_file: None,
     }))
 }
 
@@ -2475,7 +2372,7 @@ pub(crate) fn index_file_backed(
     let mut kept_generations = vec![];
     for generation in generations {
         if generation.level <= target_level {
-            inputs.push(read_rowid_records(&index.path_for(&generation.rowids_file))?);
+            inputs.push(index.generation_rowid_records(&generation)?);
             stale_generations.push(generation);
         } else {
             kept_generations.push(generation);
@@ -2503,95 +2400,29 @@ pub fn index_chunks(
     embedder: Option<&Embedder>,
     reset: bool,
 ) -> Result<()> {
+    let index = file_index_for_db(db);
     if reset {
-        db.execute("DELETE FROM generation")?;
+        index.clear()?;
         clear_generations_cache();
         db.remove_all_bucket_data_sidecars();
     }
 
-    let max_indexed_rowid = max_indexed_document_rowid(db)?;
-    let x = count_document_embeddings_after(db, cache, embedder, max_indexed_rowid)?;
-    if x == 0 {
+    let unmaterialized = unmaterialized_embedding_count(db, &index, cache, embedder)?;
+    let pending = pending_rowid_records(db, &index, cache, embedder)?;
+    if pending.is_empty() && unmaterialized == 0 {
         return Ok(());
     }
 
-    let indexed = count_indexed_embeddings(db)?;
+    for record in &pending {
+        index.append_rowid_record(record.rowid, record.rows)?;
+    }
+
+    let x = unmaterialized;
+    let indexed = index.indexed_embedding_count()?;
     info!("database has {} unindexed embeddings ({} indexed)", x, indexed);
 
-    if x < L0_CAPACITY {
-        debug!("buffering {} unindexed embeddings (< {} threshold)", x, L0_CAPACITY);
-        return Ok(());
-    }
-
-    // Find the max indexed document rowid — unindexed documents are above this.
-    let max_document_rowid = max_document_rowid(db)?;
-
-    // Cascade: accumulate x through levels until we find one with room
-    let mut total = x;
-    let mut target_level = 0u32;
-
-    loop {
-        let cap = level_capacity(target_level);
-        let level_size: usize = db
-            .query(&format!(
-                "SELECT IFNULL(SUM(num_embeddings), 0) FROM generation WHERE level = {}",
-                target_level
-            ))?
-            .query_row((), |row| {
-                let level_size: i64 = row.get(0)?;
-                Ok(level_size as usize)
-            })?;
-        total += level_size;
-        if total <= cap {
-            break;
-        }
-        target_level += 1;
-    }
-
-    // Find the min document rowid across all levels being merged + unindexed
-    let min_rowid: i64 = db
-        .query(&format!(
-            "SELECT IFNULL(MIN(min_document_rowid), {}) FROM generation WHERE level <= {}",
-            max_indexed_rowid + 1,
-            target_level
-        ))?
-        .query_row((), |row| row.get(0))?;
-
-    info!(
-        "cascading {} embeddings into L{} (documents {}..={})",
-        total, target_level, min_rowid, max_document_rowid
-    );
-
-    let stale_bucket_data_files =
-        bucket_data_files_for_generations(db, &format!("level <= {}", target_level))?;
-
-    db.begin_transaction()?;
-
-    let result = (|| -> Result<()> {
-        // Delete all generations at levels 0..=target_level (they get merged)
-        let delete_sql = format!("DELETE FROM generation WHERE level <= {}", target_level);
-        db.execute(&delete_sql)?;
-
-        build_layer(
-            db,
-            device,
-            cache,
-            embedder,
-            target_level,
-            min_rowid,
-            max_document_rowid,
-        )?;
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        let _ = db.rollback_transaction();
-        return Err(err);
-    }
-
-    db.commit_transaction()?;
-    clear_generations_cache();
-    db.remove_bucket_data_files(&stale_bucket_data_files);
+    let source = DocumentEmbeddingSource::new(db, cache)?;
+    index_file_backed(&index, device, &source)?;
     db.checkpoint();
     Ok(())
 }
@@ -2863,8 +2694,14 @@ fn search_rowids_inner(
 
     let mut rowids = Vec::with_capacity(fused.len());
     let mut seen: HashMap<u32, bool> = HashMap::new();
+    let mut exists_query = db.query("SELECT 1 FROM document WHERE rowid = ?1")?;
     for (rowid, _) in fused {
-        if seen.insert(rowid, true).is_none() {
+        if seen.insert(rowid, true).is_none()
+            && exists_query
+                .query_row((rowid,), |_| Ok(()))
+                .optional()?
+                .is_some()
+        {
             rowids.push(rowid as u64);
         }
     }

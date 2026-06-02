@@ -1,12 +1,19 @@
 use anyhow::Result;
-use crate::direct_io::DirectFileWriter;
+use crate::file_writer::NewFileWriter;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+pub(crate) const GENERATION_DATA_VERSION: u32 = 3;
+pub(crate) const GENERATION_DATA_MAGIC: [u8; 8] = *b"WRPBKT03";
+pub(crate) const GENERATION_DATA_HEADER_BYTES: usize =
+    std::mem::size_of::<u32>() + GENERATION_DATA_MAGIC.len() + 4 * std::mem::size_of::<u64>();
+
 const ROWID_RECORD_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+const ROWIDS_OFFSET_FIELD: usize =
+    std::mem::size_of::<u32>() + GENERATION_DATA_MAGIC.len() + 3 * std::mem::size_of::<u64>();
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -31,8 +38,8 @@ pub(crate) struct RowidRecord {
 pub(crate) struct FileIndexGeneration {
     pub(crate) level: u32,
     pub(crate) num_embeddings: usize,
-    pub(crate) bucket_data_file: String,
-    pub(crate) rowids_file: String,
+    pub(crate) data_file: String,
+    pub(crate) rowids_file: Option<String>,
 }
 
 pub(crate) struct FileBackedIndex {
@@ -77,16 +84,20 @@ impl FileBackedIndex {
             .unwrap_or(0)
     }
 
-    pub(crate) fn bucket_data_file_name(&self, level: u32) -> String {
+    pub(crate) fn generation_file_name(&self, level: u32) -> String {
         format!("{}.buckets.{}.{}", self.prefix, level, Self::nonce())
-    }
-
-    pub(crate) fn rowids_file_name(&self, level: u32) -> String {
-        format!("{}.rowids.{}.{}", self.prefix, level, Self::nonce())
     }
 
     pub(crate) fn rowid_buffer_path(&self) -> &PathBuf {
         &self.rowid_buffer_path
+    }
+
+    pub(crate) fn clear(&self) -> Result<()> {
+        let generations = self.read_manifest()?;
+        self.remove_generation_files(&generations);
+        let _ = std::fs::remove_file(&self.manifest_path);
+        let _ = std::fs::remove_file(&self.rowid_buffer_path);
+        Ok(())
     }
 
     pub(crate) fn read_manifest(&self) -> Result<Vec<FileIndexGeneration>> {
@@ -96,11 +107,17 @@ impl FileBackedIndex {
             Err(err) => return Err(err.into()),
         };
         let mut lines = text.lines();
-        anyhow::ensure!(
-            lines.next() == Some("WITCHCRAFT_INDEX_V1"),
-            "bad C index manifest header in {}",
-            self.manifest_path.display()
-        );
+        let header = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty file index manifest {}", self.manifest_path.display()))?;
+        let version = match header {
+            "WITCHCRAFT_INDEX_V1" => 1,
+            "WITCHCRAFT_INDEX_V2" => 2,
+            _ => anyhow::bail!(
+                "bad file index manifest header in {}",
+                self.manifest_path.display()
+            ),
+        };
         let mut generations = vec![];
         for line in lines {
             if line.trim().is_empty() {
@@ -109,28 +126,34 @@ impl FileBackedIndex {
             let mut parts = line.split('\t');
             let level = parts
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("missing level in C index manifest"))?
+                .ok_or_else(|| anyhow::anyhow!("missing level in file index manifest"))?
                 .parse::<u32>()?;
             let num_embeddings = parts
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("missing embedding count in C index manifest"))?
+                .ok_or_else(|| anyhow::anyhow!("missing embedding count in file index manifest"))?
                 .parse::<usize>()?;
-            let bucket_data_file = parts
+            let data_file = parts
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("missing bucket file in C index manifest"))?
+                .ok_or_else(|| anyhow::anyhow!("missing generation file in file index manifest"))?
                 .to_string();
-            let rowids_file = parts
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("missing rowids file in C index manifest"))?
-                .to_string();
+            let rowids_file = if version == 1 {
+                Some(
+                    parts
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("missing rowids file in file index manifest"))?
+                        .to_string(),
+                )
+            } else {
+                None
+            };
             anyhow::ensure!(
                 parts.next().is_none(),
-                "extra fields in C index manifest"
+                "extra fields in file index manifest"
             );
             generations.push(FileIndexGeneration {
                 level,
                 num_embeddings,
-                bucket_data_file,
+                data_file,
                 rowids_file,
             });
         }
@@ -141,16 +164,15 @@ impl FileBackedIndex {
     pub(crate) fn write_manifest(&self, generations: &[FileIndexGeneration]) -> Result<()> {
         std::fs::create_dir_all(&self.parent)?;
         let tmp = unique_tmp_path(&self.manifest_path, "manifest");
-        let mut file = DirectFileWriter::create_append_new(&tmp)?;
-        writeln!(file, "WITCHCRAFT_INDEX_V1")?;
+        let mut file = NewFileWriter::create_new(&tmp)?;
+        writeln!(file, "WITCHCRAFT_INDEX_V2")?;
         for generation in generations {
             writeln!(
                 file,
-                "{}\t{}\t{}\t{}",
+                "{}\t{}\t{}",
                 generation.level,
                 generation.num_embeddings,
-                generation.bucket_data_file,
-                generation.rowids_file
+                generation.data_file
             )?;
         }
         file.finish()?;
@@ -175,17 +197,73 @@ impl FileBackedIndex {
         Ok(self
             .read_manifest()?
             .into_iter()
-            .map(|generation| self.path_for(&generation.bucket_data_file))
+            .map(|generation| self.path_for(&generation.data_file))
             .collect())
     }
 
+    pub(crate) fn buffered_rowid_records(&self) -> Result<Vec<RowidRecord>> {
+        Ok(sort_dedup_rowid_records(read_rowid_records(&self.rowid_buffer_path)?))
+    }
+
     fn current_rowid_records(&self) -> Result<Vec<RowidRecord>> {
-        let mut inputs =
-            vec![sort_dedup_rowid_records(read_rowid_records(&self.rowid_buffer_path)?)];
+        let mut inputs = vec![self.buffered_rowid_records()?];
+        inputs.push(self.indexed_rowid_records()?);
+        Ok(nway_merge_rowid_records(&inputs))
+    }
+
+    pub(crate) fn indexed_rowid_records(&self) -> Result<Vec<RowidRecord>> {
+        let mut inputs = vec![];
         for generation in self.read_manifest()? {
-            inputs.push(read_rowid_records(&self.path_for(&generation.rowids_file))?);
+            inputs.push(self.generation_rowid_records(&generation)?);
         }
         Ok(nway_merge_rowid_records(&inputs))
+    }
+
+    pub(crate) fn generation_rowid_records(
+        &self,
+        generation: &FileIndexGeneration,
+    ) -> Result<Vec<RowidRecord>> {
+        match &generation.rowids_file {
+            Some(rowids_file) => read_rowid_records(&self.path_for(rowids_file)),
+            None => read_generation_rowid_records(&self.path_for(&generation.data_file)),
+        }
+    }
+
+    pub(crate) fn all_rowid_records(&self) -> Result<Vec<RowidRecord>> {
+        self.current_rowid_records()
+    }
+
+    pub(crate) fn indexed_embedding_count(&self) -> Result<usize> {
+        Ok(self
+            .read_manifest()?
+            .into_iter()
+            .map(|generation| generation.num_embeddings)
+            .sum())
+    }
+
+    pub(crate) fn indexed_rowid_map(&self) -> Result<HashMap<u64, u32>> {
+        Ok(self
+            .indexed_rowid_records()?
+            .into_iter()
+            .map(|record| (record.rowid, record.rows))
+            .collect())
+    }
+
+    pub(crate) fn all_rowid_map(&self) -> Result<HashMap<u64, u32>> {
+        Ok(self
+            .all_rowid_records()?
+            .into_iter()
+            .map(|record| (record.rowid, record.rows))
+            .collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn level_embedding_counts(&self) -> Result<Vec<(u32, usize)>> {
+        Ok(self
+            .read_manifest()?
+            .into_iter()
+            .map(|generation| (generation.level, generation.num_embeddings))
+            .collect())
     }
 
     pub(crate) fn active_rowids(&self) -> Result<HashMap<u64, bool>> {
@@ -198,8 +276,10 @@ impl FileBackedIndex {
 
     pub(crate) fn remove_generation_files(&self, generations: &[FileIndexGeneration]) {
         for generation in generations {
-            let _ = std::fs::remove_file(self.path_for(&generation.bucket_data_file));
-            let _ = std::fs::remove_file(self.path_for(&generation.rowids_file));
+            let _ = std::fs::remove_file(self.path_for(&generation.data_file));
+            if let Some(rowids_file) = &generation.rowids_file {
+                let _ = std::fs::remove_file(self.path_for(rowids_file));
+            }
         }
     }
 }
@@ -212,10 +292,48 @@ pub(crate) fn read_rowid_records(path: &PathBuf) -> Result<Vec<RowidRecord>> {
     };
     let mut bytes = vec![];
     file.read_to_end(&mut bytes)?;
+    parse_rowid_records(&bytes, &path.display().to_string())
+}
+
+pub(crate) fn read_generation_rowid_records(path: &PathBuf) -> Result<Vec<RowidRecord>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    anyhow::ensure!(
+        file_len >= GENERATION_DATA_HEADER_BYTES as u64,
+        "generation sidecar {} is too small",
+        path.display()
+    );
+    let mut header = [0u8; GENERATION_DATA_HEADER_BYTES];
+    file.read_exact(&mut header)?;
+    let version = u32::from_le_bytes(header[..4].try_into()?);
+    anyhow::ensure!(
+        version == GENERATION_DATA_VERSION,
+        "generation sidecar version {version} is not supported; run ./warp-cli reindex"
+    );
+    anyhow::ensure!(
+        header[4..4 + GENERATION_DATA_MAGIC.len()] == GENERATION_DATA_MAGIC,
+        "generation sidecar has an invalid header; run ./warp-cli reindex"
+    );
+    let rowids_offset = u64::from_le_bytes(
+        header[ROWIDS_OFFSET_FIELD..ROWIDS_OFFSET_FIELD + 8].try_into()?,
+    );
+    anyhow::ensure!(
+        rowids_offset <= file_len,
+        "generation sidecar rowid offset {} exceeds file length {}",
+        rowids_offset,
+        file_len
+    );
+    file.seek(SeekFrom::Start(rowids_offset))?;
+    let mut bytes = vec![];
+    file.read_to_end(&mut bytes)?;
+    parse_rowid_records(&bytes, &path.display().to_string())
+}
+
+fn parse_rowid_records(bytes: &[u8], source: &str) -> Result<Vec<RowidRecord>> {
     anyhow::ensure!(
         bytes.len() % ROWID_RECORD_BYTES == 0,
-        "rowid file {} length {} is not divisible by {ROWID_RECORD_BYTES}",
-        path.display(),
+        "rowid data in {} length {} is not divisible by {ROWID_RECORD_BYTES}",
+        source,
         bytes.len()
     );
     let mut records = Vec::with_capacity(bytes.len() / ROWID_RECORD_BYTES);
@@ -227,16 +345,25 @@ pub(crate) fn read_rowid_records(path: &PathBuf) -> Result<Vec<RowidRecord>> {
     Ok(records)
 }
 
+pub(crate) fn write_rowid_records_to_writer(
+    writer: &mut impl Write,
+    records: &[RowidRecord],
+) -> Result<()> {
+    for record in records {
+        writer.write_all(&record.rowid.to_le_bytes())?;
+        writer.write_all(&record.rows.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn write_rowid_records(path: &PathBuf, records: &[RowidRecord]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = unique_tmp_path(path, "rowids");
-    let mut file = DirectFileWriter::create_append_new(&tmp)?;
-    for record in records {
-        file.write_all(&record.rowid.to_le_bytes())?;
-        file.write_all(&record.rows.to_le_bytes())?;
-    }
+    let mut file = NewFileWriter::create_new(&tmp)?;
+    write_rowid_records_to_writer(&mut file, records)?;
     file.finish()?;
     std::fs::rename(&tmp, path)?;
     sync_parent_dir(path)?;
@@ -399,8 +526,8 @@ mod tests {
         let generations = vec![FileIndexGeneration {
             level: 2,
             num_embeddings: 17,
-            bucket_data_file: "standalone.buckets.2".to_string(),
-            rowids_file: "standalone.rowids.2".to_string(),
+            data_file: "standalone.buckets.2".to_string(),
+            rowids_file: None,
         }];
 
         index.write_manifest(&generations)?;
@@ -409,8 +536,30 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].level, generations[0].level);
         assert_eq!(loaded[0].num_embeddings, generations[0].num_embeddings);
-        assert_eq!(loaded[0].bucket_data_file, generations[0].bucket_data_file);
+        assert_eq!(loaded[0].data_file, generations[0].data_file);
         assert_eq!(loaded[0].rowids_file, generations[0].rowids_file);
+        Ok(())
+    }
+
+    #[test]
+    fn generation_sidecar_rowids_roundtrip() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("level.buckets");
+        let records = vec![
+            RowidRecord { rowid: 11, rows: 4 },
+            RowidRecord { rowid: 19, rows: 0 },
+        ];
+        let mut file = NewFileWriter::create_new(&path)?;
+        file.write_all(&GENERATION_DATA_VERSION.to_le_bytes())?;
+        file.write_all(&GENERATION_DATA_MAGIC)?;
+        file.write_all(&0u64.to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        write_rowid_records_to_writer(&mut file, &records)?;
+        file.finish()?;
+
+        assert_eq!(read_generation_rowid_records(&path)?, records);
         Ok(())
     }
 }

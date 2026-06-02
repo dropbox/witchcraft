@@ -5,13 +5,12 @@ use rusqlite::{
     params_from_iter, Connection, OpenFlags, OptionalExtension, Result as SQLResult, Statement,
 };
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use super::sql_generator::build_filter_sql_and_params;
 
 const APP_ID: i32 = 0x07DB_DA55;
-const SCHEMA_VERSION: i32 = 12;
+const SCHEMA_VERSION: i32 = 13;
 const MAX_SQLITE_ROWID: u64 = i64::MAX as u64;
 
 fn invalid_input_error(message: String) -> rusqlite::Error {
@@ -65,6 +64,30 @@ impl DB {
         format!("{base}.buckets.")
     }
 
+    fn rowids_prefix(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.rowids.")
+    }
+
+    fn rowids_buffer_file(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.rowids.buffer")
+    }
+
+    fn index_manifest_file(db_fn: &Path) -> String {
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
+        format!("{base}.index")
+    }
+
     fn db_parent(db_fn: &Path) -> &Path {
         match db_fn.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -80,6 +103,9 @@ impl DB {
     fn remove_bucket_data_sidecars(db_fn: &Path) {
         let parent = Self::db_parent(db_fn);
         let prefix = Self::bucket_data_prefix(db_fn);
+        let rowids_prefix = Self::rowids_prefix(db_fn);
+        let rowids_buffer = Self::rowids_buffer_file(db_fn);
+        let manifest = Self::index_manifest_file(db_fn);
         let old_prefix = Self::old_residuals_prefix(db_fn);
         let Ok(entries) = std::fs::read_dir(parent) else {
             return;
@@ -87,7 +113,12 @@ impl DB {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(&prefix) || name.starts_with(&old_prefix) {
+            if name.starts_with(&prefix)
+                || name.starts_with(&rowids_prefix)
+                || name == rowids_buffer
+                || name == manifest
+                || name.starts_with(&old_prefix)
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -153,13 +184,7 @@ impl DB {
                  INSERT INTO document_fts(rowid, body) VALUES (new.rowid, new.body);
              END;
 
-             CREATE TABLE generation(
-                 id INTEGER PRIMARY KEY,
-                 level INTEGER NOT NULL,
-                 num_embeddings INTEGER NOT NULL,
-                 min_document_rowid INTEGER NOT NULL,
-                 max_document_rowid INTEGER NOT NULL,
-                 bucket_data_file TEXT NOT NULL);"
+             "
         ))?;
         Ok(())
     }
@@ -236,7 +261,6 @@ impl DB {
 
     fn clear_inner(&mut self) -> SQLResult<()> {
         self.execute("DELETE FROM document")?;
-        self.execute("DELETE FROM generation")?;
         self.remove_all_bucket_data_sidecars();
         self.execute("VACUUM")?;
         Ok(())
@@ -322,38 +346,6 @@ impl DB {
 
     pub fn file_size(&self) -> std::io::Result<u64> {
         std::fs::metadata(&self.db_fn).map(|meta| meta.len())
-    }
-
-    pub fn bucket_data_file_name(&self, generation_id: i64) -> String {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        format!("{}{generation_id}.{nonce}", Self::bucket_data_prefix(&self.db_fn))
-    }
-
-    pub fn bucket_data_path(&self, file_name: &str) -> PathBuf {
-        let path = Path::new(file_name);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            Self::db_parent(&self.db_fn).join(path)
-        }
-    }
-
-    pub fn remove_bucket_data_file(&self, file_name: &str) {
-        let path = self.bucket_data_path(file_name);
-        if let Err(e) = std::fs::remove_file(&path) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("unable to remove bucket data sidecar {}: {e}", path.display());
-            }
-        }
-    }
-
-    pub fn remove_bucket_data_files(&self, file_names: &[String]) {
-        for file_name in file_names {
-            self.remove_bucket_data_file(file_name);
-        }
     }
 
     pub fn remove_all_bucket_data_sidecars(&self) {
@@ -495,17 +487,10 @@ impl DB {
     }
 
     fn max_known_document_rowid(&self) -> SQLResult<i64> {
-        let document_rowid: i64 = self
-            .conn()
+        self.conn()
             .query_row("SELECT IFNULL(MAX(rowid), 0) FROM document", (), |row| {
                 row.get(0)
-            })?;
-        let indexed_rowid: i64 = self.conn().query_row(
-            "SELECT IFNULL(MAX(max_document_rowid), 0) FROM generation",
-            (),
-            |row| row.get(0),
-        )?;
-        Ok(document_rowid.max(indexed_rowid))
+            })
     }
 
     pub fn remove_doc(&mut self, uuid: &Uuid) -> SQLResult<()> {
@@ -514,32 +499,6 @@ impl DB {
         Ok(())
     }
 
-    pub fn add_generation(
-        &self,
-        level: u32,
-        num_embeddings: u64,
-        min_document_rowid: i64,
-        max_document_rowid: i64,
-    ) -> SQLResult<i64> {
-        self.conn().execute(
-            "INSERT INTO generation(level, num_embeddings, min_document_rowid, max_document_rowid, bucket_data_file)
-             VALUES(?1, ?2, ?3, ?4, '')",
-            (level, num_embeddings as i64, min_document_rowid, max_document_rowid),
-        )?;
-        Ok(self.conn().last_insert_rowid())
-    }
-
-    pub fn set_generation_bucket_data_file(
-        &self,
-        generation_id: i64,
-        bucket_data_file: &str,
-    ) -> SQLResult<()> {
-        self.conn().execute(
-            "UPDATE generation SET bucket_data_file = ?1 WHERE id = ?2",
-            (bucket_data_file, generation_id),
-        )?;
-        Ok(())
-    }
 }
 
 impl Drop for DB {
@@ -579,13 +538,22 @@ mod tests {
         let base = format!("warp-sidecar-test-{nonce}.sqlite");
         let db_path = PathBuf::from(&base);
         let sidecar = PathBuf::from(format!("{base}.buckets.1.test"));
+        let rowids = PathBuf::from(format!("{base}.rowids.1.test"));
+        let rowids_buffer = PathBuf::from(format!("{base}.rowids.buffer"));
+        let manifest = PathBuf::from(format!("{base}.index"));
         let old_sidecar = PathBuf::from(format!("{base}.residuals.1.test"));
 
         std::fs::write(&sidecar, b"bucket").unwrap();
+        std::fs::write(&rowids, b"rowids").unwrap();
+        std::fs::write(&rowids_buffer, b"buffer").unwrap();
+        std::fs::write(&manifest, b"manifest").unwrap();
         std::fs::write(&old_sidecar, b"residual").unwrap();
         DB::remove_bucket_data_sidecars(&db_path);
 
         assert!(!sidecar.exists());
+        assert!(!rowids.exists());
+        assert!(!rowids_buffer.exists());
+        assert!(!manifest.exists());
         assert!(!old_sidecar.exists());
     }
 }

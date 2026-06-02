@@ -166,6 +166,12 @@ mod tests {
             .query_row((), |row| row.get(0))
             .unwrap();
         assert_eq!(chunk_table_count, 0);
+        let generation_table_count: i64 = db
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'generation'")
+            .unwrap()
+            .query_row((), |row| row.get(0))
+            .unwrap();
+        assert_eq!(generation_table_count, 0);
 
         let embedding_cache =
             crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
@@ -430,22 +436,20 @@ mod tests {
         crate::embed_chunks(&db, &embedder, None).unwrap();
         index_chunks(&db, &device).unwrap();
 
-        // Verify generations span multiple levels
-        let levels: Vec<(u32, i64)> = {
-            let mut level_query = db
-                .query("SELECT level, SUM(num_embeddings) FROM generation GROUP BY level ORDER BY level")
-                .unwrap();
-            level_query
-                .query_map((), |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        };
+        // Verify file-backed generations span multiple levels
+        let levels = crate::file_index::FileBackedIndex::new(path.clone())
+            .level_embedding_counts()
+            .unwrap();
         println!("cascade levels: {:?}", levels);
         assert!(
             levels.len() >= 2,
             "should have at least 2 levels after adding extra docs"
         );
+        let rowid_sidecars = std::fs::read_dir(dir.path())?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("warp.rowids."))
+            .count();
+        assert_eq!(rowid_sidecars, 0);
 
         // Verify search finds results from both old and new data
         for (q, _pos) in EASY_QUERIES {
@@ -570,7 +574,7 @@ mod tests {
     fn test_unindexed_embedding_count_uses_cache_metadata() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("counts.sqlite");
-        let mut db = DB::new(path)?;
+        let mut db = DB::new(path.clone())?;
 
         let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"counts-1");
         let uuid2 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"counts-2");
@@ -612,7 +616,22 @@ mod tests {
         )?;
 
         assert_eq!(crate::count_unindexed_cached_embeddings(&db, &cache)?, 18);
-        db.add_generation(0, 7, rows[0].0, rows[0].0)?;
+        let index = crate::file_index::FileBackedIndex::new(path.clone());
+        let rowids_file = "counts.sqlite.rowids.0.test".to_string();
+        let rowids_path = index.path_for(&rowids_file);
+        crate::file_index::write_rowid_records(
+            &rowids_path,
+            &[crate::file_index::RowidRecord {
+                rowid: rows[0].0.try_into()?,
+                rows: 7,
+            }],
+        )?;
+        std::fs::write(
+            dir.path().join("counts.sqlite.index"),
+            format!(
+                "WITCHCRAFT_INDEX_V1\n0\t7\tcounts.sqlite.buckets.0.test\t{rowids_file}\n"
+            ),
+        )?;
         assert_eq!(crate::count_unindexed_cached_embeddings(&db, &cache)?, 11);
         Ok(())
     }
@@ -757,12 +776,6 @@ mod tests {
             (Some(39), uuid6, None, "{}", "lower", None),
         ];
         assert!(db.add_docs_batch(&non_monotonic).is_err());
-
-        db.add_generation(0, 1, 1, 100)?;
-        assert!(db
-            .add_doc(Some(99), &uuid4, None, "{}", "below indexed max", None)
-            .is_err());
-        db.add_doc(Some(101), &uuid4, None, "{}", "above indexed max", None)?;
 
         db.clear();
         db.shutdown();
@@ -945,12 +958,6 @@ mod tests {
             callback_calls: usize,
         }
 
-        fn embedding_rows(blob: &[u8]) -> u32 {
-            u64::from_le_bytes(blob[16..24].try_into().unwrap())
-                .try_into()
-                .unwrap()
-        }
-
         unsafe fn last_error(handle: *mut crate::capi::WitchcraftHandle) -> String {
             let ptr = crate::capi::witchcraft_last_error(handle);
             if ptr.is_null() {
@@ -1019,16 +1026,16 @@ mod tests {
             crate::capi::witchcraft_bytes_free(blob.ptr, blob.len);
 
             let user_data = &mut store as *mut _ as *mut c_void;
-            let honey_rows = embedding_rows(&store.blobs[&42]);
+            let honey_blob = &store.blobs[&42];
             assert_eq!(
-                crate::capi::witchcraft_add(handle, 42, honey_rows),
+                crate::capi::witchcraft_add(handle, 42, honey_blob.as_ptr(), honey_blob.len()),
                 0,
                 "{}",
                 last_error(handle)
             );
-            let octopus_rows = embedding_rows(&store.blobs[&43]);
+            let octopus_blob = &store.blobs[&43];
             assert_eq!(
-                crate::capi::witchcraft_add(handle, 43, octopus_rows),
+                crate::capi::witchcraft_add(handle, 43, octopus_blob.as_ptr(), octopus_blob.len()),
                 0,
                 "{}",
                 last_error(handle)

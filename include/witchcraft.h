@@ -42,7 +42,8 @@ WitchcraftBytes witchcraft_embed(
 int32_t witchcraft_add(
     WitchcraftHandle *handle,
     uint64_t rowid,
-    uint32_t rows
+    const uint8_t *embedding_blob,
+    size_t embedding_blob_len
 );
 
 int32_t witchcraft_index(
