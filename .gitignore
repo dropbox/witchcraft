@@ -1,7 +1,7 @@
 target
 warp.node
 warp-cli
-pickbrain
+/pickbrain
 .claude/
 
 # Uncompressed OpenVINO model files (large, not versioned)

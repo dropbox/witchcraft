@@ -59,7 +59,7 @@ standard with sqlite.
 # Pickbrain: semantic search over your AI coding sessions #
 
 Included as an example is **pickbrain** (screenshot above), a CLI that indexes
-your Claude Code and OpenAI Codex session transcripts, memory files, and
+your Pi, Claude Code, and OpenAI Codex session transcripts, memory files, and
 authored documents into a Witchcraft database for fast semantic search. Ever
 wondered "what was that conversation where I fixed the auth middleware?" —
 pickbrain finds it, and lets you resume the session directly.
@@ -73,14 +73,14 @@ make pickbrain
 
 The source lives in `examples/pickbrain/` and demonstrates how to use
 Witchcraft as a library: document ingestion, embedding, indexing, and hybrid
-search. To install pickbrain as a skill for both Claude Code and Codex:
+search. To install pickbrain as a skill/extension for Pi and as a skill for both Claude Code and Codex:
 
 ```
 make pickbrain-install
 ```
 
-This puts the binary on your `PATH` and installs the skill definitions so
-you can use pickbrain directly from either tool to answer questions requiring
+This puts the binary on your `PATH` and installs the skill/extension definitions so
+you can use pickbrain directly from Pi, Claude Code, or Codex to answer questions requiring
 global knowledge of all your projects:
 
 ![skill](skill.png)

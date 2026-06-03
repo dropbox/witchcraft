@@ -1,11 +1,11 @@
 ---
 name: pickbrain
-description: Semantic search over past Claude Code and Codex conversations and memories. Use when the user wants to recall, find, or reference something from a previous coding session — e.g. "what did we discuss about X", "find that conversation where we fixed Y", "search my history for Z".
+description: Semantic search over past Pi, Claude Code, and Codex conversations and memories. Use when the user wants to recall, find, or reference something from a previous coding session — e.g. "what did we discuss about X", "find that conversation where we fixed Y", "search my history for Z".
 ---
 
 # Pickbrain — Semantic Search for AI Coding History
 
-Search past Claude Code and Codex conversations, memory files, and authored files using semantic search.
+Search past Pi, Claude Code, and Codex conversations, memory files, and authored files using semantic search.
 
 ## Usage
 
@@ -15,7 +15,7 @@ Run `pickbrain` with the user's query:
 pickbrain "$ARGUMENTS"
 ```
 
-Pickbrain automatically ingests new sessions, memories, and project config files (CLAUDE.md, AGENTS.md, and their @ references) before each search.
+Pickbrain automatically ingests new Pi/Claude/Codex sessions, memories, and project config files (CLAUDE.md, AGENTS.md, and their @ references) before each search.
 
 ## Interpreting Results
 

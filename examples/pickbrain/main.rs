@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod claude_code;
 mod codex;
+mod pi;
 mod slack;
 mod watermark;
 
@@ -180,6 +181,13 @@ fn needs_ingest(
         return Ok(true);
     }
 
+    if wants_source(types, "pi") {
+        let pi_skip = skip_session.filter(|_| watermark::is_fresh(&watermark::pi_path(), stale_ms));
+        if pi::has_work(pi_skip) {
+            return Ok(true);
+        }
+    }
+
     if wants_source(types, "slack") && slack::has_work() {
         return Ok(true);
     }
@@ -194,11 +202,29 @@ fn warn_lookup_only(reason: impl std::fmt::Display) {
 fn reset_ingest_watermarks() {
     watermark::remove(&watermark::claude_path());
     watermark::remove(&watermark::codex_path());
+    watermark::remove(&watermark::pi_path());
     slack::remove_watermark();
 }
 
 /// Walk up the process tree to find the calling Claude Code session ID.
 fn detect_active_session() -> Option<String> {
+    for key in ["PICKBRAIN_ACTIVE_SESSION_ID", "PI_SESSION_ID"] {
+        if let Ok(value) = env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    for key in ["PICKBRAIN_ACTIVE_SESSION_FILE", "PI_SESSION_FILE"] {
+        if let Ok(value) = env::var(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(pi::session_id_from_filename(std::path::Path::new(value)));
+            }
+        }
+    }
+
     let home = env::var("HOME").ok()?;
     let sessions_dir = PathBuf::from(&home).join(".claude/sessions");
     let mut pid = std::process::id() as i32;
@@ -269,19 +295,26 @@ fn ingest(db_name: &PathBuf, skip_session: Option<&str>, stale_ms: i64, types: &
         0
     };
 
+    let pi_sessions = if want("pi") {
+        let pi_skip = skip_session.filter(|_| watermark::is_fresh(&watermark::pi_path(), stale_ms));
+        pi::ingest_pi(&mut db, pi_skip)?
+    } else {
+        0
+    };
+
     let slack_conversations = if want("slack") {
         slack::ingest_slack(&mut db)?
     } else {
         0
     };
 
-    let total = sessions + memories + authored + configs + codex_sessions + slack_conversations;
+    let total = sessions + memories + authored + configs + codex_sessions + pi_sessions + slack_conversations;
     if total == 0 {
         eprintln!("No new sessions to ingest.");
         return Ok(false);
     }
     eprintln!(
-        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {slack_conversations} slack conversations, {memories} memory files, {authored} authored files, {configs} config files"
+        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {pi_sessions} pi sessions, {slack_conversations} slack conversations, {memories} memory files, {authored} authored files, {configs} config files"
     );
     Ok(true)
 }
@@ -337,6 +370,26 @@ fn read_jsonl_line(path: &str, offset: u64, len: u64) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
+fn extract_pi_content_text(content: &serde_json::Value) -> Option<String> {
+    if content.is_string() {
+        return content.as_str().map(|s| s.to_string());
+    }
+    let blocks = content.as_array()?;
+    let texts: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
+            Some("text") => b.get("text").and_then(|t| t.as_str()),
+            Some("thinking") => b.get("thinking").and_then(|t| t.as_str()),
+            _ => None,
+        })
+        .collect();
+    if texts.is_empty() {
+        None
+    } else {
+        Some(texts.join("\n"))
+    }
+}
+
 fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> {
     let line = read_jsonl_line(path, tm.byte_offset, tm.byte_len)?;
     let v: serde_json::Value = serde_json::from_str(&line).ok()?;
@@ -362,6 +415,13 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
         } else {
             return None;
         }
+    } else if source == "pi" {
+        let content = if v.get("type").and_then(|t| t.as_str()) == Some("custom_message") {
+            v.get("content")?
+        } else {
+            v.get("message")?.get("content")?
+        };
+        extract_pi_content_text(content)?
     } else {
         // Claude Code
         let msg = v.get("message")?;
@@ -956,13 +1016,13 @@ fn search_tui(
                             }
                             let match_role = matched_tm.map(|tm| tm.role.as_str()).unwrap_or("");
                             let role_prefix = if r.source == "slack" {
-                                ""
+                                String::new()
                             } else if match_role == "user" {
-                                "[User] "
+                                "[User] ".to_string()
                             } else if match_role == "assistant" {
-                                if r.source == "codex" { "[Codex] " } else { "[Claude] " }
+                                format!("{} ", role_label(&r.source))
                             } else {
-                                ""
+                                String::new()
                             };
                             ratatui::widgets::ListItem::new(vec![
                                 Line::from(meta_spans),
@@ -1045,19 +1105,15 @@ fn search_tui(
                                     .fg(Color::Cyan)
                                     .add_modifier(Modifier::BOLD)
                             };
+                            let role_prefix = if r.source == "slack" {
+                                String::new()
+                            } else if turn.role == "user" {
+                                "[User] ".to_string()
+                            } else {
+                                format!("{} ", role_label(&r.source))
+                            };
                             lines.push(Line::from(vec![
-                                Span::styled(
-                                    if r.source == "slack" {
-                                        ""
-                                    } else if turn.role == "user" {
-                                        "[User] "
-                                    } else if r.source == "codex" {
-                                        "[Codex] "
-                                    } else {
-                                        "[Claude] "
-                                    },
-                                    role_style,
-                                ),
+                                Span::styled(role_prefix, role_style),
                                 Span::styled(
                                     format_date(&turn.timestamp),
                                     Style::default().fg(Color::DarkGray),
@@ -1299,6 +1355,13 @@ fn read_cwd_from_jsonl(path: &str, source: &str) -> Option<String> {
                     return Some(cwd.to_string());
                 }
             }
+        } else if source == "pi" {
+            // Pi: cwd is in the session header
+            if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+                if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                    return Some(cwd.to_string());
+                }
+            }
         } else {
             // Claude: cwd is a top-level field
             if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
@@ -1366,6 +1429,12 @@ fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
             .args(["resume", session_id])
             .exec();
         Err(err.into())
+    } else if s.source == "pi" {
+        eprintln!("Resuming pi session {session_id}...");
+        let err = std::process::Command::new("pi")
+            .args(["--session", session_id])
+            .exec();
+        Err(err.into())
     } else {
         eprintln!("Resuming claude session {session_id}...");
         let err = std::process::Command::new("claude")
@@ -1388,10 +1457,28 @@ fn slack_conv_tag(conv_key: &str) -> String {
     String::new()
 }
 
+fn source_label(source: &str) -> &str {
+    match source {
+        "slack" => "slack",
+        "codex" => "codex",
+        "pi" => "pi",
+        _ => "claude",
+    }
+}
+
+fn role_label(source: &str) -> &str {
+    match source {
+        "codex" => "[Codex]",
+        "pi" => "[Pi]",
+        _ => "[Claude]",
+    }
+}
+
 fn strip_body_prefix(s: &str) -> &str {
     s.strip_prefix("[User] ")
         .or_else(|| s.strip_prefix("[Claude] "))
         .or_else(|| s.strip_prefix("[Codex] "))
+        .or_else(|| s.strip_prefix("[Pi] "))
         .unwrap_or(s)
 }
 
@@ -1447,7 +1534,7 @@ fn search_plain(
             .filter(|tm| !tm.timestamp.is_empty())
             .map(|tm| format_date(&tm.timestamp))
             .unwrap_or_else(|| r.timestamp.clone());
-        let source_label = if r.source == "slack" { "slack" } else if r.source == "codex" { "codex" } else { "claude" };
+        let source_label = source_label(&r.source);
         let filename = if r.path.ends_with(".md") {
             format!("  {}", r.path)
         } else {
@@ -1492,10 +1579,8 @@ fn search_plain(
                 let tm = &r.turns[i];
                 let label = if tm.role == "user" {
                     "[User]"
-                } else if r.source == "codex" {
-                    "[Codex]"
                 } else {
-                    "[Claude]"
+                    role_label(&r.source)
                 };
                 let prefix = if i == mi { ">>>" } else { "  " };
                 writeln!(buf, "{prefix} {label} {}", format_date(&tm.timestamp))?;
@@ -1539,7 +1624,7 @@ fn session_meta_spans(
             Style::default().fg(Color::Magenta),
         ));
     } else if !session_id.is_empty() {
-        let source_label = if source == "codex" { "codex" } else { "claude" };
+        let source_label = source_label(source);
         let short_sid = if session_id.len() > 8 { &session_id[..8] } else { session_id };
         spans.push(Span::styled(
             format!("  {source_label} {short_sid}"),
@@ -1852,6 +1937,7 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
                 && !l.starts_with("[User]")
                 && !l.starts_with("[Claude]")
                 && !l.starts_with("[Codex]")
+                && !l.starts_with("[Pi]")
         }) {
             writeln!(buf, "{line}")?;
         }
@@ -1912,7 +1998,7 @@ fn main() -> Result<()> {
                 eprintln!("  --exclude-current    exclude the calling session");
                 eprintln!("  --session ID         search within a session, channel, or thread");
                 eprintln!("  --since 24h|7d|2w    only search recent history");
-                eprintln!("  --type claude,slack  filter by source (claude, codex, slack)");
+                eprintln!("  --type claude,codex,pi,slack  filter by source");
                 eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
                 eprintln!("  --dm                 only DMs (Slack)");
                 eprintln!("  --no-dm              exclude DMs (Slack)");
@@ -1934,6 +2020,7 @@ fn main() -> Result<()> {
                 }
                 watermark::remove(&watermark::claude_path());
                 watermark::remove(&watermark::codex_path());
+                watermark::remove(&watermark::pi_path());
                 slack::remove_watermark();
                 std::process::exit(0);
             }

@@ -8,7 +8,9 @@ fn watermark_path(agent_dir: &str) -> PathBuf {
         return crate::pickbrain_dir().join(format!("{name}.watermark"));
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(agent_dir).join("pickbrain.watermark")
+    PathBuf::from(home)
+        .join(agent_dir)
+        .join("pickbrain.watermark")
 }
 
 pub fn claude_path() -> PathBuf {
@@ -17,6 +19,10 @@ pub fn claude_path() -> PathBuf {
 
 pub fn codex_path() -> PathBuf {
     watermark_path(".codex")
+}
+
+pub fn pi_path() -> PathBuf {
+    watermark_path(".pi/agent")
 }
 
 pub fn mtime_ms(path: &Path) -> i64 {

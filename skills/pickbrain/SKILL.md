@@ -1,12 +1,12 @@
 ---
 name: pickbrain
-description: Semantic search over past Claude Code conversations, memories, and Slack messages. Use when the user wants to recall, find, or reference something from a previous Claude session or Slack conversation — e.g. "what did we discuss about X", "find that conversation where we fixed Y", "search my history for Z", "what did someone say about X in Slack".
+description: Semantic search over past Pi, Claude Code, Codex, and Slack conversations, memories, and authored files. Use when the user wants to recall, find, or reference something from a previous coding-agent session or Slack conversation — e.g. "what did we discuss about X", "find that conversation where we fixed Y", "search my history for Z", "what did someone say about X in Slack".
 allowed-tools: Bash
 ---
 
 # Pickbrain — Semantic Search for Claude History and Slack
 
-Search past Claude Code conversations, Codex sessions, Slack messages, memory files, and authored files using semantic search.
+Search past Pi sessions, Claude Code conversations, Codex sessions, Slack messages, memory files, and authored files using semantic search.
 
 ## Installation
 
@@ -28,13 +28,13 @@ Run `pickbrain` via Bash with the user's query:
 pickbrain "$ARGUMENTS"
 ```
 
-Pickbrain automatically ingests new Claude/Codex sessions, Slack conversations (from the desktop app's local IndexedDB), memories, and project config files before each search.
+Pickbrain automatically ingests new Pi/Claude/Codex sessions, Slack conversations (from the desktop app's local IndexedDB), memories, and project config files before each search.
 
 ## Interpreting Results
 
 Each result includes:
 - **Timestamp** and **project directory** (or **channel name** for Slack results)
-- **Source** — `claude`, `codex`, or `slack`
+- **Source** — `pi`, `claude`, `codex`, or `slack`
 - **Session ID** and **turn number** (Claude/Codex) or **channel + thread ID** (Slack)
 - **Matching text** — the relevant chunk from the conversation
 
@@ -96,7 +96,7 @@ pickbrain --since 7d "<query>"
 pickbrain --since 2w "<query>"
 ```
 
-To filter by source type (claude, codex, slack):
+To filter by source type (pi, claude, codex, slack):
 
 ```bash
 pickbrain --type slack "<query>"
