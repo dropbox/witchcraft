@@ -1485,7 +1485,7 @@ fn match_centroids_from_cache(
     embedder: Option<&Embedder>,
     cache: &dyn EmbeddingCache,
 ) -> Result<Vec<(f32, u32, u32)>> {
-    let index = file_index_for_db(db);
+    let index = index_for_db(db);
     let generation_files = index.generation_files()?;
     let buffered = index.buffered_rowid_records()?;
     let unindexed = if !buffered.is_empty() {
@@ -1675,7 +1675,7 @@ fn current_unindexed_embeddings(
 }
 
 #[cfg(feature = "sqlite")]
-fn file_index_for_db(db: &DB) -> FileBackedIndex {
+fn index_for_db(db: &DB) -> FileBackedIndex {
     FileBackedIndex::new(db.path().clone())
 }
 
@@ -2111,7 +2111,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
 #[cfg(feature = "sqlite")]
 pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
     let cache = default_embedding_cache();
-    let index = file_index_for_db(db);
+    let index = index_for_db(db);
     unmaterialized_embedding_count(db, &index, &cache, None)
 }
 
@@ -2121,7 +2121,7 @@ pub fn count_unindexed_embeddings_with_cache(
     embedder: &Embedder,
     cache: &dyn EmbeddingCache,
 ) -> Result<usize> {
-    let index = file_index_for_db(db);
+    let index = index_for_db(db);
     unmaterialized_embedding_count(
         db,
         &index,
@@ -2132,7 +2132,7 @@ pub fn count_unindexed_embeddings_with_cache(
 
 #[cfg(feature = "sqlite")]
 pub fn count_unindexed_cached_embeddings(db: &DB, cache: &dyn EmbeddingCache) -> Result<usize> {
-    let index = file_index_for_db(db);
+    let index = index_for_db(db);
     unmaterialized_embedding_count(db, &index, cache, None)
 }
 
@@ -2319,7 +2319,7 @@ fn write_buckets_for_rowids(
     Ok((tmpfiles, centers_cpu))
 }
 
-fn build_file_backed_generation(
+fn build_index_generation(
     index: &FileBackedIndex,
     device: &Device,
     cache: &dyn EmbeddingCache,
@@ -2361,7 +2361,7 @@ fn build_file_backed_generation(
     }))
 }
 
-pub(crate) fn index_file_backed(
+pub(crate) fn index_buffered_embeddings(
     index: &FileBackedIndex,
     device: &Device,
     cache: &dyn EmbeddingCache,
@@ -2414,7 +2414,7 @@ pub(crate) fn index_file_backed(
 
     let merged = nway_merge_rowid_records(&inputs);
     if let Some(generation) =
-        build_file_backed_generation(index, device, cache, target_level, &merged)?
+        build_index_generation(index, device, cache, target_level, &merged)?
     {
         kept_generations.push(generation);
     }
@@ -2434,7 +2434,7 @@ pub fn index_chunks(
     embedder: Option<&Embedder>,
     reset: bool,
 ) -> Result<()> {
-    let index = file_index_for_db(db);
+    let index = index_for_db(db);
     if reset {
         index.clear()?;
         clear_generations_cache();
@@ -2456,7 +2456,7 @@ pub fn index_chunks(
     info!("database has {} unindexed embeddings ({} indexed)", x, indexed);
 
     let source = DocumentEmbeddingSource::new(db, cache)?;
-    index_file_backed(&index, device, &source)?;
+    index_buffered_embeddings(&index, device, &source)?;
     db.checkpoint();
     Ok(())
 }

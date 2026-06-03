@@ -1,5 +1,5 @@
 use crate::{
-    index_file_backed, match_centroids_raw, CachedEmbeddings, Embedder, EmbeddingCache,
+    index_buffered_embeddings, match_centroids_raw, CachedEmbeddings, Embedder, EmbeddingCache,
     EmbeddingsCache, FileBackedIndex,
 };
 use anyhow::{anyhow, Result};
@@ -497,7 +497,7 @@ pub unsafe extern "C" fn witchcraft_index(
             .lock()
             .map_err(|_| anyhow!("witchcraft handle lock poisoned"))?;
         let embeddings = CallbackEmbeddingSource::new(embedding_callback, user_data);
-        index_file_backed(&state.index, &state.device, &embeddings)
+        index_buffered_embeddings(&state.index, &state.device, &embeddings)
     }));
 
     match result {
