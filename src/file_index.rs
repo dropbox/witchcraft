@@ -92,6 +92,7 @@ impl FileBackedIndex {
         &self.rowid_buffer_path
     }
 
+    #[cfg(feature = "sqlite")]
     pub(crate) fn clear(&self) -> Result<()> {
         let generations = self.read_manifest()?;
         self.remove_generation_files(&generations);
@@ -229,10 +230,12 @@ impl FileBackedIndex {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     pub(crate) fn all_rowid_records(&self) -> Result<Vec<RowidRecord>> {
         self.current_rowid_records()
     }
 
+    #[cfg(feature = "sqlite")]
     pub(crate) fn indexed_embedding_count(&self) -> Result<usize> {
         Ok(self
             .read_manifest()?
@@ -241,6 +244,7 @@ impl FileBackedIndex {
             .sum())
     }
 
+    #[cfg(feature = "sqlite")]
     pub(crate) fn indexed_rowid_map(&self) -> Result<HashMap<u64, u32>> {
         Ok(self
             .indexed_rowid_records()?
@@ -249,6 +253,7 @@ impl FileBackedIndex {
             .collect())
     }
 
+    #[cfg(feature = "sqlite")]
     pub(crate) fn all_rowid_map(&self) -> Result<HashMap<u64, u32>> {
         Ok(self
             .all_rowid_records()?

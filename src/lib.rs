@@ -3,7 +3,9 @@ use memmap2::Mmap;
 use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "deterministic"))]
 use rand::SeedableRng;
+#[cfg(feature = "sqlite")]
 use rusqlite::OptionalExtension;
+#[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
@@ -60,7 +62,9 @@ compile_error!("hybrid-dequant is incompatible with metal (use accelerate only f
 #[cfg(all(feature = "polar-quant-2bit", feature = "polar-quant-3bit"))]
 compile_error!("polar-quant-2bit and polar-quant-3bit are mutually exclusive");
 
+#[cfg(feature = "sqlite")]
 mod db;
+#[cfg(feature = "sqlite")]
 pub use db::DB;
 
 mod embedding_cache;
@@ -93,13 +97,17 @@ use file_index::{
 mod priority;
 use priority::PriorityManager;
 
+#[cfg(feature = "sqlite")]
 mod progress_reporter;
+#[cfg(feature = "sqlite")]
 use progress_reporter::ProgressReporter;
 
 pub mod types;
 pub use types::SqlStatementInternal;
 
+#[cfg(feature = "sqlite")]
 pub mod sql_generator;
+#[cfg(feature = "sqlite")]
 use sql_generator::build_filter_sql_and_params;
 
 #[cfg(feature = "napi")]
@@ -115,6 +123,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const DEFAULT_EMBEDDING_DIM: usize = 128;
+#[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
 const DOCUMENT_CACHE_HASH_CHARS: usize = 32;
 const BUCKET_DATA_VERSION: u32 = file_index::GENERATION_DATA_VERSION;
 const BUCKET_DATA_MAGIC: [u8; 8] = file_index::GENERATION_DATA_MAGIC;
@@ -200,6 +209,7 @@ fn cached_embeddings_match_current_encoder(embeddings: &CachedEmbeddings) -> boo
     embeddings.model == model_id_for_dim(dim_from_model_id(&embeddings.model))
 }
 
+#[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
 pub(crate) fn document_cache_hash(body: &str, lens: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(body.as_bytes());
@@ -783,6 +793,7 @@ fn merge_and_write_buckets_to_path(
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
 fn fts5_query(q: &str) -> Option<(String, String)> {
     let terms: Vec<&str> = q
         .split(|c: char| !c.is_alphanumeric())
@@ -811,6 +822,7 @@ fn fts5_query(q: &str) -> Option<(String, String)> {
     Some((query, normalized))
 }
 
+#[cfg(feature = "sqlite")]
 pub fn fulltext_search(
     db: &DB,
     q: &str,
@@ -1428,6 +1440,7 @@ pub fn match_centroids_raw(
 
 /// DB-backed wrapper: loads generations from cache and fetches any unindexed
 /// documents that already have cached embeddings.
+#[cfg(feature = "sqlite")]
 pub fn match_centroids(
     db: &DB,
     query_embeddings: &Tensor,
@@ -1441,6 +1454,7 @@ pub fn match_centroids(
 
 /// DB-backed wrapper that can demand-populate missing unindexed document
 /// embeddings through the supplied cache.
+#[cfg(feature = "sqlite")]
 pub fn match_centroids_with_cache(
     db: &DB,
     query_embeddings: &Tensor,
@@ -1461,6 +1475,7 @@ pub fn match_centroids_with_cache(
     )
 }
 
+#[cfg(feature = "sqlite")]
 fn match_centroids_from_cache(
     db: &DB,
     query_embeddings: &Tensor,
@@ -1555,6 +1570,7 @@ fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
     document_indices
 }
 
+#[cfg(feature = "sqlite")]
 fn buffered_unindexed_embeddings(
     db: &DB,
     records: &[RowidRecord],
@@ -1613,6 +1629,7 @@ fn buffered_unindexed_embeddings(
     Ok(unindexed)
 }
 
+#[cfg(feature = "sqlite")]
 fn current_unindexed_embeddings(
     db: &DB,
     cache: &dyn EmbeddingCache,
@@ -1657,6 +1674,7 @@ fn current_unindexed_embeddings(
     Ok(unindexed)
 }
 
+#[cfg(feature = "sqlite")]
 fn file_index_for_db(db: &DB) -> FileBackedIndex {
     FileBackedIndex::new(db.path().clone())
 }
@@ -1669,6 +1687,7 @@ fn cached_embeddings_for_rowid(
         .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))
 }
 
+#[cfg(feature = "sqlite")]
 fn current_document_rowid_records(
     db: &DB,
     cache: &dyn EmbeddingCache,
@@ -1705,6 +1724,7 @@ fn current_document_rowid_records(
     Ok(records)
 }
 
+#[cfg(feature = "sqlite")]
 fn pending_rowid_records(
     db: &DB,
     index: &FileBackedIndex,
@@ -1731,11 +1751,13 @@ fn pending_rowid_records(
     Ok(pending)
 }
 
+#[cfg(feature = "sqlite")]
 struct DocumentEmbeddingSource<'a> {
     cache: &'a dyn EmbeddingCache,
     hashes: HashMap<u64, String>,
 }
 
+#[cfg(feature = "sqlite")]
 impl<'a> DocumentEmbeddingSource<'a> {
     fn new(db: &DB, cache: &'a dyn EmbeddingCache) -> Result<Self> {
         let mut query = db.query(
@@ -1758,6 +1780,7 @@ impl<'a> DocumentEmbeddingSource<'a> {
     }
 }
 
+#[cfg(feature = "sqlite")]
 impl EmbeddingCache for DocumentEmbeddingSource<'_> {
     fn get(&self, hash: &str) -> Result<Option<CachedEmbeddings>> {
         self.cache.get(hash)
@@ -1775,6 +1798,7 @@ impl EmbeddingCache for DocumentEmbeddingSource<'_> {
     }
 }
 
+#[cfg(feature = "sqlite")]
 fn unmaterialized_embedding_count(
     db: &DB,
     index: &FileBackedIndex,
@@ -1987,6 +2011,7 @@ pub(crate) fn compute_cached_embeddings(
     })
 }
 
+#[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
 pub(crate) fn load_or_compute_cached_embeddings(
     cache: &dyn EmbeddingCache,
     rowid: u64,
@@ -2006,6 +2031,7 @@ pub(crate) fn load_or_compute_cached_embeddings(
     Ok((embeddings, true))
 }
 
+#[cfg(feature = "sqlite")]
 pub fn embed_chunks_with_cache(
     db: &DB,
     embedder: &Embedder,
@@ -2076,17 +2102,20 @@ pub fn embed_chunks_with_cache(
     Ok(count)
 }
 
+#[cfg(feature = "sqlite")]
 pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
     let cache = default_embedding_cache();
     embed_chunks_with_cache(db, embedder, &cache, limit)
 }
 
+#[cfg(feature = "sqlite")]
 pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
     let cache = default_embedding_cache();
     let index = file_index_for_db(db);
     unmaterialized_embedding_count(db, &index, &cache, None)
 }
 
+#[cfg(feature = "sqlite")]
 pub fn count_unindexed_embeddings_with_cache(
     db: &DB,
     embedder: &Embedder,
@@ -2101,11 +2130,13 @@ pub fn count_unindexed_embeddings_with_cache(
     )
 }
 
+#[cfg(feature = "sqlite")]
 pub fn count_unindexed_cached_embeddings(db: &DB, cache: &dyn EmbeddingCache) -> Result<usize> {
     let index = file_index_for_db(db);
     unmaterialized_embedding_count(db, &index, cache, None)
 }
 
+#[cfg(feature = "sqlite")]
 fn cached_embeddings_for_document(
     cache: &dyn EmbeddingCache,
     embedder: Option<&Embedder>,
@@ -2395,6 +2426,7 @@ pub(crate) fn index_file_backed(
     Ok(())
 }
 
+#[cfg(feature = "sqlite")]
 pub fn index_chunks(
     db: &DB,
     device: &Device,
@@ -2453,6 +2485,7 @@ impl EmbeddingsCache {
     }
 }
 
+#[cfg(feature = "sqlite")]
 pub fn search(
     db: &DB,
     embedder: &Embedder,
@@ -2580,6 +2613,7 @@ pub fn search(
     Ok(results)
 }
 
+#[cfg(feature = "sqlite")]
 pub fn search_rowids(
     db: &DB,
     embedder: &Embedder,
@@ -2605,6 +2639,7 @@ pub fn search_rowids(
     )
 }
 
+#[cfg(feature = "sqlite")]
 pub fn search_cached_rowids_with_cache(
     db: &DB,
     embedder: &Embedder,
@@ -2630,6 +2665,7 @@ pub fn search_cached_rowids_with_cache(
     )
 }
 
+#[cfg(feature = "sqlite")]
 fn search_rowids_inner(
     db: &DB,
     embedder: &Embedder,
@@ -2803,5 +2839,5 @@ fn test_compress_decompress_keys_roundtrip() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests;

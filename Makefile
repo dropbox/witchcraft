@@ -12,14 +12,16 @@ ENCODER ?= t5-quantized
 ifeq ($(UNAME_S),Darwin)
   ifeq ($(UNAME_M),arm64)
     # Apple Silicon: Metal GPU + Accelerate BLAS
-    CLI_FEATURES := $(ENCODER),metal,progress
+    CLI_FEATURES := $(ENCODER),metal,progress,sqlite
+    CAPI_FEATURES := $(ENCODER),metal,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),metal,napi
     PYTHON_FEATURES := $(ENCODER),metal,python
     RUSTFLAGS_EXTRA :=
     TARGET := aarch64-apple-darwin
   else
     # Intel Mac: CPU-only with FBGEMM + hybrid-dequant
-    CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress
+    CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress,sqlite
+    CAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
     PYTHON_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,python
     RUSTFLAGS_EXTRA := -C target-feature=+avx2,+fma
@@ -29,17 +31,20 @@ ifeq ($(UNAME_S),Darwin)
 else ifeq ($(UNAME_S),Linux)
   NVCC := $(or $(shell which nvcc 2>/dev/null),$(wildcard /usr/local/cuda/bin/nvcc),$(wildcard /opt/cuda/bin/nvcc))
   ifneq ($(NVCC),)
-    CLI_FEATURES := $(ENCODER),cuda,progress
+    CLI_FEATURES := $(ENCODER),cuda,progress,sqlite
+    CAPI_FEATURES := $(ENCODER),cuda,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),cuda,napi
     PYTHON_FEATURES := $(ENCODER),cuda,python
   else ifeq ($(UNAME_M),aarch64)
     # Linux ARM (Graviton, Pi, Ampere): fbgemm/hybrid-dequant are x86-only
     CLI_FEATURES := $(ENCODER),progress
+    CAPI_FEATURES := $(ENCODER),capi-embed-cache
     NAPI_FEATURES := $(ENCODER),napi
     PYTHON_FEATURES := $(ENCODER),python
   else
     # Linux x86_64 CPU-only
     CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress
+    CAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
     PYTHON_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,python
   endif
@@ -69,7 +74,7 @@ PYTEST := $(VENV_DIR)/bin/pytest
 PYTHON_TEST_ARGS ?= python/test_witchcraft.py
 
 LINUX_X86_TARGET ?= x86_64-unknown-linux-gnu
-LINUX_X86_DYLIB_FEATURES ?= $(ENCODER),fbgemm,hybrid-dequant
+LINUX_X86_DYLIB_FEATURES ?= $(ENCODER),fbgemm,hybrid-dequant,capi-embed-cache
 LINUX_X86_DYLIB := target/$(LINUX_X86_TARGET)/release/libwitchcraft.so
 
 # === Prerequisites ===
@@ -175,7 +180,7 @@ warp-cli: prereqs download
 	ln -sf $(CLI_BIN) ./warp-cli
 
 dylib: prereqs download
-	cargo build --release --features $(CLI_FEATURES)$(if $(EXTRA_FEATURES),$(comma)$(EXTRA_FEATURES)) --lib
+	cargo build --release --features $(CAPI_FEATURES)$(if $(EXTRA_FEATURES),$(comma)$(EXTRA_FEATURES)) --lib
 
 pickbrain: prereqs download
 	cargo build --release $(BUILD_TARGET) --features $(PICKBRAIN_FEATURES) --example pickbrain
