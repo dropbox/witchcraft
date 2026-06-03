@@ -668,7 +668,9 @@ pub fn ingest_claude_code(db: &mut DB, skip_session: Option<&str>) -> Result<(us
     let projects_dir = PathBuf::from(&home).join(".claude/projects");
 
     if !projects_dir.is_dir() {
-        println!("no Claude Code projects found at {}", projects_dir.display());
+        if !crate::quiet() {
+            println!("no Claude Code projects found at {}", projects_dir.display());
+        }
         return Ok((0, 0, 0, 0));
     }
 
@@ -715,7 +717,7 @@ pub fn ingest_claude_code(db: &mut DB, skip_session: Option<&str>) -> Result<(us
                 }
             }
             let mtime_ms = file_mtime_ms(jsonl_path).unwrap_or(0);
-            println!("{}", jsonl_path.display());
+            crate::print_ingest_path(&jsonl_path);
             for p in extract_written_paths(jsonl_path) {
                 if p.extension().is_some_and(|ext| ext == "md") && p.is_file() {
                     authored_paths.insert(p);
@@ -744,7 +746,7 @@ pub fn ingest_claude_code(db: &mut DB, skip_session: Option<&str>) -> Result<(us
                 if !watermark::file_newer_than(md_path, wm_ts) {
                     continue;
                 }
-                println!("{}", md_path.display());
+                crate::print_ingest_path(md_path);
                 ingested_paths.insert(md_path.clone());
                 let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
                 match ingest_memory_file(db, md_path, &project_name, mtime_ms) {
@@ -765,7 +767,7 @@ pub fn ingest_claude_code(db: &mut DB, skip_session: Option<&str>) -> Result<(us
                 continue;
             }
             let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
-            println!("{}", md_path.display());
+            crate::print_ingest_path(md_path);
             ingested_paths.insert(md_path.clone());
             match ingest_authored_file(db, md_path, &project_name, mtime_ms) {
                 Ok(true) => authored_count += 1,
@@ -786,7 +788,7 @@ pub fn ingest_claude_code(db: &mut DB, skip_session: Option<&str>) -> Result<(us
                 continue;
             }
             let mtime_ms = file_mtime_ms(&config_path).unwrap_or(0);
-            println!("{}", config_path.display());
+            crate::print_ingest_path(&config_path);
             match ingest_authored_file(db, &config_path, &project_name, mtime_ms) {
                 Ok(true) => config_count += 1,
                 Ok(false) => {}

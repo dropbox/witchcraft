@@ -36,6 +36,18 @@ fn pickbrain_dir_overridden() -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn quiet() -> bool {
+    env::var("PICKBRAIN_QUIET")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+pub(crate) fn print_ingest_path(path: &std::path::Path) {
+    if !quiet() {
+        println!("{}", path.display());
+    }
+}
+
 pub(crate) fn pickbrain_dir() -> PathBuf {
     if let Ok(dir) = env::var(PICKBRAIN_DIR_ENV) {
         if !dir.trim().is_empty() {
@@ -310,12 +322,16 @@ fn ingest(db_name: &PathBuf, skip_session: Option<&str>, stale_ms: i64, types: &
 
     let total = sessions + memories + authored + configs + codex_sessions + pi_sessions + slack_conversations;
     if total == 0 {
-        eprintln!("No new sessions to ingest.");
+        if !quiet() {
+            eprintln!("No new sessions to ingest.");
+        }
         return Ok(false);
     }
-    eprintln!(
-        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {pi_sessions} pi sessions, {slack_conversations} slack conversations, {memories} memory files, {authored} authored files, {configs} config files"
-    );
+    if !quiet() {
+        eprintln!(
+            "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {pi_sessions} pi sessions, {slack_conversations} slack conversations, {memories} memory files, {authored} authored files, {configs} config files"
+        );
+    }
     Ok(true)
 }
 
@@ -1999,6 +2015,7 @@ fn main() -> Result<()> {
                 eprintln!("  --session ID         search within a session, channel, or thread");
                 eprintln!("  --since 24h|7d|2w    only search recent history");
                 eprintln!("  --type claude,codex,pi,slack  filter by source");
+                eprintln!("  --quiet              suppress ingest progress output");
                 eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
                 eprintln!("  --dm                 only DMs (Slack)");
                 eprintln!("  --no-dm              exclude DMs (Slack)");
@@ -2009,6 +2026,9 @@ fn main() -> Result<()> {
                 eprintln!("Environment:");
                 eprintln!("  PICKBRAIN_DIR        override the pickbrain DB and state directory");
                 std::process::exit(0);
+            }
+            "--quiet" => {
+                std::env::set_var("PICKBRAIN_QUIET", "1");
             }
             "--nuke" => {
                 let db_name = db_path();

@@ -399,7 +399,7 @@ pub fn ingest_codex(db: &mut DB) -> Result<usize> {
         let mtime_ms = file_mtime_ms(&jsonl_path).unwrap_or(0);
         let sid = session_id_from_filename(&jsonl_path);
         let name = session_names.get(&sid).map(|s| s.as_str());
-        println!("{}", jsonl_path.display());
+        crate::print_ingest_path(&jsonl_path);
         match ingest_session(db, &jsonl_path, mtime_ms, name) {
             Ok(n) => session_count += n,
             Err(e) => {

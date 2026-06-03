@@ -424,7 +424,7 @@ pub fn ingest_pi(db: &mut DB, skip_session: Option<&str>) -> Result<usize> {
             continue;
         }
         let mtime_ms = file_mtime_ms(&jsonl_path).unwrap_or(0);
-        println!("{}", jsonl_path.display());
+        crate::print_ingest_path(&jsonl_path);
         match ingest_session(db, &jsonl_path, mtime_ms) {
             Ok(n) => session_count += n,
             Err(e) => {

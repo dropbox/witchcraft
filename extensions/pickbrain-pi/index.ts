@@ -6,12 +6,27 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 
 const MAX_OUTPUT_BYTES = 50 * 1024;
+const DEFAULT_RESULTS = 5;
 
 type RunResult = {
 	stdout: string;
 	stderr: string;
 	code: number | null;
 	truncated: boolean;
+};
+
+type PickbrainParams = {
+	query?: string;
+	current?: boolean;
+	excludeCurrent?: boolean;
+	session?: string;
+	type?: string;
+	since?: string;
+	branch?: string;
+	numResults?: number;
+	dump?: string;
+	turns?: string;
+	allSources?: boolean;
 };
 
 function truncateOutput(text: string): { text: string; truncated: boolean } {
@@ -45,7 +60,7 @@ function runPickbrain(
 	return new Promise((resolve, reject) => {
 		const child = spawn(pickbrainCommand(), args, {
 			cwd,
-			env: { ...process.env, ...env },
+			env: { ...process.env, PICKBRAIN_QUIET: "1", ...env },
 		});
 
 		let stdout = "";
@@ -99,41 +114,64 @@ function renderResult(result: RunResult): string {
 	return parts.join("\n").trim() || "pickbrain returned no output";
 }
 
+function addDefaultScope(args: string[], params: PickbrainParams) {
+	if (params.dump || params.allSources) return;
+	if (params.type) {
+		if (params.type !== "all") args.push("--type", params.type);
+		return;
+	}
+	args.push("--type", "pi");
+}
+
+function buildArgs(params: PickbrainParams): string[] {
+	const args: string[] = ["--quiet"];
+	if (params.current) args.push("--current");
+	if (params.excludeCurrent) args.push("--exclude-current");
+	if (params.session) args.push("--session", params.session);
+	if (params.since) args.push("--since", params.since);
+	if (params.branch) args.push("--branch", params.branch);
+	if (typeof params.numResults === "number") args.push("-n", String(params.numResults));
+	else if (!params.dump) args.push("-n", String(DEFAULT_RESULTS));
+	if (params.dump) args.push("--dump", params.dump);
+	if (params.turns) args.push("--turns", params.turns);
+	addDefaultScope(args, params);
+	if (params.query) args.push(params.query);
+	return args;
+}
+
+function parseSlashArgs(raw: string): string[] {
+	const text = raw.trim();
+	if (!text) return ["--quiet", "--type", "pi", "-n", String(DEFAULT_RESULTS)];
+	if (text.startsWith("-")) return ["--quiet", ...text.split(/\s+/)];
+	return ["--quiet", "--type", "pi", "-n", String(DEFAULT_RESULTS), text];
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "pickbrain_search",
 		label: "Pickbrain",
 		description:
-			"Semantic search over past Pi, Claude Code, Codex, and Slack conversations. Use for recalling previous coding-agent sessions, dumping sessions, or searching history.",
-		promptSnippet: "Search previous Pi/Claude/Codex/Slack conversations with pickbrain semantic search",
+			"Semantic search over past Pi, Claude Code, Codex, and Slack conversations. Defaults to Pi sessions; set type or allSources for broader search.",
+		promptSnippet: "Search previous Pi coding sessions with pickbrain semantic search",
 		promptGuidelines: [
-			"Use pickbrain_search when the user asks to recall, find, or reference a previous Pi, Claude Code, Codex, or Slack conversation.",
+			"Use pickbrain_search when the user asks to recall, find, or reference a previous Pi coding session.",
+			"pickbrain_search defaults to Pi sessions. Set type to claude, codex, slack, or a comma-separated list only when the user asks to search outside Pi.",
 		],
 		parameters: Type.Object({
 			query: Type.Optional(Type.String({ description: "Search query. May be omitted with filters to browse recent matches." })),
 			current: Type.Optional(Type.Boolean({ description: "Search only the current Pi session." })),
 			excludeCurrent: Type.Optional(Type.Boolean({ description: "Exclude the current Pi session." })),
 			session: Type.Optional(Type.String({ description: "Session id, Slack channel, or thr:<timestamp> to search within." })),
-			type: Type.Optional(Type.String({ description: "Source filter, e.g. pi, claude, codex, slack, or comma-separated." })),
+			type: Type.Optional(Type.String({ description: "Source filter, e.g. pi, claude, codex, slack, all, or comma-separated." })),
+			allSources: Type.Optional(Type.Boolean({ description: "Search all sources instead of defaulting to Pi sessions." })),
 			since: Type.Optional(Type.String({ description: "Recent-history filter like 24h, 7d, or 2w." })),
 			branch: Type.Optional(Type.String({ description: "Git branch filter. Use . for the current branch." })),
-			numResults: Type.Optional(Type.Number({ description: "Number of results. 0 means unlimited." })),
+			numResults: Type.Optional(Type.Number({ description: `Number of results. Defaults to ${DEFAULT_RESULTS}; 0 means unlimited.` })),
 			dump: Type.Optional(Type.String({ description: "Dump this session/channel/thread id instead of searching." })),
 			turns: Type.Optional(Type.String({ description: "Turn range for dumps, e.g. 2-5." })),
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const args: string[] = [];
-			if (params.current) args.push("--current");
-			if (params.excludeCurrent) args.push("--exclude-current");
-			if (params.session) args.push("--session", params.session);
-			if (params.type) args.push("--type", params.type);
-			if (params.since) args.push("--since", params.since);
-			if (params.branch) args.push("--branch", params.branch);
-			if (typeof params.numResults === "number") args.push("-n", String(params.numResults));
-			if (params.dump) args.push("--dump", params.dump);
-			if (params.turns) args.push("--turns", params.turns);
-			if (params.query) args.push(params.query);
-
+			const args = buildArgs(params as PickbrainParams);
 			const result = await runPickbrain(args, ctx.cwd, sessionEnv(ctx), signal);
 			const text = renderResult(result);
 			return {
@@ -144,9 +182,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("pickbrain", {
-		description: "Run pickbrain with the current Pi session in the environment",
+		description: "Search prior Pi sessions with pickbrain (use flags to override)",
 		handler: async (args, ctx) => {
-			const argv = args.trim() ? args.trim().split(/\s+/) : [];
+			const argv = parseSlashArgs(args);
 			const result = await runPickbrain(argv, ctx.cwd, sessionEnv(ctx), ctx.signal);
 			pi.sendMessage(
 				{
