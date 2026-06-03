@@ -1,6 +1,6 @@
 use crate::{
-    compute_cached_embeddings, index_file_backed, match_centroids_raw, CachedEmbeddings, Embedder,
-    EmbeddingCache, EmbeddingsCache, FileBackedIndex,
+    index_file_backed, match_centroids_raw, CachedEmbeddings, Embedder, EmbeddingCache,
+    EmbeddingsCache, FileBackedIndex,
 };
 use anyhow::{anyhow, Result};
 use std::ffi::{CStr, CString};
@@ -242,6 +242,21 @@ fn decode_embedding_blob(bytes: &[u8]) -> Result<CachedEmbeddings> {
     })
 }
 
+fn embed_for_capi(embedder: &Embedder, body_text: &str, lens: &str) -> Result<CachedEmbeddings> {
+    #[cfg(feature = "capi-embed-cache")]
+    {
+        let cache = crate::default_embedding_cache();
+        let hash = crate::document_cache_hash(body_text, lens);
+        let (embeddings, _computed) =
+            crate::load_or_compute_cached_embeddings(&cache, 0, &hash, body_text, lens, embedder)?;
+        Ok(embeddings)
+    }
+    #[cfg(not(feature = "capi-embed-cache"))]
+    {
+        crate::compute_cached_embeddings(embedder, body_text, lens)
+    }
+}
+
 fn embedding_blob_row_count(bytes: &[u8]) -> Result<u32> {
     let mut offset = 0usize;
     let magic = read_bytes(bytes, &mut offset, EMBEDDING_BLOB_MAGIC.len())?;
@@ -406,7 +421,7 @@ pub unsafe extern "C" fn witchcraft_embed(
             .state
             .lock()
             .map_err(|_| anyhow!("witchcraft handle lock poisoned"))?;
-        let embeddings = compute_cached_embeddings(&state.embedder, &body_text, &lens)?;
+        let embeddings = embed_for_capi(&state.embedder, &body_text, &lens)?;
         encode_embedding_blob(&embeddings)
     }));
 

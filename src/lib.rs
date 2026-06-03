@@ -1987,7 +1987,7 @@ pub(crate) fn compute_cached_embeddings(
     })
 }
 
-fn load_or_compute_cached_embeddings(
+pub(crate) fn load_or_compute_cached_embeddings(
     cache: &dyn EmbeddingCache,
     rowid: u64,
     hash: &str,
@@ -2000,7 +2000,9 @@ fn load_or_compute_cached_embeddings(
     }
 
     let embeddings = compute_cached_embeddings(embedder, body, lens)?;
-    cache.put(hash, &embeddings)?;
+    if load_cached_embeddings(cache, rowid, hash)?.is_none() {
+        cache.put(hash, &embeddings)?;
+    }
     Ok((embeddings, true))
 }
 
