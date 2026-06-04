@@ -2412,7 +2412,10 @@ pub(crate) fn index_buffered_embeddings(
         }
     }
 
-    let merged = nway_merge_rowid_records(&inputs);
+    let mut merged = nway_merge_rowid_records(&inputs);
+    if kept_generations.is_empty() {
+        merged.retain(|record| record.rows > 0);
+    }
     if let Some(generation) =
         build_index_generation(index, device, cache, target_level, &merged)?
     {
