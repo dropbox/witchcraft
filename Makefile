@@ -66,16 +66,19 @@ EXTRA_FEATURES :=
 comma := ,
 export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
 
-
 VENV_DIR := $(abspath env)
 PYTHON_BIN := $(VENV_DIR)/bin/python
 MATURIN := $(VENV_DIR)/bin/maturin
 PYTEST := $(VENV_DIR)/bin/pytest
 PYTHON_TEST_ARGS ?= python/test_witchcraft.py
 
-LINUX_X86_TARGET ?= x86_64-unknown-linux-gnu
-LINUX_X86_DYLIB_FEATURES ?= $(ENCODER),fbgemm,hybrid-dequant,capi-embed-cache
-LINUX_X86_DYLIB := target/$(LINUX_X86_TARGET)/release/libwitchcraft.so
+ifeq ($(UNAME_S),Darwin)
+  CAPI_LIB := target/release/libwitchcraft.dylib
+else ifeq ($(UNAME_S),Linux)
+  CAPI_LIB := target/release/libwitchcraft.so
+else
+  CAPI_LIB := target/release/witchcraft.dll
+endif
 
 # === Prerequisites ===
 
@@ -91,26 +94,6 @@ prereqs:
 		echo "Install uv and the Rust toolchain, then rerun make." >&2; \
 		exit 1; \
 	fi
-
-linux-cross-prereqs: prereqs
-	@missing=0; \
-	for tool in zig cargo-zigbuild; do \
-		if ! command -v $$tool >/dev/null 2>&1; then \
-			echo "missing required Linux cross-build tool: $$tool" >&2; \
-			missing=1; \
-		fi; \
-	done; \
-	if [ $$missing -ne 0 ]; then \
-		echo "Install with:" >&2; \
-		echo "  brew install zig" >&2; \
-		echo "  cargo install cargo-zigbuild" >&2; \
-		echo "Then rerun make x86-linux-dylib." >&2; \
-		exit 1; \
-	fi
-
-install-linux-cross-prereqs: prereqs
-	brew install zig
-	cargo install cargo-zigbuild
 
 # === Python environment ===
 
@@ -181,6 +164,7 @@ warp-cli: prereqs download
 
 dylib: prereqs download
 	cargo build --release --features $(CAPI_FEATURES)$(if $(EXTRA_FEATURES),$(comma)$(EXTRA_FEATURES)) --lib
+	ln -sf $(CAPI_LIB) ./$(notdir $(CAPI_LIB))
 
 pickbrain: prereqs download
 	cargo build --release $(BUILD_TARGET) --features $(PICKBRAIN_FEATURES) --example pickbrain
@@ -202,10 +186,6 @@ winintel: prereqs ovdownload
 	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features t5-openvino,fbgemm,progress,sqlite
 
 win: winintel
-
-x86-linux-dylib: linux-cross-prereqs
-	RUSTFLAGS='-C target-cpu=haswell' cargo zigbuild --release --target $(LINUX_X86_TARGET) --features $(LINUX_X86_DYLIB_FEATURES) --lib
-	ln -sf $(LINUX_X86_DYLIB) ./libwitchcraft-linux-x86_64.so
 
 ifdef TARGET
   LIB_BIN := target/$(TARGET)/release/libwitchcraft.dylib
@@ -286,8 +266,6 @@ distclean:
 	distclean \
 	download \
 	dylib \
-	install-linux-cross-prereqs \
-	linux-cross-prereqs \
 	macintel \
 	modernbert-assets \
 	modernbert-quantized-assets \
@@ -307,5 +285,4 @@ distclean:
 	test \
 	warp-cli \
 	win \
-	winintel \
-	x86-linux-dylib
+	winintel

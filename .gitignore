@@ -2,6 +2,9 @@ target
 warp.node
 warp-cli
 /pickbrain
+libwitchcraft.dylib
+libwitchcraft.so
+witchcraft.dll
 .claude/
 
 # Uncompressed OpenVINO model files (large, not versioned)
