@@ -45,8 +45,15 @@ pub struct WitchcraftBytes {
 }
 
 #[repr(C)]
-pub struct WitchcraftRowids {
-    pub ptr: *mut u64,
+#[derive(Clone, Copy)]
+pub struct WitchcraftSearchHit {
+    pub rowid: u64,
+    pub score: f32,
+}
+
+#[repr(C)]
+pub struct WitchcraftSearchResults {
+    pub ptr: *mut WitchcraftSearchHit,
     pub len: usize,
     pub status: i32,
 }
@@ -129,23 +136,23 @@ fn bytes_result(bytes: Vec<u8>) -> WitchcraftBytes {
     }
 }
 
-fn empty_rowids(status: i32) -> WitchcraftRowids {
-    WitchcraftRowids {
+fn empty_search_results(status: i32) -> WitchcraftSearchResults {
+    WitchcraftSearchResults {
         ptr: ptr::null_mut(),
         len: 0,
         status,
     }
 }
 
-fn rowids_result(rowids: Vec<u64>) -> WitchcraftRowids {
-    if rowids.is_empty() {
-        return empty_rowids(0);
+fn search_results_result(results: Vec<WitchcraftSearchHit>) -> WitchcraftSearchResults {
+    if results.is_empty() {
+        return empty_search_results(0);
     }
-    let mut rowids = rowids.into_boxed_slice();
-    let ptr = rowids.as_mut_ptr();
-    let len = rowids.len();
-    std::mem::forget(rowids);
-    WitchcraftRowids {
+    let mut results = results.into_boxed_slice();
+    let ptr = results.as_mut_ptr();
+    let len = results.len();
+    std::mem::forget(results);
+    WitchcraftSearchResults {
         ptr,
         len,
         status: 0,
@@ -517,16 +524,16 @@ pub unsafe extern "C" fn witchcraft_search(
     query_len: usize,
     threshold: f32,
     top_k: usize,
-) -> WitchcraftRowids {
+) -> WitchcraftSearchResults {
     let handle = match handle_ref(handle) {
         Ok(handle) => handle,
         Err(err) => {
             set_global_error(err);
-            return empty_rowids(-1);
+            return empty_search_results(-1);
         }
     };
 
-    let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u64>> {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<WitchcraftSearchHit>> {
         let query = string_from_utf8_ptr(query, query_len, "query")?;
         let mut state = handle
             .state
@@ -554,34 +561,34 @@ pub unsafe extern "C" fn witchcraft_search(
         let generation_files = index.generation_files()?;
         let active = index.active_rowids()?;
         let scored = match_centroids_raw(&generation_files, &qe.to_device(device)?, &[], threshold, top_k)?;
-        let mut rowids = Vec::with_capacity(scored.len());
+        let mut results = Vec::with_capacity(scored.len());
         let mut seen = std::collections::HashMap::<u64, bool>::new();
-        for (_score, rowid, _sub_idx) in scored {
+        for (score, rowid, _sub_idx) in scored {
             let rowid = rowid as u64;
             if active.get(&rowid).copied().unwrap_or(false)
                 && seen.insert(rowid, true).is_none()
             {
-                rowids.push(rowid);
-                if rowids.len() == top_k {
+                results.push(WitchcraftSearchHit { rowid, score });
+                if results.len() == top_k {
                     break;
                 }
             }
         }
-        Ok(rowids)
+        Ok(results)
     }));
 
     match result {
-        Ok(Ok(rowids)) => {
+        Ok(Ok(results)) => {
             clear_handle_error(handle);
-            rowids_result(rowids)
+            search_results_result(results)
         }
         Ok(Err(err)) => {
             set_handle_error(handle, err);
-            empty_rowids(-1)
+            empty_search_results(-1)
         }
         Err(_) => {
             set_handle_error(handle, "panic while searching");
-            empty_rowids(-1)
+            empty_search_results(-1)
         }
     }
 }
@@ -596,7 +603,7 @@ pub unsafe extern "C" fn witchcraft_bytes_free(ptr: *mut u8, len: usize) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn witchcraft_rowids_free(ptr: *mut u64, len: usize) {
+pub unsafe extern "C" fn witchcraft_search_results_free(ptr: *mut WitchcraftSearchHit, len: usize) {
     if ptr.is_null() {
         return;
     }

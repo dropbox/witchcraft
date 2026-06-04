@@ -1054,7 +1054,8 @@ mod tests {
         Ok(())
     }
 
-    fn test_capi_add_search_rowids() -> anyhow::Result<()> {
+    #[test]
+    fn test_capi_add_search_results() -> anyhow::Result<()> {
         use std::ffi::{CStr, CString};
         use std::os::raw::c_void;
 
@@ -1161,12 +1162,13 @@ mod tests {
                 10,
             );
             assert_eq!(result.status, 0, "{}", last_error(handle));
-            let rowids = std::slice::from_raw_parts(result.ptr, result.len).to_vec();
-            crate::capi::witchcraft_rowids_free(result.ptr, result.len);
+            let hits = std::slice::from_raw_parts(result.ptr, result.len).to_vec();
+            crate::capi::witchcraft_search_results_free(result.ptr, result.len);
             crate::capi::witchcraft_close(handle);
 
             assert!(store.callback_calls > 0);
-            assert_eq!(rowids.first(), Some(&42));
+            assert_eq!(hits.first().map(|hit| hit.rowid), Some(42));
+            assert!(hits.first().map(|hit| hit.score.is_finite()).unwrap_or(false));
         }
 
         Ok(())
