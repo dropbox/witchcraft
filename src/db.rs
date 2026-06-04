@@ -189,6 +189,30 @@ impl DB {
         Ok(())
     }
 
+    fn ensure_document_index_tombstone_schema(connection: &Connection) -> SQLResult<()> {
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS document_index_tombstone(
+                 rowid INTEGER NOT NULL PRIMARY KEY
+             );
+
+             CREATE TRIGGER IF NOT EXISTS document_index_tombstone_delete
+             AFTER DELETE ON document
+             BEGIN
+                 INSERT OR IGNORE INTO document_index_tombstone(rowid)
+                     VALUES(old.rowid);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS document_index_tombstone_rowid_update
+             AFTER UPDATE ON document
+             WHEN old.rowid != new.rowid
+             BEGIN
+                 INSERT OR IGNORE INTO document_index_tombstone(rowid)
+                     VALUES(old.rowid);
+             END;",
+        )?;
+        Ok(())
+    }
+
     pub fn new_reader(db_fn: PathBuf) -> SQLResult<Self> {
         let connection =
             Connection::open_with_flags(db_fn.clone(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -238,6 +262,7 @@ impl DB {
         if first_creation {
             Self::create_schema(&connection)?;
         }
+        Self::ensure_document_index_tombstone_schema(&connection)?;
 
         Ok(Self {
             db_fn,
@@ -261,6 +286,7 @@ impl DB {
 
     fn clear_inner(&mut self) -> SQLResult<()> {
         self.execute("DELETE FROM document")?;
+        self.execute("DELETE FROM document_index_tombstone")?;
         self.remove_all_bucket_data_sidecars();
         self.execute("VACUUM")?;
         Ok(())

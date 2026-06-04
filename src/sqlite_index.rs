@@ -1,4 +1,6 @@
-use crate::file_index::{active_rowid_records, FileBackedIndex, RowidRecord};
+use crate::file_index::{
+    active_rowid_records, sort_dedup_rowid_records, FileBackedIndex, RowidRecord,
+};
 use crate::packops::TensorPackOps;
 use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
@@ -238,6 +240,39 @@ fn pending_rowid_records(
     }
     pending.sort_unstable_by_key(|record| record.rowid);
     Ok(pending)
+}
+
+fn queued_document_tombstones(db: &DB) -> Result<(Vec<RowidRecord>, Vec<u64>)> {
+    let mut query = db.query(
+        "SELECT document_index_tombstone.rowid
+         FROM document_index_tombstone
+         LEFT JOIN document ON document.rowid = document_index_tombstone.rowid
+         WHERE document.rowid IS NULL
+         ORDER BY document_index_tombstone.rowid",
+    )?;
+    let rows = query.query_map((), |row| row.get::<_, i64>(0))?;
+
+    let mut records = vec![];
+    let mut queued = vec![];
+    for row in rows {
+        let rowid: u64 = row?.try_into()?;
+        queued.push(rowid);
+        records.push(RowidRecord { rowid, rows: 0 });
+    }
+    Ok((records, queued))
+}
+
+fn clear_queued_document_tombstones(db: &DB, rowids: &[u64]) -> Result<()> {
+    if rowids.is_empty() {
+        return Ok(());
+    }
+
+    let mut statement = db.query("DELETE FROM document_index_tombstone WHERE rowid = ?1")?;
+    for rowid in rowids {
+        let rowid: i64 = (*rowid).try_into()?;
+        statement.execute((rowid,))?;
+    }
+    Ok(())
 }
 
 struct DocumentEmbeddingSource<'a> {
@@ -559,14 +594,19 @@ pub fn index_chunks(
 
     let current = current_document_rowid_plan(db, cache, embedder)?;
     let unmaterialized = unmaterialized_embedding_count(&index, &current.records)?;
-    let pending = pending_rowid_records(&index, &current.records)?;
+    let mut pending = pending_rowid_records(&index, &current.records)?;
+    let (queued_tombstones, queued_tombstone_rowids) = queued_document_tombstones(db)?;
+    pending.extend(queued_tombstones);
+    let pending = sort_dedup_rowid_records(pending);
     if pending.is_empty() && unmaterialized == 0 {
+        clear_queued_document_tombstones(db, &queued_tombstone_rowids)?;
         return Ok(());
     }
 
     for record in &pending {
         index.append_rowid_record(record.rowid, record.rows)?;
     }
+    clear_queued_document_tombstones(db, &queued_tombstone_rowids)?;
 
     let x = unmaterialized;
     let indexed = index.indexed_embedding_count()?;

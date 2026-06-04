@@ -715,6 +715,66 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_tombstone_trigger_is_transactional() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("delete_tombstone.sqlite");
+        let mut db = DB::new(path)?;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"delete-tombstone");
+        db.add_doc(None, &uuid, None, "{}", "delete me", None)?;
+
+        db.begin_transaction()?;
+        db.execute("DELETE FROM document WHERE rowid = 1")?;
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 1);
+        db.rollback_transaction()?;
+
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 0);
+
+        db.begin_transaction()?;
+        db.execute("DELETE FROM document WHERE rowid = 1")?;
+        db.commit_transaction()?;
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 1);
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_tombstones_drain_into_file_index() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("delete_drain.sqlite");
+        let mut db = DB::new(path.clone())?;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"delete-drain");
+        db.add_doc(None, &uuid, None, "{}", "delete me", None)?;
+        db.remove_doc(&uuid)?;
+
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 1);
+
+        let cache = crate::default_embedding_cache();
+        crate::index_chunks(&db, &candle_core::Device::Cpu, &cache, None, false)?;
+
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 0);
+
+        let index = crate::file_index::FileBackedIndex::new(path.clone());
+        let active = index.active_rowids()?;
+        assert_eq!(active.get(&1), Some(&false));
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
     fn test_add_docs_with_explicit_rowids() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("rowid_test.sqlite");
