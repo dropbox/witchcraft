@@ -111,7 +111,7 @@ mod sqlite_index;
 pub use sqlite_index::{
     count_unindexed_cached_embeddings, count_unindexed_embeddings,
     count_unindexed_embeddings_with_cache, embed_chunks, embed_chunks_with_cache, fulltext_search,
-    index_chunks, match_centroids, match_centroids_with_cache, search,
+    index_chunks, index_chunks_with_cache, match_centroids, match_centroids_with_cache, search,
     search_cached_rowids_with_cache, search_rowids,
 };
 #[cfg(all(test, feature = "sqlite"))]

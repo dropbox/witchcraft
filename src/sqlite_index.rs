@@ -5,7 +5,7 @@ use crate::packops::TensorPackOps;
 use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
-    cached_embeddings_for_rowid, clear_generations_cache, default_embedding_cache,
+    cached_embeddings_for_rowid, clear_generations_cache,
     dim_from_model_id, docptrs_for_counts, document_cache_hash, index_buffered_embeddings,
     hybrid_reciprocal_rank_fusion, load_cached_embeddings, load_or_compute_cached_embeddings,
     match_centroids_raw, reciprocal_rank_fusion, split_by_codepoints, CachedEmbeddings, DB,
@@ -17,6 +17,94 @@ use log::{debug, info, warn};
 use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 
+struct SqliteEmbeddingCache<'a> {
+    db: &'a DB,
+}
+
+impl<'a> SqliteEmbeddingCache<'a> {
+    fn new(db: &'a DB) -> Self {
+        Self { db }
+    }
+}
+
+impl EmbeddingCache for SqliteEmbeddingCache<'_> {
+    fn get(&self, hash: &str) -> Result<Option<CachedEmbeddings>> {
+        let mut query = self.db.query(
+            "SELECT model, counts, embedding_count, embeddings
+             FROM chunk
+             WHERE hash = ?1",
+        )?;
+        let cached = query
+            .query_row((hash,), |row| {
+                Ok(CachedEmbeddings {
+                    model: row.get(0)?,
+                    counts: row.get(1)?,
+                    embedding_count: row.get::<_, i64>(2)?.try_into().map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            Box::new(err),
+                        )
+                    })?,
+                    embeddings: row.get(3)?,
+                })
+            })
+            .optional()?;
+        Ok(cached)
+    }
+
+    fn get_for_document(&self, rowid: u64, hash: &str) -> Result<Option<CachedEmbeddings>> {
+        if !hash.is_empty() {
+            return self.get(hash);
+        }
+
+        let rowid: i64 = rowid.try_into()?;
+        let mut query = self.db.query(
+            "SELECT chunk.model, chunk.counts, chunk.embedding_count, chunk.embeddings
+             FROM document, chunk
+             WHERE document.hash = chunk.hash
+             AND document.rowid = ?1",
+        )?;
+        let cached = query
+            .query_row((rowid,), |row| {
+                Ok(CachedEmbeddings {
+                    model: row.get(0)?,
+                    counts: row.get(1)?,
+                    embedding_count: row.get::<_, i64>(2)?.try_into().map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Integer,
+                            Box::new(err),
+                        )
+                    })?,
+                    embeddings: row.get(3)?,
+                })
+            })
+            .optional()?;
+        Ok(cached)
+    }
+
+    fn put(&self, hash: &str, embeddings: &CachedEmbeddings) -> Result<()> {
+        let mut statement = self.db.query(
+            "INSERT INTO chunk(hash, model, embeddings, counts, embedding_count)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(hash) DO UPDATE SET
+                 model = excluded.model,
+                 embeddings = excluded.embeddings,
+                 counts = excluded.counts,
+                 embedding_count = excluded.embedding_count",
+        )?;
+        statement.execute((
+            hash,
+            &embeddings.model,
+            &embeddings.embeddings,
+            &embeddings.counts,
+            i64::try_from(embeddings.embedding_count)?,
+        ))?;
+        Ok(())
+    }
+}
+
 /// DB-backed wrapper: loads generations from cache and fetches any unindexed
 /// documents that already have cached embeddings.
 pub fn match_centroids(
@@ -26,7 +114,7 @@ pub fn match_centroids(
     top_k: usize,
     sql_filter: Option<&crate::SqlStatementInternal>,
 ) -> Result<Vec<(f32, u32, u32)>> {
-    let cache = default_embedding_cache();
+    let cache = SqliteEmbeddingCache::new(db);
     match_centroids_from_cache(db, query_embeddings, threshold, top_k, sql_filter, None, &cache)
 }
 
@@ -147,23 +235,24 @@ fn current_document_rowid_plan(
     embedder: Option<&Embedder>,
 ) -> Result<DocumentRowidPlan> {
     let mut query = db.query(
-        "SELECT rowid, body, lens FROM document
+        "SELECT rowid, hash, body, lens FROM document
          WHERE length(body) > 0
          ORDER BY rowid",
     )?;
     let rows = query.query_map((), |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
 
     let mut plan = DocumentRowidPlan::new();
     for row in rows {
-        let (rowid, body, lens) = row?;
+        let (rowid, hash, body, lens) = row?;
         let rowid_u64: u64 = rowid.try_into()?;
-        let hash = document_cache_hash(&body, &lens);
+        let hash = hash.unwrap_or_else(|| document_cache_hash(&body, &lens));
         let Some(embeddings) =
             cached_embeddings_for_document(cache, embedder, rowid_u64, &hash, &body, &lens)?
         else {
@@ -185,7 +274,7 @@ fn document_rowid_plan_for_records(
     embedder: Option<&Embedder>,
 ) -> Result<DocumentRowidPlan> {
     let mut query = db.query(
-        "SELECT body, lens FROM document
+        "SELECT hash, body, lens FROM document
          WHERE rowid = ?1 AND length(body) > 0",
     )?;
 
@@ -194,13 +283,17 @@ fn document_rowid_plan_for_records(
         let rowid: i64 = record.rowid.try_into()?;
         let row = query
             .query_row((rowid,), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })
             .optional()?;
-        let Some((body, lens)) = row else {
+        let Some((hash, body, lens)) = row else {
             continue;
         };
-        let hash = document_cache_hash(&body, &lens);
+        let hash = hash.unwrap_or_else(|| document_cache_hash(&body, &lens));
         let Some(embeddings) =
             cached_embeddings_for_document(cache, embedder, record.rowid, &hash, &body, &lens)?
         else {
@@ -493,7 +586,7 @@ pub fn embed_chunks_with_cache(
 
     let sql = format!(
         "SELECT
-        document.rowid,document.body,document.lens
+        document.rowid,document.hash,document.body,document.lens
         FROM document
         WHERE length(document.body) > 0
         ORDER BY rowid
@@ -508,15 +601,16 @@ pub fn embed_chunks_with_cache(
     let mut documents = query.query_map((), |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
 
     let mut count = 0;
     for result in documents.by_ref() {
-        let (rowid, body, lens) = result?;
-        let hash = document_cache_hash(&body, &lens);
+        let (rowid, hash, body, lens) = result?;
+        let hash = hash.unwrap_or_else(|| document_cache_hash(&body, &lens));
         let (_cached, computed) =
             load_or_compute_cached_embeddings(cache, rowid.try_into()?, &hash, &body, &lens, embedder)?;
         if computed {
@@ -534,12 +628,12 @@ pub fn embed_chunks_with_cache(
 }
 
 pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
-    let cache = default_embedding_cache();
+    let cache = SqliteEmbeddingCache::new(db);
     embed_chunks_with_cache(db, embedder, &cache, limit)
 }
 
 pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
-    let cache = default_embedding_cache();
+    let cache = SqliteEmbeddingCache::new(db);
     let index = index_for_db(db);
     let current = current_document_rowid_plan(db, &cache, None)?;
     unmaterialized_embedding_count(&index, &current.records)
@@ -579,6 +673,16 @@ fn cached_embeddings_for_document(
 }
 
 pub fn index_chunks(
+    db: &DB,
+    device: &Device,
+    embedder: Option<&Embedder>,
+    reset: bool,
+) -> Result<()> {
+    let cache = SqliteEmbeddingCache::new(db);
+    index_chunks_with_cache(db, device, &cache, embedder, reset)
+}
+
+pub fn index_chunks_with_cache(
     db: &DB,
     device: &Device,
     cache: &dyn EmbeddingCache,
@@ -648,7 +752,7 @@ pub fn search(
                 qe
             }
         };
-        let embedding_cache = default_embedding_cache();
+        let embedding_cache = SqliteEmbeddingCache::new(db);
         match match_centroids_with_cache(
             db,
             &qe,
@@ -755,7 +859,7 @@ pub fn search_rowids(
     use_fulltext: bool,
     sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<Vec<u64>> {
-    let embedding_cache = default_embedding_cache();
+    let embedding_cache = SqliteEmbeddingCache::new(db);
     search_rowids_inner(
         db,
         embedder,

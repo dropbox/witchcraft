@@ -55,8 +55,7 @@ mod tests {
     const THRESHOLD: f32 = 0.7;
 
     fn index_chunks(db: &DB, device: &candle_core::Device) -> anyhow::Result<()> {
-        let cache = crate::default_embedding_cache();
-        crate::index_chunks(db, device, &cache, None, false)
+        crate::index_chunks(db, device, None, false)
     }
 
     #[test]
@@ -165,7 +164,13 @@ mod tests {
             .unwrap()
             .query_row((), |row| row.get(0))
             .unwrap();
-        assert_eq!(chunk_table_count, 0);
+        assert_eq!(chunk_table_count, 1);
+        let chunk_rows: i64 = db
+            .query("SELECT COUNT(*) FROM chunk")
+            .unwrap()
+            .query_row((), |row| row.get(0))
+            .unwrap();
+        assert_eq!(chunk_rows, 0);
         let generation_table_count: i64 = db
             .query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'generation'")
             .unwrap()
@@ -176,7 +181,7 @@ mod tests {
         let embedding_cache =
             crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
         assert!(!embedding_cache.root().exists());
-        crate::index_chunks(&db, &device, &embedding_cache, Some(&embedder), false).unwrap();
+        crate::index_chunks_with_cache(&db, &device, &embedding_cache, Some(&embedder), false).unwrap();
 
         let cache_entries = std::fs::read_dir(embedding_cache.root()).unwrap().count();
         assert_eq!(cache_entries, 5);
@@ -654,6 +659,9 @@ mod tests {
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"only-doc");
         db.add_doc(None, &uuid, None, &uuid.to_string(), "Honey never spoils", None)?;
         crate::embed_chunks(&db, &embedder, None)?;
+        let chunk_rows: i64 = db.query("SELECT COUNT(*) FROM chunk")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(chunk_rows, 1);
         index_chunks(&db, &device)?;
 
         let results = crate::search(
@@ -759,7 +767,7 @@ mod tests {
         assert_eq!(queued, 1);
 
         let cache = crate::default_embedding_cache();
-        crate::index_chunks(&db, &candle_core::Device::Cpu, &cache, None, false)?;
+        crate::index_chunks_with_cache(&db, &candle_core::Device::Cpu, &cache, None, false)?;
 
         let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
             .query_row((), |row| row.get(0))?;
@@ -768,6 +776,40 @@ mod tests {
         let index = crate::file_index::FileBackedIndex::new(path.clone());
         let active = index.active_rowids()?;
         assert_eq!(active.get(&1), Some(&false));
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunk_cache_cleanup_triggers() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("chunk_cleanup.sqlite");
+        let mut db = DB::new(path)?;
+        let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"chunk-cleanup-1");
+        let uuid2 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"chunk-cleanup-2");
+        let body = "same cached chunk body";
+        db.add_doc(None, &uuid1, None, "{}", body, None)?;
+        db.add_doc(None, &uuid2, None, "{}", body, None)?;
+
+        let hash: String = db.query("SELECT hash FROM document WHERE uuid = ?1")?
+            .query_row((uuid1.to_string(),), |row| row.get(0))?;
+        db.query(
+            "INSERT INTO chunk(hash, model, embeddings, counts, embedding_count)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute((&hash, "xtr-base-en", vec![1u8, 2, 3], "3", 3i64))?;
+
+        db.remove_doc(&uuid1)?;
+        let chunks: i64 = db.query("SELECT COUNT(*) FROM chunk WHERE hash = ?1")?
+            .query_row((&hash,), |row| row.get(0))?;
+        assert_eq!(chunks, 1);
+
+        db.remove_doc(&uuid2)?;
+        let chunks: i64 = db.query("SELECT COUNT(*) FROM chunk WHERE hash = ?1")?
+            .query_row((&hash,), |row| row.get(0))?;
+        assert_eq!(chunks, 0);
 
         db.clear();
         db.shutdown();
@@ -962,7 +1004,10 @@ mod tests {
 
         let chunk_table_count: i64 = db.query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'chunk'")?
             .query_row((), |row| row.get(0))?;
-        assert_eq!(chunk_table_count, 0);
+        assert_eq!(chunk_table_count, 1);
+        let chunk_rows: i64 = db.query("SELECT COUNT(*) FROM chunk")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(chunk_rows, 0);
 
         db.clear();
         db.shutdown();

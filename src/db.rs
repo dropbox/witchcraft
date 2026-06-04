@@ -1,4 +1,5 @@
 use super::types::SqlStatementInternal;
+use super::document_cache_hash;
 use iso8601_timestamp::Timestamp;
 use log::{error, warn};
 use rusqlite::{
@@ -11,6 +12,7 @@ use super::sql_generator::build_filter_sql_and_params;
 
 const APP_ID: i32 = 0x07DB_DA55;
 const SCHEMA_VERSION: i32 = 13;
+const HASH_CHARS: usize = 32;
 const MAX_SQLITE_ROWID: u64 = i64::MAX as u64;
 
 fn invalid_input_error(message: String) -> rusqlite::Error {
@@ -159,8 +161,11 @@ impl DB {
                  uuid TEXT NOT NULL PRIMARY KEY,
                  date TEXT NOT NULL,
                  metadata JSON,
+                 hash TEXT CHECK (hash IS NULL OR length(hash) = {HASH_CHARS}),
                  body TEXT,
                  lens TEXT);
+
+             CREATE INDEX document_index ON document(hash);
 
              CREATE VIRTUAL TABLE document_fts
                  USING fts5(body, content='document', content_rowid='rowid');
@@ -184,8 +189,135 @@ impl DB {
                  INSERT INTO document_fts(rowid, body) VALUES (new.rowid, new.body);
              END;
 
+             CREATE TABLE chunk(
+                 hash TEXT PRIMARY KEY CHECK (length(hash) = {HASH_CHARS}),
+                 model TEXT NOT NULL,
+                 embeddings BLOB NOT NULL,
+                 counts TEXT NOT NULL,
+                 embedding_count INTEGER NOT NULL);
+
+             CREATE TRIGGER document_after_delete AFTER DELETE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = old.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = old.hash);
+             END;
+
+             CREATE TRIGGER document_after_update AFTER UPDATE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = old.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = old.hash);
+             END;
+
              "
         ))?;
+        Ok(())
+    }
+
+    fn has_column(connection: &Connection, table: &str, column: &str) -> SQLResult<bool> {
+        let mut query = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = query.query_map((), |row| row.get::<_, String>(1))?;
+        for result in columns {
+            if result? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn backfill_document_hashes(connection: &Connection) -> SQLResult<()> {
+        let rows = {
+            let mut query = connection.prepare(
+                "SELECT rowid, IFNULL(body, ''), IFNULL(lens, '')
+                 FROM document
+                 WHERE hash IS NULL OR length(hash) != ?1",
+            )?;
+            let rows = query
+                .query_map((HASH_CHARS as i64,), |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<SQLResult<Vec<_>>>()?;
+            rows
+        };
+
+        let mut update = connection.prepare("UPDATE document SET hash = ?1 WHERE rowid = ?2")?;
+        for (rowid, body, lens) in rows {
+            let hash = document_cache_hash(&body, &lens);
+            update.execute((&hash, rowid))?;
+        }
+        Ok(())
+    }
+
+    fn backfill_chunk_embedding_counts(connection: &Connection) -> SQLResult<()> {
+        let rows = {
+            let mut query = connection.prepare(
+                "SELECT hash, counts FROM chunk WHERE embedding_count = 0",
+            )?;
+            let rows = query
+                .query_map((), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<SQLResult<Vec<_>>>()?;
+            rows
+        };
+
+        let mut update = connection.prepare("UPDATE chunk SET embedding_count = ?1 WHERE hash = ?2")?;
+        for (hash, counts) in rows {
+            let embedding_count: usize = counts
+                .split(',')
+                .filter_map(|count| count.parse::<usize>().ok())
+                .sum();
+            update.execute((embedding_count as i64, hash))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_chunk_schema(connection: &Connection) -> SQLResult<()> {
+        if !Self::has_column(connection, "document", "hash")? {
+            connection.execute_batch(&format!(
+                "ALTER TABLE document
+                 ADD COLUMN hash TEXT CHECK (hash IS NULL OR length(hash) = {HASH_CHARS});",
+            ))?;
+        }
+        Self::backfill_document_hashes(connection)?;
+
+        connection.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS document_index ON document(hash);
+
+             CREATE TABLE IF NOT EXISTS chunk(
+                 hash TEXT PRIMARY KEY CHECK (length(hash) = {HASH_CHARS}),
+                 model TEXT NOT NULL,
+                 embeddings BLOB NOT NULL,
+                 counts TEXT NOT NULL,
+                 embedding_count INTEGER NOT NULL DEFAULT 0);
+
+             CREATE TRIGGER IF NOT EXISTS document_after_delete AFTER DELETE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = old.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = old.hash);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS document_after_update AFTER UPDATE ON document
+             BEGIN
+                 DELETE FROM chunk
+                     WHERE hash = old.hash
+                     AND NOT EXISTS (SELECT 1 FROM document WHERE hash = old.hash);
+             END;",
+        ))?;
+
+        if !Self::has_column(connection, "chunk", "embedding_count")? {
+            connection.execute_batch(
+                "ALTER TABLE chunk
+                 ADD COLUMN embedding_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        Self::backfill_chunk_embedding_counts(connection)?;
         Ok(())
     }
 
@@ -262,6 +394,7 @@ impl DB {
         if first_creation {
             Self::create_schema(&connection)?;
         }
+        Self::ensure_chunk_schema(&connection)?;
         Self::ensure_document_index_tombstone_schema(&connection)?;
 
         Ok(Self {
@@ -287,6 +420,7 @@ impl DB {
     fn clear_inner(&mut self) -> SQLResult<()> {
         self.execute("DELETE FROM document")?;
         self.execute("DELETE FROM document_index_tombstone")?;
+        self.execute("DELETE FROM chunk")?;
         self.remove_all_bucket_data_sidecars();
         self.execute("VACUUM")?;
         Ok(())
@@ -432,10 +566,10 @@ impl DB {
         let rowids = self.resolve_document_rowids(docs)?;
         self.conn().execute("BEGIN", ())?;
         let mut stmt = self.conn().prepare(
-            "INSERT INTO document(rowid, uuid, date, metadata, body, lens)
-            VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO document(rowid, uuid, date, metadata, hash, body, lens)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(uuid) DO UPDATE SET
-                rowid = ?1, date = ?3, metadata = ?4, body = ?5, lens = ?6",
+                rowid = ?1, date = ?3, metadata = ?4, hash = ?5, body = ?6, lens = ?7",
         )?;
 
         let mut count = 0;
@@ -453,6 +587,7 @@ impl DB {
                 .map(|len| len.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
+            let hash = document_cache_hash(body, &lens_str);
 
             let date = date.unwrap_or_else(Timestamp::now_utc);
             stmt.execute((
@@ -460,6 +595,7 @@ impl DB {
                 &uuid.to_string(),
                 date.to_string(),
                 *metadata,
+                &hash,
                 *body,
                 &lens_str,
             ))?;
