@@ -1,14 +1,12 @@
 use log::{debug, info, warn};
-use memmap2::Mmap;
 use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "deterministic"))]
 use rand::SeedableRng;
-#[cfg(feature = "sqlite")]
 #[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 // Conditionally compile encoder backend based on features
@@ -556,14 +554,193 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes[offset..offset + 8].try_into()?))
 }
 
-fn bucket_data_header(bucket_data: &[u8]) -> Result<BucketDataHeader> {
+#[cfg(all(not(unix), windows))]
+fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::ReadFile;
+    use windows::Win32::System::IO::OVERLAPPED;
+
+    let read_len = buf.len().min(u32::MAX as usize);
+    let buf = &mut buf[..read_len];
+    let mut bytes_read = 0u32;
+    let mut overlapped = OVERLAPPED::default();
+    unsafe {
+        overlapped.Anonymous.Anonymous.Offset = offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        ReadFile(
+            HANDLE(file.as_raw_handle()),
+            Some(buf),
+            Some(&mut bytes_read),
+            Some(&mut overlapped),
+        )
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    }
+    Ok(bytes_read as usize)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positioned_read(_file: &File, _buf: &mut [u8], _offset: u64) -> io::Result<usize> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "bucket positioned reads are only implemented on Unix and Windows",
+    ))
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = positioned_read(file, buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short positioned read",
+            ));
+        }
+        offset += n as u64;
+        buf = &mut buf[n..];
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn max_iov() -> usize {
+    let n = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+    if n > 0 {
+        n as usize
+    } else {
+        1024
+    }
+}
+
+#[cfg(unix)]
+fn preadv_once(file: &File, offset: u64, buffers: &mut [&mut [u8]]) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    let mut iovecs: Vec<libc::iovec> = buffers
+        .iter_mut()
+        .map(|buf| libc::iovec {
+            iov_base: (*buf).as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        })
+        .collect();
+    let n = unsafe {
+        libc::preadv(
+            file.as_raw_fd(),
+            iovecs.as_mut_ptr(),
+            iovecs.len().try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many iovecs")
+            })?,
+            offset.try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "preadv offset overflow")
+            })?,
+        )
+    };
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[cfg(unix)]
+fn readv_one_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = {
+            let mut single = [&mut *buf];
+            preadv_once(file, offset, &mut single)?
+        };
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short vectored positioned read",
+            ));
+        }
+        offset += n as u64;
+        let (_, rest) = buf.split_at_mut(n);
+        buf = rest;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn readv_group_exact_at(file: &File, offset: u64, buffers: &mut [&mut [u8]]) -> io::Result<()> {
+    let total = buffers.iter().map(|buf| buf.len()).sum::<usize>();
+    if total == 0 {
+        return Ok(());
+    }
+    let n = preadv_once(file, offset, buffers)?;
+    if n == total {
+        return Ok(());
+    }
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short vectored positioned read",
+        ));
+    }
+
+    let mut skipped = n;
+    let mut cursor = offset;
+    for buf in buffers.iter_mut() {
+        if skipped >= buf.len() {
+            skipped -= buf.len();
+            cursor += buf.len() as u64;
+            continue;
+        }
+        if skipped > 0 {
+            let skip = skipped;
+            skipped = 0;
+            readv_one_exact_at(file, cursor + skip as u64, &mut buf[skip..])?;
+        } else {
+            readv_one_exact_at(file, cursor, buf)?;
+        }
+        cursor += buf.len() as u64;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn readv_exact_at(file: &File, mut offset: u64, buffers: &mut [&mut [u8]]) -> io::Result<()> {
+    let mut rest = buffers;
+    let max_iov = max_iov();
+    while !rest.is_empty() {
+        let take = rest.len().min(max_iov);
+        let (group, tail) = rest.split_at_mut(take);
+        readv_group_exact_at(file, offset, group)?;
+        offset += group.iter().map(|buf| buf.len() as u64).sum::<u64>();
+        rest = tail;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn readv_exact_at(file: &File, mut offset: u64, buffers: &mut [&mut [u8]]) -> io::Result<()> {
+    for buf in buffers {
+        read_exact_at(file, offset, buf)?;
+        offset += buf.len() as u64;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_contiguous_exact_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut data = vec![0; len];
+    read_exact_at(file, offset, &mut data)?;
+    Ok(data)
+}
+
+fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<BucketDataHeader> {
     anyhow::ensure!(
-        bucket_data.len() >= LEGACY_BUCKET_DATA_HEADER_BYTES,
+        sidecar_len >= LEGACY_BUCKET_DATA_HEADER_BYTES,
         "bucket sidecar is too small: {} bytes",
-        bucket_data.len()
+        sidecar_len
     );
-    let version = read_u32_le(bucket_data, 0)?;
-    let header_bytes = match version {
+    anyhow::ensure!(
+        prefix.len() >= std::mem::size_of::<u32>(),
+        "bucket sidecar header is too small"
+    );
+    let version = read_u32_le(prefix, 0)?;
+    let header_len = match version {
         BUCKET_DATA_VERSION => BUCKET_DATA_HEADER_BYTES,
         LEGACY_BUCKET_DATA_VERSION => LEGACY_BUCKET_DATA_HEADER_BYTES,
         _ => anyhow::bail!(
@@ -571,32 +748,36 @@ fn bucket_data_header(bucket_data: &[u8]) -> Result<BucketDataHeader> {
         ),
     };
     anyhow::ensure!(
-        bucket_data.len() >= header_bytes,
+        sidecar_len >= header_len,
         "bucket sidecar is too small: {} bytes",
-        bucket_data.len()
+        sidecar_len
+    );
+    anyhow::ensure!(
+        header_len <= prefix.len(),
+        "bucket sidecar header read was too short"
     );
     anyhow::ensure!(
         if version == BUCKET_DATA_VERSION {
-            &bucket_data[4..4 + BUCKET_DATA_MAGIC.len()] == BUCKET_DATA_MAGIC.as_slice()
+            &prefix[4..4 + BUCKET_DATA_MAGIC.len()] == BUCKET_DATA_MAGIC.as_slice()
         } else {
-            &bucket_data[4..4 + LEGACY_BUCKET_DATA_MAGIC.len()]
+            &prefix[4..4 + LEGACY_BUCKET_DATA_MAGIC.len()]
                 == LEGACY_BUCKET_DATA_MAGIC.as_slice()
         },
         "bucket sidecar has an invalid header; run ./warp-cli reindex"
     );
-    let centroid_count: usize = read_u64_le(bucket_data, 12)?.try_into()?;
-    let meta_offset: usize = read_u64_le(bucket_data, 20)?.try_into()?;
-    let payload_offset: usize = read_u64_le(bucket_data, 28)?.try_into()?;
+    let centroid_count: usize = read_u64_le(prefix, 12)?.try_into()?;
+    let meta_offset: usize = read_u64_le(prefix, 20)?.try_into()?;
+    let payload_offset: usize = read_u64_le(prefix, 28)?.try_into()?;
     let rowids_offset: usize = if version == BUCKET_DATA_VERSION {
-        read_u64_le(bucket_data, 36)?.try_into()?
+        read_u64_le(prefix, 36)?.try_into()?
     } else {
-        bucket_data.len()
+        sidecar_len
     };
     anyhow::ensure!(
-        meta_offset >= header_bytes
+        meta_offset >= header_len
             && payload_offset >= meta_offset
             && rowids_offset >= payload_offset
-            && rowids_offset <= bucket_data.len(),
+            && rowids_offset <= sidecar_len,
         "bucket sidecar layout is invalid"
     );
     let meta_block_len = payload_offset - meta_offset;
@@ -633,17 +814,43 @@ fn bucket_data_header(bucket_data: &[u8]) -> Result<BucketDataHeader> {
     })
 }
 
-fn bucket_data_bucket_meta(
-    bucket_data: &[u8],
+fn bucket_data_header_from_file(file: &File, sidecar_len: usize) -> Result<BucketDataHeader> {
+    let prefix_len = BUCKET_DATA_HEADER_BYTES.min(sidecar_len);
+    let mut prefix = vec![0; prefix_len];
+    let mut buffers = [prefix.as_mut_slice()];
+    readv_exact_at(file, 0, &mut buffers)?;
+    bucket_data_header_from_prefix(&prefix, sidecar_len)
+}
+
+fn bucket_data_bucket_meta_from_file(
+    file: &File,
     header: &BucketDataHeader,
 ) -> Result<Vec<BucketSidecarMeta>> {
+    let meta_len = header
+        .payload_offset
+        .checked_sub(header.meta_offset)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar metadata range is invalid"))?;
+    let mut meta_block = vec![0; meta_len];
+    let mut buffers = [meta_block.as_mut_slice()];
+    readv_exact_at(file, header.meta_offset as u64, &mut buffers)?;
+    bucket_data_bucket_meta_from_block(&meta_block, header)
+}
+
+fn bucket_data_bucket_meta_from_block(
+    meta_block: &[u8],
+    header: &BucketDataHeader,
+) -> Result<Vec<BucketSidecarMeta>> {
+    anyhow::ensure!(
+        meta_block.len() == header.payload_offset - header.meta_offset,
+        "bucket sidecar metadata block length is invalid"
+    );
     let mut metas = Vec::with_capacity(header.centroid_count);
     for bucket_idx in 0..header.centroid_count {
-        let offset = header.meta_offset + bucket_idx * header.meta_bytes;
-        let size = read_u32_le(bucket_data, offset)? as usize;
-        let data_offset: u64 = read_u64_le(bucket_data, offset + 4)?;
-        let indices_len = read_u32_le(bucket_data, offset + 12)? as usize;
-        let residual_len = read_u32_le(bucket_data, offset + 16)? as usize;
+        let offset = bucket_idx * header.meta_bytes;
+        let size = read_u32_le(meta_block, offset)? as usize;
+        let data_offset: u64 = read_u64_le(meta_block, offset + 4)?;
+        let indices_len = read_u32_le(meta_block, offset + 12)? as usize;
+        let residual_len = read_u32_le(meta_block, offset + 16)? as usize;
         let center_start = offset + BUCKET_META_PREFIX_BYTES;
         let center_end = offset + header.meta_bytes;
         anyhow::ensure!(
@@ -663,7 +870,7 @@ fn bucket_data_bucket_meta(
             data_offset,
             indices_len,
             residual_len,
-            center: bucket_data[center_start..center_end].to_vec(),
+            center: meta_block[center_start..center_end].to_vec(),
         });
     }
     Ok(metas)
@@ -932,7 +1139,23 @@ mod reciprocal_rank_fusion_tests {
     }
 }
 
-/// Per-generation centroid data loaded from the database.
+struct BucketRead {
+    bucket_idx: usize,
+    len: usize,
+}
+
+struct BucketReadBatch {
+    offset: usize,
+    len: usize,
+    buckets: Vec<BucketRead>,
+}
+
+struct BucketPayload<'a> {
+    keys: &'a [u8],
+    residuals: &'a [u8],
+}
+
+/// Per-generation centroid data loaded from sidecar files.
 pub struct GenerationCentroids {
     dim: usize,
     residual_bytes: usize,
@@ -941,7 +1164,8 @@ pub struct GenerationCentroids {
     data_offsets: Vec<usize>,
     indices_lens: Vec<usize>,
     residual_lens: Vec<usize>,
-    bucket_data: Option<Arc<Mmap>>,
+    sidecar_len: usize,
+    data_file: Arc<File>,
     centers_matrix: Tensor,
 }
 
@@ -954,6 +1178,148 @@ pub fn invalidate_generations_cache(paths: &[PathBuf]) {
 
 fn clear_generations_cache() {
     GENERATIONS_CACHE.write().unwrap().clear();
+}
+
+impl GenerationCentroids {
+    fn bucket_range(&self, bucket_idx: usize) -> Result<(usize, usize, usize, usize)> {
+        let bucket_id = *self
+            .bucket_indices
+            .get(bucket_idx)
+            .ok_or_else(|| anyhow::anyhow!("bucket index {bucket_idx} is out of range"))?;
+        let data_offset = self.data_offsets[bucket_idx];
+        let indices_len = self.indices_lens[bucket_idx];
+        let residual_len = self.residual_lens[bucket_idx];
+        let total_len = indices_len
+            .checked_add(residual_len)
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_id} data length overflow"))?;
+        let end = data_offset
+            .checked_add(total_len)
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_id} data range overflow"))?;
+        anyhow::ensure!(
+            end <= self.sidecar_len,
+            "bucket {bucket_id} data range {}..{} exceeds sidecar length {}",
+            data_offset,
+            end,
+            self.sidecar_len
+        );
+        Ok((bucket_id, data_offset, indices_len, residual_len))
+    }
+
+    fn bucket_read_batches(&self, bucket_indices: &[usize]) -> Result<Vec<BucketReadBatch>> {
+        let mut batches: Vec<BucketReadBatch> = vec![];
+        for &bucket_idx in bucket_indices {
+            let (_, data_offset, indices_len, residual_len) = self.bucket_range(bucket_idx)?;
+            let len = indices_len
+                .checked_add(residual_len)
+                .ok_or_else(|| anyhow::anyhow!("bucket data length overflow"))?;
+            if len == 0 {
+                continue;
+            }
+            if let Some(batch) = batches.last_mut() {
+                let batch_end = batch
+                    .len
+                    .checked_add(batch.offset)
+                    .ok_or_else(|| anyhow::anyhow!("bucket read batch range overflow"))?;
+                if batch_end == data_offset {
+                    batch.buckets.push(BucketRead { bucket_idx, len });
+                    batch.len = batch
+                        .len
+                        .checked_add(len)
+                        .ok_or_else(|| anyhow::anyhow!("bucket read batch length overflow"))?;
+                    continue;
+                }
+            }
+            batches.push(BucketReadBatch {
+                offset: data_offset,
+                len,
+                buckets: vec![BucketRead { bucket_idx, len }],
+            });
+        }
+        Ok(batches)
+    }
+
+    #[cfg(unix)]
+    fn read_bucket_batch(file: &File, batch: &BucketReadBatch) -> Result<Vec<Vec<u8>>> {
+        let mut payloads: Vec<Vec<u8>> =
+            batch.buckets.iter().map(|bucket| vec![0; bucket.len]).collect();
+        let mut slices: Vec<&mut [u8]> =
+            payloads.iter_mut().map(|payload| payload.as_mut_slice()).collect();
+        readv_exact_at(file, batch.offset as u64, &mut slices)?;
+        drop(slices);
+        Ok(payloads)
+    }
+
+    #[cfg(not(unix))]
+    fn read_bucket_batch(file: &File, batch: &BucketReadBatch) -> Result<Vec<Vec<u8>>> {
+        let data = read_contiguous_exact_at(file, batch.offset as u64, batch.len)?;
+        let mut offset = 0usize;
+        let mut payloads = Vec::with_capacity(batch.buckets.len());
+        for bucket in &batch.buckets {
+            let end = offset
+                .checked_add(bucket.len)
+                .ok_or_else(|| anyhow::anyhow!("bucket read batch slice overflow"))?;
+            anyhow::ensure!(
+                end <= data.len(),
+                "bucket read batch slice {}..{} exceeds batch length {}",
+                offset,
+                end,
+                data.len()
+            );
+            payloads.push(data[offset..end].to_vec());
+            offset = end;
+        }
+        anyhow::ensure!(
+            offset == data.len(),
+            "bucket read batch consumed {} bytes but read {} bytes",
+            offset,
+            data.len()
+        );
+        Ok(payloads)
+    }
+
+    fn prefetch_bucket_payloads(&self, bucket_indices: &[usize]) -> Result<Vec<Option<Vec<u8>>>> {
+        let batches = self.bucket_read_batches(bucket_indices)?;
+        let mut payloads = vec![None; self.bucket_indices.len()];
+        if batches.is_empty() {
+            return Ok(payloads);
+        }
+
+        for batch in &batches {
+            let data = Self::read_bucket_batch(&self.data_file, batch)?;
+            anyhow::ensure!(
+                data.len() == batch.buckets.len(),
+                "bucket read batch returned {} buffers for {} buckets",
+                data.len(),
+                batch.buckets.len()
+            );
+            for (bucket, data) in batch.buckets.iter().zip(data) {
+                payloads[bucket.bucket_idx] = Some(data);
+            }
+        }
+        Ok(payloads)
+    }
+
+    fn bucket_payload<'a>(
+        &'a self,
+        bucket_idx: usize,
+        prefetched: &'a [Option<Vec<u8>>],
+    ) -> Result<BucketPayload<'a>> {
+        let (_, _, indices_len, residual_len) = self.bucket_range(bucket_idx)?;
+        let data = prefetched
+            .get(bucket_idx)
+            .and_then(|data| data.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_idx} was not prefetched"))?;
+        anyhow::ensure!(
+            data.len() == indices_len + residual_len,
+            "bucket {bucket_idx} prefetched length {} does not match expected {}",
+            data.len(),
+            indices_len + residual_len
+        );
+        Ok(BucketPayload {
+            keys: &data[..indices_len],
+            residuals: &data[indices_len..],
+        })
+    }
 }
 
 #[inline(always)]
@@ -980,7 +1346,7 @@ fn vmax_inplace(current: &mut [f32], row: &[f32]) {
     }
 }
 
-/// Load generation centroid data from mmap sidecar files (cached).
+/// Load generation centroid data from sidecar files (cached).
 pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<GenerationCentroids>>> {
     let key = paths.to_vec();
     {
@@ -993,12 +1359,10 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
     let mut all = Vec::with_capacity(paths.len());
     for path in paths {
         let file = File::open(path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let bucket_data = Arc::new(mmap);
-
-        let header = bucket_data_header(&bucket_data)?;
+        let sidecar_len: usize = file.metadata()?.len().try_into()?;
+        let header = bucket_data_header_from_file(&file, sidecar_len)?;
+        let metas = bucket_data_bucket_meta_from_file(&file, &header)?;
         let residual_bytes = residual_bytes_for_dim(header.embedding_dim);
-        let metas = bucket_data_bucket_meta(&bucket_data, &header)?;
 
         let mut bucket_indices = vec![];
         let mut sizes = vec![];
@@ -1034,7 +1398,8 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
             data_offsets,
             indices_lens,
             residual_lens,
-            bucket_data: Some(bucket_data),
+            sidecar_len,
+            data_file: Arc::new(file),
             centers_matrix,
         });
     }
@@ -1045,7 +1410,7 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
 }
 
 /// Pure index search: scores query embeddings against generation sidecar files.
-/// No database access — loads generations from mmap files directly.
+/// No database access — loads generation metadata and reads bucket payloads from sidecar files.
 /// `unindexed` contains (doc_rowid, embeddings) for documents not yet in any generation.
 pub fn match_centroids_raw(
     generation_files: &[PathBuf],
@@ -1130,26 +1495,13 @@ pub fn match_centroids_raw(
         topk_clusters.sort_unstable();
         topk_clusters.dedup();
 
+        let prefetched_payloads = gen.prefetch_bucket_payloads(&topk_clusters)?;
         for &i in &topk_clusters {
             let bucket_idx = i as usize;
             let bucket_id = gen.bucket_indices[bucket_idx];
-            let data_offset = gen.data_offsets[bucket_idx];
-            let indices_len = gen.indices_lens[bucket_idx];
-            let residual_len = gen.residual_lens[bucket_idx];
-            let bucket_data = gen.bucket_data.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("generation has no mapped bucket data sidecar")
-            })?;
-            let indices_end = data_offset + indices_len;
-            let residual_end = indices_end + residual_len;
-            anyhow::ensure!(
-                residual_end <= bucket_data.len(),
-                "bucket {bucket_id} data range {}..{} exceeds sidecar length {}",
-                data_offset,
-                residual_end,
-                bucket_data.len()
-            );
-            let keys_compressed = &bucket_data[data_offset..indices_end];
-            let residual_bytes = &bucket_data[indices_end..residual_end];
+            let payload = gen.bucket_payload(bucket_idx, &prefetched_payloads)?;
+            let keys_compressed = payload.keys;
+            let residual_bytes = payload.residuals;
 
             let document_indices = decompress_keys(keys_compressed)?;
             anyhow::ensure!(
