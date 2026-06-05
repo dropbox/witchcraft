@@ -1108,7 +1108,8 @@ mod tests {
         };
 
         unsafe {
-            let handle = crate::capi::witchcraft_open(db_path.as_ptr(), assets.as_ptr());
+            let handle =
+                crate::capi::witchcraft_open(db_path.as_ptr(), assets.as_ptr(), std::ptr::null());
             assert!(!handle.is_null(), "{}", last_error(std::ptr::null_mut()));
 
             let honey = "Honey never spoils";

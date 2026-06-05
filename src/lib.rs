@@ -1155,6 +1155,15 @@ struct BucketPayload<'a> {
     residuals: &'a [u8],
 }
 
+struct CoarseTreeLevel {
+    centers: Tensor,
+    children: Vec<Vec<usize>>,
+}
+
+struct CoarseTree {
+    levels: Vec<CoarseTreeLevel>,
+}
+
 /// Per-generation centroid data loaded from sidecar files.
 pub struct GenerationCentroids {
     dim: usize,
@@ -1167,6 +1176,7 @@ pub struct GenerationCentroids {
     sidecar_len: usize,
     data_file: Arc<File>,
     centers_matrix: Tensor,
+    coarse_tree: Option<CoarseTree>,
 }
 
 static GENERATIONS_CACHE: Lazy<RwLock<HashMap<Vec<PathBuf>, Arc<Vec<GenerationCentroids>>>>> =
@@ -1180,7 +1190,111 @@ fn clear_generations_cache() {
     GENERATIONS_CACHE.write().unwrap().clear();
 }
 
+fn build_coarse_tree_from_centers(
+    leaf_centers: &Tensor,
+    device: &Device,
+) -> Result<Option<CoarseTree>> {
+    let target_branching = 16usize;
+    let (leaf_count, _) = leaf_centers.dims2()?;
+    if leaf_count <= target_branching {
+        return Ok(None);
+    }
+
+    let mut levels = vec![];
+    let mut current_centers = leaf_centers.to_device(&Device::Cpu)?;
+    let mut current_count = leaf_count;
+    let mut node_to_leaves: Vec<Vec<usize>> = (0..leaf_count).map(|i| vec![i]).collect();
+
+    while current_count > target_branching {
+        let k_coarse = (current_count as f64 / target_branching as f64)
+            .sqrt()
+            .ceil()
+            .max(2.0) as usize;
+        let k_coarse = k_coarse.min(current_count - 1);
+
+        debug!(
+            "building coarse tree: {} nodes -> {} super-clusters",
+            current_count, k_coarse
+        );
+        let super_centers = kmeans(&current_centers, k_coarse, 5)?;
+        let packed = fast_ops::PackedRight::new(&super_centers)?;
+        let assignments = matmul_argmax_batched(&current_centers, &packed, 1024)?;
+        let assignments = assignments.to_vec1::<u32>()?;
+
+        let mut children_map: Vec<Vec<u32>> = vec![vec![]; k_coarse];
+        for (node_idx, &parent) in assignments.iter().enumerate() {
+            children_map[parent as usize].push(node_idx as u32);
+        }
+
+        let mut new_node_to_leaves = Vec::with_capacity(k_coarse);
+        for group in &children_map {
+            let mut leaves = Vec::new();
+            for &child_node in group {
+                leaves.extend_from_slice(&node_to_leaves[child_node as usize]);
+            }
+            new_node_to_leaves.push(leaves);
+        }
+
+        levels.push(CoarseTreeLevel {
+            centers: super_centers.to_device(device)?,
+            children: new_node_to_leaves.clone(),
+        });
+        node_to_leaves = new_node_to_leaves;
+        current_centers = super_centers;
+        current_count = k_coarse;
+    }
+
+    Ok(Some(CoarseTree { levels }))
+}
+
 impl GenerationCentroids {
+    fn routed_centroid_candidates(&self, query_embeddings: &Tensor) -> Result<Vec<usize>> {
+        let Some(tree) = &self.coarse_tree else {
+            return Ok((0..self.sizes.len()).collect());
+        };
+        if tree.levels.is_empty() {
+            return Ok((0..self.sizes.len()).collect());
+        }
+
+        let (query_rows, _) = query_embeddings.dims2()?;
+        let mut candidate_set = vec![false; self.sizes.len()];
+        for level in tree.levels.iter().rev() {
+            let k_level = level.children.len();
+            if k_level == 0 {
+                continue;
+            }
+            let n_expand = (k_level as f64).sqrt().ceil() as usize;
+            let level_sim = fast_ops::matmul_t(query_embeddings, &level.centers)?;
+            let level_sim = level_sim.to_device(&Device::Cpu)?;
+            let level_sorted = level_sim.arg_sort_last_dim(false)?
+                .to_device(&Device::Cpu)?
+                .to_vec2::<u32>()?;
+
+            for qi in 0..query_rows {
+                for &node_idx in level_sorted[qi].iter().take(n_expand) {
+                    if let Some(leaves) = level.children.get(node_idx as usize) {
+                        for &leaf_idx in leaves {
+                            if let Some(selected) = candidate_set.get_mut(leaf_idx) {
+                                *selected = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let candidates: Vec<usize> = candidate_set
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, selected)| selected.then_some(idx))
+            .collect();
+        if candidates.is_empty() {
+            Ok((0..self.sizes.len()).collect())
+        } else {
+            Ok(candidates)
+        }
+    }
+
     fn bucket_range(&self, bucket_idx: usize) -> Result<(usize, usize, usize, usize)> {
         let bucket_id = *self
             .bucket_indices
@@ -1389,6 +1503,7 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
         } else {
             Tensor::zeros(&[0, header.embedding_dim], DType::F32, device)?
         };
+        let coarse_tree = build_coarse_tree_from_centers(&centers_matrix, device)?;
 
         all.push(GenerationCentroids {
             dim: header.embedding_dim,
@@ -1401,6 +1516,7 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
             sidecar_len,
             data_file: Arc::new(file),
             centers_matrix,
+            coarse_tree,
         });
     }
 
@@ -1452,11 +1568,23 @@ pub fn match_centroids_raw(
         let gen_idx = gen_centroid_scores_all.len();
         let n_centroids = gen.sizes.len();
 
+        let candidates = gen.routed_centroid_candidates(query_embeddings)?;
+        let candidate_indices: Vec<u32> = candidates.iter().map(|&idx| idx as u32).collect();
+        let candidate_index_tensor =
+            Tensor::from_slice(candidate_indices.as_slice(), (candidate_indices.len(),), device)?;
+        let candidate_centers = gen.centers_matrix.index_select(&candidate_index_tensor, 0)?;
         let query_centroid_similarity =
-            fast_ops::matmul_t(query_embeddings, &gen.centers_matrix)?;
+            fast_ops::matmul_t(query_embeddings, &candidate_centers)?;
         let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
 
-        let gen_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
+        let candidate_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
+        let mut gen_centroid_scores = vec![vec![0.0f32; n_centroids]; m];
+        for (candidate_pos, &centroid_idx) in candidates.iter().enumerate() {
+            for query_idx in 0..m {
+                gen_centroid_scores[query_idx][centroid_idx] =
+                    candidate_centroid_scores[query_idx][candidate_pos];
+            }
+        }
         gen_centroid_scores_all.push(gen_centroid_scores);
 
         let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
@@ -1470,10 +1598,10 @@ pub fn match_centroids_raw(
             let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
             let row = row.to_vec1::<u32>()?;
             let mut cumsum = 0;
-            let selection_limit = n_centroids.min(k);
+            let selection_limit = candidates.len().min(k);
             let mut tail_rank = 0;
             for j in 0..selection_limit {
-                let idx = row[j] as usize;
+                let idx = candidates[row[j] as usize];
                 topk_clusters.push(idx);
                 cumsum += gen.sizes[idx];
                 tail_rank = j;
@@ -1494,6 +1622,13 @@ pub fn match_centroids_raw(
         gen_centroid_score_ranges_all.push(gen_centroid_score_ranges);
         topk_clusters.sort_unstable();
         topk_clusters.dedup();
+
+        debug!(
+            "hierarchical centroid routing: candidates={} selected={} / {} buckets",
+            candidates.len(),
+            topk_clusters.len(),
+            n_centroids
+        );
 
         let prefetched_payloads = gen.prefetch_bucket_payloads(&topk_clusters)?;
         for &i in &topk_clusters {
