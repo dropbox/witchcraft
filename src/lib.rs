@@ -147,6 +147,10 @@ const L0_CAPACITY: usize = 4;
 const LSM_FANOUT: usize = 16;
 #[cfg(test)]
 const LSM_FANOUT: usize = 2;
+const COARSE_TREE_BRANCHING: usize = 16;
+const INDEX_KMEANS_BRANCHING: usize = 128;
+const INDEX_KMEANS_ITERATIONS: usize = 5;
+const INDEX_BATCH_SIZE: usize = 0x10000;
 
 /// A document pointer combining document ID and sub-chunk index
 /// Allows precise location of results within subdivided documents
@@ -380,13 +384,16 @@ fn matmul_argmax_batched(
     Ok(Tensor::from_vec(assignments, m, device)?)
 }
 
-fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
+fn kmeans_inner(
+    data: &Tensor,
+    k: usize,
+    max_iter: usize,
+    bar: Option<&progress::Bar>,
+) -> Result<Tensor> {
     let (m, n) = data.dims2()?;
     debug!("kmeans k={} m={} n={}...", k, m, n);
 
     let _priority_mgr = PriorityManager::new();
-    let total: u64 = (max_iter * k).try_into()?;
-    let bar = progress::new_with_label(total, "kmeans");
     let device = data.device();
 
     #[cfg(any(test, feature = "deterministic"))]
@@ -446,8 +453,17 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
         }
 
         centers = Tensor::from_vec(centers_flat, (k, n), device)?;
-        bar.inc(k as u64);
+        if let Some(bar) = bar {
+            bar.inc(k as u64);
+        }
     }
+    Ok(centers)
+}
+
+fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
+    let total: u64 = (max_iter * k).try_into()?;
+    let bar = progress::new_with_label(total, "kmeans");
+    let centers = kmeans_inner(data, k, max_iter, Some(&bar))?;
     bar.finish();
     Ok(centers)
 }
@@ -1194,9 +1210,8 @@ fn build_coarse_tree_from_centers(
     leaf_centers: &Tensor,
     device: &Device,
 ) -> Result<Option<CoarseTree>> {
-    let target_branching = 16usize;
     let (leaf_count, _) = leaf_centers.dims2()?;
-    if leaf_count <= target_branching {
+    if leaf_count <= COARSE_TREE_BRANCHING {
         return Ok(None);
     }
 
@@ -1205,8 +1220,8 @@ fn build_coarse_tree_from_centers(
     let mut current_count = leaf_count;
     let mut node_to_leaves: Vec<Vec<usize>> = (0..leaf_count).map(|i| vec![i]).collect();
 
-    while current_count > target_branching {
-        let k_coarse = (current_count as f64 / target_branching as f64)
+    while current_count > COARSE_TREE_BRANCHING {
+        let k_coarse = (current_count as f64 / COARSE_TREE_BRANCHING as f64)
             .sqrt()
             .ceil()
             .max(2.0) as usize;
@@ -2066,6 +2081,137 @@ pub(crate) fn load_or_compute_cached_embeddings(
     Ok((embeddings, true))
 }
 
+fn sample_centers(data: &Tensor, k: usize) -> Result<Tensor> {
+    let (m, _) = data.dims2()?;
+    anyhow::ensure!(k > 0 && k <= m, "cannot sample {k} centers from {m} rows");
+    let indices: Vec<u32> = (0..k).map(|i| ((i * m) / k).min(m - 1) as u32).collect();
+    let index_tensor = Tensor::from_slice(indices.as_slice(), (k,), data.device())?;
+    Ok(data.index_select(&index_tensor, 0)?)
+}
+
+fn allocate_child_kmeans_targets(counts: &[usize], target_k: usize) -> Vec<usize> {
+    let total: usize = counts.iter().sum();
+    if total == 0 || target_k == 0 {
+        return vec![0; counts.len()];
+    }
+
+    let target_k = target_k.min(total);
+    let mut child_ks = vec![0usize; counts.len()];
+    let mut remainders = Vec::new();
+    let mut assigned = 0usize;
+
+    for (idx, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let exact = (count as f64 / total as f64) * target_k as f64;
+        let base = (exact.floor() as usize).max(1).min(count);
+        child_ks[idx] = base;
+        assigned += base;
+        remainders.push((exact - exact.floor(), idx));
+    }
+
+    if assigned > target_k {
+        remainders.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut excess = assigned - target_k;
+        while excess > 0 {
+            let mut changed = false;
+            for &(_, idx) in &remainders {
+                if child_ks[idx] > 1 {
+                    child_ks[idx] -= 1;
+                    excess -= 1;
+                    changed = true;
+                    if excess == 0 {
+                        break;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    } else if assigned < target_k {
+        remainders.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut remaining = target_k - assigned;
+        while remaining > 0 {
+            let mut changed = false;
+            for &(_, idx) in &remainders {
+                if child_ks[idx] < counts[idx] {
+                    child_ks[idx] += 1;
+                    remaining -= 1;
+                    changed = true;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    child_ks
+}
+
+fn select_tensor_rows(data: &Tensor, rows: &[u32]) -> Result<Tensor> {
+    let index_tensor = Tensor::from_slice(rows, (rows.len(),), data.device())?;
+    Ok(data.index_select(&index_tensor, 0)?)
+}
+
+fn hierarchical_kmeans_for_index(
+    data: &Tensor,
+    target_k: usize,
+    max_iter: usize,
+    bar: Option<&progress::Bar>,
+) -> Result<Tensor> {
+    let (m, _) = data.dims2()?;
+    let target_k = target_k.min(m);
+    anyhow::ensure!(target_k > 0, "cannot build index kmeans with zero centers");
+
+    if target_k <= INDEX_KMEANS_BRANCHING || m <= INDEX_KMEANS_BRANCHING {
+        return kmeans_inner(data, target_k, max_iter, bar);
+    }
+
+    let branch_k = INDEX_KMEANS_BRANCHING.min(target_k).min(m);
+    let coarse = kmeans_inner(data, branch_k, max_iter, bar)?;
+    let packed = fast_ops::PackedRight::new(&coarse)?;
+    let assignments = matmul_argmax_batched(data, &packed, 1024)?
+        .to_device(&Device::Cpu)?
+        .to_vec1::<u32>()?;
+
+    let mut row_groups = vec![Vec::<u32>::new(); branch_k];
+    for (row, &child) in assignments.iter().enumerate() {
+        row_groups[child as usize].push(row as u32);
+    }
+    let counts: Vec<usize> = row_groups.iter().map(Vec::len).collect();
+    let active_children = counts.iter().filter(|&&count| count > 0).count();
+    if active_children <= 1 {
+        return sample_centers(data, target_k);
+    }
+
+    let child_targets = allocate_child_kmeans_targets(&counts, target_k);
+    let mut child_centers = Vec::new();
+
+    for child_idx in 0..branch_k {
+        let child_target = child_targets[child_idx];
+        if child_target == 0 {
+            continue;
+        }
+
+        let child_data = select_tensor_rows(data, &row_groups[child_idx])?;
+        let child = hierarchical_kmeans_for_index(
+            &child_data,
+            child_target,
+            max_iter,
+            bar,
+        )?;
+        child_centers.push(child);
+    }
+
+    Ok(Tensor::cat(&child_centers, 0)?)
+}
+
 fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tensor> {
     let now = std::time::Instant::now();
     let mut k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
@@ -2075,7 +2221,19 @@ fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tens
     if m < k {
         k = (m / 4).max(1);
     }
-    let centers = kmeans(matrix, k, 5)?;
+    let total: u64 = (INDEX_KMEANS_ITERATIONS * k).try_into()?;
+    let bar = progress::new_with_label(total, "kmeans");
+    let centers = hierarchical_kmeans_for_index(
+        matrix,
+        k,
+        INDEX_KMEANS_ITERATIONS,
+        Some(&bar),
+    )?;
+    bar.finish();
+    anyhow::ensure!(
+        centers.dims2()?.0 > 0,
+        "index kmeans produced no centers"
+    );
     debug!("kmeans took {} ms.", now.elapsed().as_millis());
     Ok(centers)
 }
@@ -2151,30 +2309,28 @@ fn write_buckets_for_rowids(
             }
         }
 
-        let batch_size = 0x10000;
-
-        if batch >= batch_size || done {
+        if batch >= INDEX_BATCH_SIZE || done {
             if batch == 0 {
                 continue;
             }
             let now = std::time::Instant::now();
 
-            let take = batch.min(batch_size);
+            let take = batch.min(INDEX_BATCH_SIZE);
             let left = batch - take;
 
             let embeddings = all_embeddings.split_off(left);
             let indices = document_indices.split_off(left);
             let data = Tensor::cat(&embeddings, 0)?.to_device(device)?;
 
-            let cluster_assignments =
-                matmul_argmax_batched(&data, &packed_centers, 1024)?.to_device(&Device::Cpu)?;
+            let cluster_assignments = matmul_argmax_batched(&data, &packed_centers, 1024)?
+                .to_device(&Device::Cpu)?
+                .to_vec1::<u32>()?;
             mmuls_total += now.elapsed().as_millis();
 
             let now = std::time::Instant::now();
             let mut writer = merger::Writer::new(residual_bytes)?;
 
             let mut pairs: Vec<(usize, u32)> = cluster_assignments
-                .to_vec1::<u32>()?
                 .iter()
                 .enumerate()
                 .map(|(i, &bucket)| (i, bucket))
