@@ -1,6 +1,6 @@
 use crate::{
     index_buffered_embeddings, match_centroids_raw, CachedEmbeddings, Embedder, EmbeddingCache,
-    EmbeddingsCache, FileBackedIndex,
+    EmbeddingsCache, FileBackedIndex, FileEmbeddingCache,
 };
 use anyhow::{anyhow, Result};
 use std::ffi::{CStr, CString};
@@ -29,6 +29,7 @@ struct CApiState {
     index: FileBackedIndex,
     device: candle_core::Device,
     embedder: Embedder,
+    embedding_cache: FileEmbeddingCache,
     query_cache: EmbeddingsCache,
 }
 
@@ -93,6 +94,18 @@ unsafe fn string_from_ptr(ptr: *const c_char, name: &str) -> Result<String> {
         return Err(anyhow!("{name} must not be null"));
     }
     Ok(CStr::from_ptr(ptr).to_str()?.to_string())
+}
+
+unsafe fn embedding_cache_from_ptr(ptr: *const c_char) -> Result<FileEmbeddingCache> {
+    if ptr.is_null() {
+        return Ok(crate::default_embedding_cache());
+    }
+
+    let path = string_from_ptr(ptr, "embedding_cache_path")?;
+    if path.is_empty() {
+        return Err(anyhow!("embedding_cache_path must not be empty"));
+    }
+    Ok(FileEmbeddingCache::new(PathBuf::from(path)))
 }
 
 unsafe fn bytes_from_ptr<'a>(ptr: *const u8, len: usize, name: &str) -> Result<&'a [u8]> {
@@ -249,18 +262,23 @@ fn decode_embedding_blob(bytes: &[u8]) -> Result<CachedEmbeddings> {
     })
 }
 
-fn embed_for_capi(embedder: &Embedder, body_text: &str, lens: &str) -> Result<CachedEmbeddings> {
+fn embed_for_capi(state: &CApiState, body_text: &str, lens: &str) -> Result<CachedEmbeddings> {
     #[cfg(feature = "capi-embed-cache")]
     {
-        let cache = crate::default_embedding_cache();
         let hash = crate::document_cache_hash(body_text, lens);
-        let (embeddings, _computed) =
-            crate::load_or_compute_cached_embeddings(&cache, 0, &hash, body_text, lens, embedder)?;
+        let (embeddings, _computed) = crate::load_or_compute_cached_embeddings(
+            &state.embedding_cache,
+            0,
+            &hash,
+            body_text,
+            lens,
+            &state.embedder,
+        )?;
         Ok(embeddings)
     }
     #[cfg(not(feature = "capi-embed-cache"))]
     {
-        crate::compute_cached_embeddings(embedder, body_text, lens)
+        crate::compute_cached_embeddings(&state.embedder, body_text, lens)
     }
 }
 
@@ -298,10 +316,14 @@ unsafe fn fetch_embedding_blob(
     let mut len = 0usize;
     let status = callback(rowid, user_data, ptr::null_mut(), 0, &mut len);
     if status != 0 {
-        return Err(anyhow!("embedding callback failed for rowid {rowid}: {status}"));
+        return Err(anyhow!(
+            "embedding callback failed for rowid {rowid}: {status}"
+        ));
     }
     if len == 0 {
-        return Err(anyhow!("embedding callback returned empty data for rowid {rowid}"));
+        return Err(anyhow!(
+            "embedding callback returned empty data for rowid {rowid}"
+        ));
     }
 
     let mut bytes = vec![0; len];
@@ -314,7 +336,9 @@ unsafe fn fetch_embedding_blob(
         &mut written,
     );
     if status != 0 {
-        return Err(anyhow!("embedding callback failed for rowid {rowid}: {status}"));
+        return Err(anyhow!(
+            "embedding callback failed for rowid {rowid}: {status}"
+        ));
     }
     if written != bytes.len() {
         return Err(anyhow!(
@@ -365,18 +389,21 @@ unsafe fn handle_ref<'a>(handle: *mut WitchcraftHandle) -> Result<&'a Witchcraft
 pub unsafe extern "C" fn witchcraft_open(
     db_path: *const c_char,
     assets_path: *const c_char,
+    embedding_cache_path: *const c_char,
 ) -> *mut WitchcraftHandle {
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<*mut WitchcraftHandle> {
         let db_path = string_from_ptr(db_path, "db_path")?;
         let assets_path = string_from_ptr(assets_path, "assets_path")?;
         let device = crate::make_device();
         let embedder = Embedder::new(&device, &PathBuf::from(assets_path))?;
+        let embedding_cache = embedding_cache_from_ptr(embedding_cache_path)?;
         let index = FileBackedIndex::new(PathBuf::from(db_path));
         let handle = WitchcraftHandle {
             state: Mutex::new(CApiState {
                 index,
                 device,
                 embedder,
+                embedding_cache,
                 query_cache: EmbeddingsCache::new(128),
             }),
             last_error: Mutex::new(None),
@@ -428,7 +455,7 @@ pub unsafe extern "C" fn witchcraft_embed(
             .state
             .lock()
             .map_err(|_| anyhow!("witchcraft handle lock poisoned"))?;
-        let embeddings = embed_for_capi(&state.embedder, &body_text, &lens)?;
+        let embeddings = embed_for_capi(&state, &body_text, &lens)?;
         encode_embedding_blob(&embeddings)
     }));
 
@@ -543,6 +570,7 @@ pub unsafe extern "C" fn witchcraft_search(
             index,
             device,
             embedder,
+            embedding_cache: _,
             query_cache,
         } = &mut *state;
         let q = query.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -560,14 +588,18 @@ pub unsafe extern "C" fn witchcraft_search(
         };
         let generation_files = index.generation_files()?;
         let active = index.active_rowids()?;
-        let scored = match_centroids_raw(&generation_files, &qe.to_device(device)?, &[], threshold, top_k)?;
+        let scored = match_centroids_raw(
+            &generation_files,
+            &qe.to_device(device)?,
+            &[],
+            threshold,
+            top_k,
+        )?;
         let mut results = Vec::with_capacity(scored.len());
         let mut seen = std::collections::HashMap::<u64, bool>::new();
         for (score, rowid, _sub_idx) in scored {
             let rowid = rowid as u64;
-            if active.get(&rowid).copied().unwrap_or(false)
-                && seen.insert(rowid, true).is_none()
-            {
+            if active.get(&rowid).copied().unwrap_or(false) && seen.insert(rowid, true).is_none() {
                 results.push(WitchcraftSearchHit { rowid, score });
                 if results.len() == top_k {
                     break;
@@ -612,9 +644,7 @@ pub unsafe extern "C" fn witchcraft_search_results_free(ptr: *mut WitchcraftSear
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn witchcraft_last_error(
-    handle: *mut WitchcraftHandle,
-) -> *const c_char {
+pub unsafe extern "C" fn witchcraft_last_error(handle: *mut WitchcraftHandle) -> *const c_char {
     if handle.is_null() {
         return match GLOBAL_LAST_ERROR.lock() {
             Ok(last_error) => last_error

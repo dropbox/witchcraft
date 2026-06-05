@@ -38,7 +38,9 @@ typedef struct WitchcraftSearchResults {
 extern "C" {
 #endif // __cplusplus
 
-struct WitchcraftHandle *witchcraft_open(const char *db_path, const char *assets_path);
+struct WitchcraftHandle *witchcraft_open(const char *db_path,
+                                         const char *assets_path,
+                                         const char *embedding_cache_path);
 
 void witchcraft_close(struct WitchcraftHandle *handle);
 
