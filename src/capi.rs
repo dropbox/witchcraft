@@ -1,7 +1,9 @@
 use crate::{
     index_buffered_embeddings, match_centroids_raw, CachedEmbeddings, Embedder, EmbeddingCache,
-    EmbeddingsCache, FileBackedIndex, FileEmbeddingCache,
+    EmbeddingsCache, FileBackedIndex,
 };
+#[cfg(feature = "capi-embed-cache")]
+use crate::FileEmbeddingCache;
 use anyhow::{anyhow, Result};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
@@ -29,6 +31,7 @@ struct CApiState {
     index: FileBackedIndex,
     device: candle_core::Device,
     embedder: Embedder,
+    #[cfg(feature = "capi-embed-cache")]
     embedding_cache: FileEmbeddingCache,
     query_cache: EmbeddingsCache,
 }
@@ -96,6 +99,7 @@ unsafe fn string_from_ptr(ptr: *const c_char, name: &str) -> Result<String> {
     Ok(CStr::from_ptr(ptr).to_str()?.to_string())
 }
 
+#[cfg(feature = "capi-embed-cache")]
 unsafe fn embedding_cache_from_ptr(ptr: *const c_char) -> Result<FileEmbeddingCache> {
     if ptr.is_null() {
         return Ok(crate::default_embedding_cache());
@@ -396,13 +400,17 @@ pub unsafe extern "C" fn witchcraft_open(
         let assets_path = string_from_ptr(assets_path, "assets_path")?;
         let device = crate::make_device();
         let embedder = Embedder::new(&device, &PathBuf::from(assets_path))?;
+        #[cfg(feature = "capi-embed-cache")]
         let embedding_cache = embedding_cache_from_ptr(embedding_cache_path)?;
+        #[cfg(not(feature = "capi-embed-cache"))]
+        let _ = embedding_cache_path;
         let index = FileBackedIndex::new(PathBuf::from(db_path));
         let handle = WitchcraftHandle {
             state: Mutex::new(CApiState {
                 index,
                 device,
                 embedder,
+                #[cfg(feature = "capi-embed-cache")]
                 embedding_cache,
                 query_cache: EmbeddingsCache::new(128),
             }),
@@ -570,8 +578,8 @@ pub unsafe extern "C" fn witchcraft_search(
             index,
             device,
             embedder,
-            embedding_cache: _,
             query_cache,
+            ..
         } = &mut *state;
         let q = query.split_whitespace().collect::<Vec<_>>().join(" ");
         if q.len() <= 3 {
