@@ -6,8 +6,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-pub(crate) const GENERATION_DATA_VERSION: u32 = 3;
-pub(crate) const GENERATION_DATA_MAGIC: [u8; 8] = *b"WRPBKT03";
+pub(crate) const GENERATION_DATA_VERSION: u32 = 4;
+pub(crate) const GENERATION_DATA_MAGIC: [u8; 8] = *b"WRPBKT04";
 pub(crate) const GENERATION_DATA_HEADER_BYTES: usize =
     std::mem::size_of::<u32>() + GENERATION_DATA_MAGIC.len() + 4 * std::mem::size_of::<u64>();
 

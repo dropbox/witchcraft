@@ -132,11 +132,7 @@ const DEFAULT_EMBEDDING_DIM: usize = 128;
 const DOCUMENT_CACHE_HASH_CHARS: usize = 32;
 const BUCKET_DATA_VERSION: u32 = file_index::GENERATION_DATA_VERSION;
 const BUCKET_DATA_MAGIC: [u8; 8] = file_index::GENERATION_DATA_MAGIC;
-const LEGACY_BUCKET_DATA_VERSION: u32 = 2;
-const LEGACY_BUCKET_DATA_MAGIC: [u8; 8] = *b"WRPBKT02";
 const BUCKET_META_PREFIX_BYTES: usize = 20;
-const LEGACY_BUCKET_DATA_HEADER_BYTES: usize =
-    std::mem::size_of::<u32>() + BUCKET_DATA_MAGIC.len() + 3 * std::mem::size_of::<u64>();
 const BUCKET_DATA_HEADER_BYTES: usize = file_index::GENERATION_DATA_HEADER_BYTES;
 #[cfg(not(test))]
 const L0_CAPACITY: usize = 1024;
@@ -570,6 +566,21 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes[offset..offset + 8].try_into()?))
 }
 
+fn write_u64_le(bytes: &mut Vec<u8>, value: usize) -> Result<()> {
+    bytes.write_all(&u64::try_from(value)?.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_tree_u64(bytes: &[u8], cursor: &mut usize) -> Result<usize> {
+    let end = cursor
+        .checked_add(std::mem::size_of::<u64>())
+        .ok_or_else(|| anyhow::anyhow!("coarse tree cursor overflow"))?;
+    anyhow::ensure!(end <= bytes.len(), "coarse tree data is truncated");
+    let value = u64::from_le_bytes(bytes[*cursor..end].try_into()?);
+    *cursor = end;
+    Ok(value.try_into()?)
+}
+
 #[cfg(all(not(unix), windows))]
 fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     use std::os::windows::io::AsRawHandle;
@@ -747,7 +758,7 @@ fn read_contiguous_exact_at(file: &File, offset: u64, len: usize) -> io::Result<
 
 fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<BucketDataHeader> {
     anyhow::ensure!(
-        sidecar_len >= LEGACY_BUCKET_DATA_HEADER_BYTES,
+        sidecar_len >= BUCKET_DATA_HEADER_BYTES,
         "bucket sidecar is too small: {} bytes",
         sidecar_len
     );
@@ -756,41 +767,24 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
         "bucket sidecar header is too small"
     );
     let version = read_u32_le(prefix, 0)?;
-    let header_len = match version {
-        BUCKET_DATA_VERSION => BUCKET_DATA_HEADER_BYTES,
-        LEGACY_BUCKET_DATA_VERSION => LEGACY_BUCKET_DATA_HEADER_BYTES,
-        _ => anyhow::bail!(
-            "bucket sidecar version {version} is not supported; run ./warp-cli reindex"
-        ),
-    };
     anyhow::ensure!(
-        sidecar_len >= header_len,
-        "bucket sidecar is too small: {} bytes",
-        sidecar_len
+        version == BUCKET_DATA_VERSION,
+        "bucket sidecar version {version} is not supported; run ./warp-cli reindex"
     );
     anyhow::ensure!(
-        header_len <= prefix.len(),
+        BUCKET_DATA_HEADER_BYTES <= prefix.len(),
         "bucket sidecar header read was too short"
     );
     anyhow::ensure!(
-        if version == BUCKET_DATA_VERSION {
-            &prefix[4..4 + BUCKET_DATA_MAGIC.len()] == BUCKET_DATA_MAGIC.as_slice()
-        } else {
-            &prefix[4..4 + LEGACY_BUCKET_DATA_MAGIC.len()]
-                == LEGACY_BUCKET_DATA_MAGIC.as_slice()
-        },
+        &prefix[4..4 + BUCKET_DATA_MAGIC.len()] == BUCKET_DATA_MAGIC.as_slice(),
         "bucket sidecar has an invalid header; run ./warp-cli reindex"
     );
     let centroid_count: usize = read_u64_le(prefix, 12)?.try_into()?;
     let meta_offset: usize = read_u64_le(prefix, 20)?.try_into()?;
     let payload_offset: usize = read_u64_le(prefix, 28)?.try_into()?;
-    let rowids_offset: usize = if version == BUCKET_DATA_VERSION {
-        read_u64_le(prefix, 36)?.try_into()?
-    } else {
-        sidecar_len
-    };
+    let rowids_offset: usize = read_u64_le(prefix, 36)?.try_into()?;
     anyhow::ensure!(
-        meta_offset >= header_len
+        meta_offset >= BUCKET_DATA_HEADER_BYTES
             && payload_offset >= meta_offset
             && rowids_offset >= payload_offset
             && rowids_offset <= sidecar_len,
@@ -892,6 +886,47 @@ fn bucket_data_bucket_meta_from_block(
     Ok(metas)
 }
 
+fn bucket_data_payload_end(
+    header: &BucketDataHeader,
+    metas: &[BucketSidecarMeta],
+) -> Result<usize> {
+    let mut payload_end = header.payload_offset;
+    for (bucket_idx, meta) in metas.iter().enumerate() {
+        let data_offset: usize = meta.data_offset.try_into()?;
+        let bucket_end = data_offset
+            .checked_add(meta.indices_len)
+            .and_then(|offset| offset.checked_add(meta.residual_len))
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_idx} data length overflow"))?;
+        payload_end = payload_end.max(bucket_end);
+    }
+    anyhow::ensure!(
+        payload_end <= header.rowids_offset,
+        "bucket payload ends beyond rowid offset"
+    );
+    Ok(payload_end)
+}
+
+fn bucket_data_coarse_tree_from_file(
+    file: &File,
+    header: &BucketDataHeader,
+    metas: &[BucketSidecarMeta],
+    device: &Device,
+) -> Result<CoarseTree> {
+    let payload_end = bucket_data_payload_end(header, metas)?;
+    let tree_len = header
+        .rowids_offset
+        .checked_sub(payload_end)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar tree range is invalid"))?;
+    anyhow::ensure!(
+        tree_len >= std::mem::size_of::<u64>(),
+        "bucket sidecar is missing coarse tree data; run ./warp-cli reindex"
+    );
+    let mut tree_bytes = vec![0; tree_len];
+    let mut buffers = [tree_bytes.as_mut_slice()];
+    readv_exact_at(file, payload_end as u64, &mut buffers)?;
+    deserialize_coarse_tree(&tree_bytes, device)
+}
+
 fn write_bucket_meta(writer: &mut impl Write, meta: &BucketSidecarMeta) -> Result<()> {
     let center_bytes = meta.center.len();
     anyhow::ensure!(
@@ -904,6 +939,27 @@ fn write_bucket_meta(writer: &mut impl Write, meta: &BucketSidecarMeta) -> Resul
     writer.write_all(&u32::try_from(meta.residual_len)?.to_le_bytes())?;
     writer.write_all(&meta.center)?;
     Ok(())
+}
+
+fn serialize_coarse_tree_from_bucket_meta(
+    bucket_meta: &[BucketSidecarMeta],
+    center_dim: usize,
+) -> Result<Vec<u8>> {
+    let mut centers = vec![];
+    for meta in bucket_meta {
+        if meta.size == 0 {
+            continue;
+        }
+        let center = Tensor::from_f32_bytes(&meta.center, center_dim, &Device::Cpu)?.flatten_all()?;
+        centers.push(center);
+    }
+    let tree = if centers.is_empty() {
+        CoarseTree { levels: vec![] }
+    } else {
+        let centers = Tensor::stack(&centers, 0)?;
+        build_coarse_tree_from_centers(&centers, &Device::Cpu)?
+    };
+    serialize_coarse_tree(&tree)
 }
 
 fn merge_and_write_buckets_to_path(
@@ -987,6 +1043,7 @@ fn merge_and_write_buckets_to_path(
     data_writer.flush()?;
     drop(data_writer);
 
+    let coarse_tree_bytes = serialize_coarse_tree_from_bucket_meta(&bucket_meta, center_dim)?;
     let meta_block_len = centroid_count
         .checked_mul(bucket_meta_bytes)
         .ok_or_else(|| anyhow::anyhow!("bucket metadata block length overflow"))?;
@@ -997,6 +1054,7 @@ fn merge_and_write_buckets_to_path(
     let payload_start = u64::try_from(payload_start)?;
     let rowids_offset = payload_start
         .checked_add(data_offset)
+        .and_then(|offset| offset.checked_add(u64::try_from(coarse_tree_bytes.len()).ok()?))
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar rowid offset overflow"))?;
 
     let mut bucket_data_writer = NewFileWriter::create_new(&tmp_path)?;
@@ -1016,6 +1074,7 @@ fn merge_and_write_buckets_to_path(
     }
     let mut data_reader = data_tmp.reopen()?;
     std::io::copy(&mut data_reader, &mut bucket_data_writer)?;
+    bucket_data_writer.write_all(&coarse_tree_bytes)?;
     write_rowid_records_to_writer(&mut bucket_data_writer, rowid_records)?;
     bucket_data_writer.finish()?;
     std::fs::rename(&tmp_path, &final_path)?;
@@ -1192,7 +1251,7 @@ pub struct GenerationCentroids {
     sidecar_len: usize,
     data_file: Arc<File>,
     centers_matrix: Tensor,
-    coarse_tree: Option<CoarseTree>,
+    coarse_tree: CoarseTree,
 }
 
 static GENERATIONS_CACHE: Lazy<RwLock<HashMap<Vec<PathBuf>, Arc<Vec<GenerationCentroids>>>>> =
@@ -1209,10 +1268,10 @@ fn clear_generations_cache() {
 fn build_coarse_tree_from_centers(
     leaf_centers: &Tensor,
     device: &Device,
-) -> Result<Option<CoarseTree>> {
+) -> Result<CoarseTree> {
     let (leaf_count, _) = leaf_centers.dims2()?;
     if leaf_count <= COARSE_TREE_BRANCHING {
-        return Ok(None);
+        return Ok(CoarseTree { levels: vec![] });
     }
 
     let mut levels = vec![];
@@ -1259,14 +1318,94 @@ fn build_coarse_tree_from_centers(
         current_count = k_coarse;
     }
 
-    Ok(Some(CoarseTree { levels }))
+    Ok(CoarseTree { levels })
+}
+
+fn serialize_coarse_tree(tree: &CoarseTree) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    write_u64_le(&mut bytes, tree.levels.len())?;
+
+    for level in &tree.levels {
+        let centers = level.centers.to_device(&Device::Cpu)?;
+        let (center_count, dim) = centers.dims2()?;
+        anyhow::ensure!(
+            center_count == level.children.len(),
+            "coarse tree level has {} centers but {} child lists",
+            center_count,
+            level.children.len()
+        );
+        write_u64_le(&mut bytes, center_count)?;
+        write_u64_le(&mut bytes, dim)?;
+        bytes.write_all(&centers.to_f32_bytes()?)?;
+        for children in &level.children {
+            write_u64_le(&mut bytes, children.len())?;
+            for &child in children {
+                write_u64_le(&mut bytes, child)?;
+            }
+        }
+    }
+
+    Ok(bytes)
+}
+
+fn deserialize_coarse_tree(bytes: &[u8], device: &Device) -> Result<CoarseTree> {
+    anyhow::ensure!(
+        bytes.len() >= std::mem::size_of::<u64>(),
+        "coarse tree data is too small"
+    );
+    let mut cursor = 0;
+    let level_count = read_tree_u64(bytes, &mut cursor)?;
+    anyhow::ensure!(
+        level_count <= bytes.len() / std::mem::size_of::<u64>(),
+        "coarse tree level count is invalid"
+    );
+    let mut levels = Vec::with_capacity(level_count);
+
+    for _ in 0..level_count {
+        let center_count = read_tree_u64(bytes, &mut cursor)?;
+        let dim = read_tree_u64(bytes, &mut cursor)?;
+        anyhow::ensure!(
+            center_count <= bytes.len() / std::mem::size_of::<u64>(),
+            "coarse tree center count is invalid"
+        );
+        let center_bytes_len = center_count
+            .checked_mul(dim)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("coarse tree center byte length overflow"))?;
+        let center_end = cursor
+            .checked_add(center_bytes_len)
+            .ok_or_else(|| anyhow::anyhow!("coarse tree center cursor overflow"))?;
+        anyhow::ensure!(center_end <= bytes.len(), "coarse tree center data is truncated");
+        let centers = Tensor::from_f32_bytes(&bytes[cursor..center_end], dim, device)?;
+        cursor = center_end;
+
+        let mut children = Vec::with_capacity(center_count);
+        for _ in 0..center_count {
+            let child_count = read_tree_u64(bytes, &mut cursor)?;
+            anyhow::ensure!(
+                child_count <= bytes.len() / std::mem::size_of::<u64>(),
+                "coarse tree child count is invalid"
+            );
+            let mut child_list = Vec::with_capacity(child_count);
+            for _ in 0..child_count {
+                child_list.push(read_tree_u64(bytes, &mut cursor)?);
+            }
+            children.push(child_list);
+        }
+
+        levels.push(CoarseTreeLevel { centers, children });
+    }
+
+    anyhow::ensure!(
+        cursor == bytes.len(),
+        "coarse tree sidecar data has trailing bytes"
+    );
+    Ok(CoarseTree { levels })
 }
 
 impl GenerationCentroids {
     fn routed_centroid_candidates(&self, query_embeddings: &Tensor) -> Result<Vec<usize>> {
-        let Some(tree) = &self.coarse_tree else {
-            return Ok((0..self.sizes.len()).collect());
-        };
+        let tree = &self.coarse_tree;
         if tree.levels.is_empty() {
             return Ok((0..self.sizes.len()).collect());
         }
@@ -1491,6 +1630,7 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
         let sidecar_len: usize = file.metadata()?.len().try_into()?;
         let header = bucket_data_header_from_file(&file, sidecar_len)?;
         let metas = bucket_data_bucket_meta_from_file(&file, &header)?;
+        let coarse_tree = bucket_data_coarse_tree_from_file(&file, &header, &metas, device)?;
         let residual_bytes = residual_bytes_for_dim(header.embedding_dim);
 
         let mut bucket_indices = vec![];
@@ -1518,8 +1658,6 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
         } else {
             Tensor::zeros(&[0, header.embedding_dim], DType::F32, device)?
         };
-        let coarse_tree = build_coarse_tree_from_centers(&centers_matrix, device)?;
-
         all.push(GenerationCentroids {
             dim: header.embedding_dim,
             residual_bytes,
