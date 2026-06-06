@@ -145,6 +145,8 @@ const LSM_FANOUT: usize = 16;
 const LSM_FANOUT: usize = 2;
 const COARSE_TREE_BRANCHING: usize = 16;
 const INDEX_KMEANS_BRANCHING: usize = 128;
+const INDEX_ASSIGNMENT_BEAM: usize = 2;
+const KMEANS_MATMUL_BATCH: usize = 4096;
 const INDEX_KMEANS_ITERATIONS: usize = 5;
 const INDEX_BATCH_SIZE: usize = 0x10000;
 
@@ -380,6 +382,71 @@ fn matmul_argmax_batched(
     Ok(Tensor::from_vec(assignments, m, device)?)
 }
 
+fn matmul_argmax_scores_batched(
+    t: &Tensor,
+    centers: &fast_ops::PackedRight,
+    batch_size: usize,
+) -> Result<Vec<(u32, f32)>> {
+    let (m, _n) = t.dims2()?;
+    let mut assignments = Vec::with_capacity(m);
+
+    for start in (0..m).step_by(batch_size) {
+        let end = (start + batch_size).min(m);
+        let batch_len = end - start;
+        let batch = t.narrow(0, start, batch_len)?;
+        let sim = centers.matmul(&batch)?.to_device(&Device::Cpu)?;
+        for row in sim.to_vec2::<f32>()? {
+            let mut best_idx = 0u32;
+            let mut best_score = f32::NEG_INFINITY;
+            for (idx, score) in row.into_iter().enumerate() {
+                if score > best_score {
+                    best_idx = idx as u32;
+                    best_score = score;
+                }
+            }
+            assignments.push((best_idx, best_score));
+        }
+    }
+
+    Ok(assignments)
+}
+
+fn matmul_top2_batched(
+    t: &Tensor,
+    centers: &fast_ops::PackedRight,
+    batch_size: usize,
+) -> Result<Vec<(u32, u32)>> {
+    let (m, _n) = t.dims2()?;
+    let mut assignments = Vec::with_capacity(m);
+
+    for start in (0..m).step_by(batch_size) {
+        let end = (start + batch_size).min(m);
+        let batch_len = end - start;
+        let batch = t.narrow(0, start, batch_len)?;
+        let sim = centers.matmul(&batch)?.to_device(&Device::Cpu)?;
+        for row in sim.to_vec2::<f32>()? {
+            let mut best_idx = 0u32;
+            let mut second_idx = 0u32;
+            let mut best_score = f32::NEG_INFINITY;
+            let mut second_score = f32::NEG_INFINITY;
+            for (idx, score) in row.into_iter().enumerate() {
+                if score > best_score {
+                    second_score = best_score;
+                    second_idx = best_idx;
+                    best_score = score;
+                    best_idx = idx as u32;
+                } else if score > second_score {
+                    second_score = score;
+                    second_idx = idx as u32;
+                }
+            }
+            assignments.push((best_idx, second_idx));
+        }
+    }
+
+    Ok(assignments)
+}
+
 fn kmeans_inner(
     data: &Tensor,
     k: usize,
@@ -388,6 +455,25 @@ fn kmeans_inner(
 ) -> Result<Tensor> {
     let (m, n) = data.dims2()?;
     debug!("kmeans k={} m={} n={}...", k, m, n);
+    if k == 1 {
+        let data_flat = data.flatten_all()?.to_vec1::<f32>()?;
+        let mut center = vec![0f32; n];
+        for row in data_flat.chunks_exact(n) {
+            for (dst, value) in center.iter_mut().zip(row) {
+                *dst += value;
+            }
+        }
+        let norm: f32 = center.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut center {
+                *value /= norm;
+            }
+        }
+        if let Some(bar) = bar {
+            bar.inc(1);
+        }
+        return Ok(Tensor::from_vec(center, (1, n), data.device())?);
+    }
 
     let _priority_mgr = PriorityManager::new();
     let device = data.device();
@@ -408,7 +494,7 @@ fn kmeans_inner(
 
     for _ in 0..max_iter {
         let packed_centers = fast_ops::PackedRight::new(&centers)?;
-        let cluster_assignments = matmul_argmax_batched(data, &packed_centers, 1024)?;
+        let cluster_assignments = matmul_argmax_batched(data, &packed_centers, KMEANS_MATMUL_BATCH)?;
         let assignments = cluster_assignments.to_vec1::<u32>()?;
 
         // Single O(m × n) pass: accumulate per-cluster sums directly into a
@@ -457,8 +543,8 @@ fn kmeans_inner(
 }
 
 fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
-    let total: u64 = (max_iter * k).try_into()?;
-    let bar = progress::new_with_label(total, "kmeans");
+    let total = if k == 1 { 1 } else { max_iter * k };
+    let bar = progress::new_with_label(total as u64, "kmeans");
     let centers = kmeans_inner(data, k, max_iter, Some(&bar))?;
     bar.finish();
     Ok(centers)
@@ -1239,6 +1325,17 @@ struct CoarseTree {
     levels: Vec<CoarseTreeLevel>,
 }
 
+struct IndexKMeans {
+    centers: Tensor,
+    routing: IndexKMeansNode,
+}
+
+struct IndexKMeansNode {
+    packed_centers: fast_ops::PackedRight,
+    children: Vec<IndexKMeansNode>,
+    leaf_offset: usize,
+}
+
 /// Per-generation centroid data loaded from sidecar files.
 pub struct GenerationCentroids {
     dim: usize,
@@ -1292,7 +1389,7 @@ fn build_coarse_tree_from_centers(
         );
         let super_centers = kmeans(&current_centers, k_coarse, 5)?;
         let packed = fast_ops::PackedRight::new(&super_centers)?;
-        let assignments = matmul_argmax_batched(&current_centers, &packed, 1024)?;
+        let assignments = matmul_argmax_batched(&current_centers, &packed, KMEANS_MATMUL_BATCH)?;
         let assignments = assignments.to_vec1::<u32>()?;
 
         let mut children_map: Vec<Vec<u32>> = vec![vec![]; k_coarse];
@@ -2302,19 +2399,34 @@ fn hierarchical_kmeans_for_index(
     target_k: usize,
     max_iter: usize,
     bar: Option<&progress::Bar>,
-) -> Result<Tensor> {
+    next_leaf_offset: &mut usize,
+) -> Result<IndexKMeans> {
     let (m, _) = data.dims2()?;
     let target_k = target_k.min(m);
     anyhow::ensure!(target_k > 0, "cannot build index kmeans with zero centers");
 
     if target_k <= INDEX_KMEANS_BRANCHING || m <= INDEX_KMEANS_BRANCHING {
-        return kmeans_inner(data, target_k, max_iter, bar);
+        let centers = kmeans_inner(data, target_k, max_iter, None)?;
+        let packed_centers = fast_ops::PackedRight::new(&centers)?;
+        let leaf_offset = *next_leaf_offset;
+        *next_leaf_offset += target_k;
+        if let Some(bar) = bar {
+            bar.inc(target_k as u64);
+        }
+        return Ok(IndexKMeans {
+            centers: centers.clone(),
+            routing: IndexKMeansNode {
+                packed_centers,
+                children: vec![],
+                leaf_offset,
+            },
+        });
     }
 
     let branch_k = INDEX_KMEANS_BRANCHING.min(target_k).min(m);
-    let coarse = kmeans_inner(data, branch_k, max_iter, bar)?;
+    let coarse = kmeans_inner(data, branch_k, max_iter, None)?;
     let packed = fast_ops::PackedRight::new(&coarse)?;
-    let assignments = matmul_argmax_batched(data, &packed, 1024)?
+    let assignments = matmul_argmax_batched(data, &packed, KMEANS_MATMUL_BATCH)?
         .to_device(&Device::Cpu)?
         .to_vec1::<u32>()?;
 
@@ -2325,10 +2437,26 @@ fn hierarchical_kmeans_for_index(
     let counts: Vec<usize> = row_groups.iter().map(Vec::len).collect();
     let active_children = counts.iter().filter(|&&count| count > 0).count();
     if active_children <= 1 {
-        return sample_centers(data, target_k);
+        let centers = sample_centers(data, target_k)?;
+        let packed_centers = fast_ops::PackedRight::new(&centers)?;
+        let leaf_offset = *next_leaf_offset;
+        *next_leaf_offset += target_k;
+        if let Some(bar) = bar {
+            bar.inc(target_k as u64);
+        }
+        return Ok(IndexKMeans {
+            centers: centers.clone(),
+            routing: IndexKMeansNode {
+                packed_centers,
+                children: vec![],
+                leaf_offset,
+            },
+        });
     }
 
     let child_targets = allocate_child_kmeans_targets(&counts, target_k);
+    let mut routing_centers = Vec::new();
+    let mut child_nodes = Vec::new();
     let mut child_centers = Vec::new();
 
     for child_idx in 0..branch_k {
@@ -2343,14 +2471,26 @@ fn hierarchical_kmeans_for_index(
             child_target,
             max_iter,
             bar,
+            next_leaf_offset,
         )?;
-        child_centers.push(child);
+        routing_centers.push(coarse.get(child_idx)?);
+        child_centers.push(child.centers);
+        child_nodes.push(child.routing);
     }
 
-    Ok(Tensor::cat(&child_centers, 0)?)
+    let routing = Tensor::stack(&routing_centers, 0)?.to_device(data.device())?;
+    let packed_centers = fast_ops::PackedRight::new(&routing)?;
+    Ok(IndexKMeans {
+        centers: Tensor::cat(&child_centers, 0)?,
+        routing: IndexKMeansNode {
+            packed_centers,
+            children: child_nodes,
+            leaf_offset: 0,
+        },
+    })
 }
 
-fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tensor> {
+fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<IndexKMeans> {
     let now = std::time::Instant::now();
     let mut k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
     k = k.max(1);
@@ -2359,21 +2499,163 @@ fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tens
     if m < k {
         k = (m / 4).max(1);
     }
-    let total: u64 = (INDEX_KMEANS_ITERATIONS * k).try_into()?;
-    let bar = progress::new_with_label(total, "kmeans");
+    let bar = progress::new_with_label(k as u64, "kmeans");
+    let mut next_leaf_offset = 0;
     let centers = hierarchical_kmeans_for_index(
         matrix,
         k,
         INDEX_KMEANS_ITERATIONS,
         Some(&bar),
+        &mut next_leaf_offset,
     )?;
     bar.finish();
     anyhow::ensure!(
-        centers.dims2()?.0 > 0,
+        centers.centers.dims2()?.0 == next_leaf_offset,
+        "index kmeans produced inconsistent leaf offsets"
+    );
+    anyhow::ensure!(
+        next_leaf_offset > 0,
         "index kmeans produced no centers"
     );
     debug!("kmeans took {} ms.", now.elapsed().as_millis());
     Ok(centers)
+}
+
+fn assign_with_index_kmeans_node(
+    data: &Tensor,
+    node: &IndexKMeansNode,
+    row_indices: &[usize],
+    assignments: &mut [u32],
+    best_scores: &mut [f32],
+) -> Result<()> {
+    let (m, _) = data.dims2()?;
+    if m == 0 {
+        return Ok(());
+    }
+
+    if node.children.is_empty() {
+        let local_assignments =
+            matmul_argmax_scores_batched(data, &node.packed_centers, KMEANS_MATMUL_BATCH)?;
+        for (row, &bucket) in local_assignments.iter().enumerate() {
+            let global_row = row_indices[row];
+            if bucket.1 > best_scores[global_row] {
+                best_scores[global_row] = bucket.1;
+                assignments[global_row] = (node.leaf_offset + bucket.0 as usize).try_into()?;
+            }
+        }
+        return Ok(());
+    }
+
+    debug_assert_eq!(INDEX_ASSIGNMENT_BEAM, 2);
+    let local_assignments = matmul_top2_batched(data, &node.packed_centers, KMEANS_MATMUL_BATCH)?;
+    let mut child_rows = vec![Vec::<u32>::new(); node.children.len()];
+    let mut child_row_indices = vec![Vec::<usize>::new(); node.children.len()];
+    for (row, &(best_child, second_child)) in local_assignments.iter().enumerate() {
+        for child in [best_child, second_child] {
+            let child = child as usize;
+            anyhow::ensure!(
+                child < node.children.len(),
+                "index kmeans routed row to missing child {child}"
+            );
+            child_rows[child].push(row as u32);
+            child_row_indices[child].push(row_indices[row]);
+        }
+    }
+
+    for (child_idx, rows) in child_rows.iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        let child_data = select_tensor_rows(data, rows)?;
+        assign_with_index_kmeans_node(
+            &child_data,
+            &node.children[child_idx],
+            &child_row_indices[child_idx],
+            assignments,
+            best_scores,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn assign_with_index_kmeans(data: &Tensor, routing: &IndexKMeansNode) -> Result<Vec<u32>> {
+    let (m, _) = data.dims2()?;
+    let mut assignments = vec![0u32; m];
+    let mut best_scores = vec![f32::NEG_INFINITY; m];
+    let row_indices: Vec<usize> = (0..m).collect();
+    assign_with_index_kmeans_node(
+        data,
+        routing,
+        &row_indices,
+        &mut assignments,
+        &mut best_scores,
+    )?;
+    Ok(assignments)
+}
+
+fn write_bucket_batch(
+    embeddings: Vec<Tensor>,
+    indices: Vec<DocPtr>,
+    index_kmeans: &IndexKMeans,
+    centers_cpu: &Tensor,
+    residual_bytes: usize,
+    device: &Device,
+) -> Result<(tempfile::NamedTempFile, u128, u128)> {
+    let now = std::time::Instant::now();
+    let data_cpu = Tensor::cat(&embeddings, 0)?;
+    let data = data_cpu.to_device(device)?;
+    let cluster_assignments = assign_with_index_kmeans(&data, &index_kmeans.routing)?;
+    let mmuls_ms = now.elapsed().as_millis();
+
+    let now = std::time::Instant::now();
+    let mut writer = merger::Writer::new(residual_bytes)?;
+
+    let mut pairs: Vec<(usize, u32)> = cluster_assignments
+        .iter()
+        .enumerate()
+        .map(|(i, &bucket)| (i, bucket))
+        .collect();
+    pairs.sort_by_key(|&(_, bucket)| bucket);
+
+    let mut keys: Vec<(u32, u32)> = Vec::with_capacity(indices.len());
+    let mut residuals_bytes: Vec<u8> = Vec::with_capacity(indices.len() * residual_bytes);
+    let (_, mut prev_bucket) = pairs[0];
+
+    for (sample, bucket) in pairs.iter().copied().chain(std::iter::once((0, u32::MAX))) {
+        let bucket_done = bucket == u32::MAX;
+
+        if (bucket != prev_bucket || bucket_done) && !keys.is_empty() {
+            assert!(prev_bucket < bucket);
+            writer.write_record(prev_bucket, &keys, &residuals_bytes)?;
+
+            keys.clear();
+            residuals_bytes.clear();
+            prev_bucket = bucket;
+        }
+
+        if bucket_done {
+            break;
+        }
+
+        match indices.get(sample) {
+            Some(pair) => {
+                keys.push(*pair);
+            }
+            None => {
+                warn!("unable to get key pair from indices @{sample}");
+                keys.push((0, 0));
+            }
+        }
+
+        let center = centers_cpu.get(bucket as usize)?;
+        let residual = (&data_cpu.get(sample)? - &center)?;
+        let residual_quantized = packops::residual_to_temp_bytes(&residual)?;
+        residuals_bytes.extend(&residual_quantized);
+    }
+
+    let tmpfile = writer.finish()?;
+    Ok((tmpfile, mmuls_ms, now.elapsed().as_millis()))
 }
 
 fn level_capacity(level: u32) -> usize {
@@ -2383,7 +2665,7 @@ fn level_capacity(level: u32) -> usize {
 fn write_buckets_for_rowids(
     records: &[RowidRecord],
     cache: &dyn EmbeddingCache,
-    centers: &Tensor,
+    index_kmeans: &IndexKMeans,
     device: &Device,
     expected_count: u64,
 ) -> Result<(Vec<tempfile::NamedTempFile>, Tensor)> {
@@ -2400,10 +2682,10 @@ fn write_buckets_for_rowids(
     let mut done = false;
     let mut batch = 0;
     let mut tmpfiles = vec![];
+    let centers = &index_kmeans.centers;
     let centers_cpu = centers.to_device(&Device::Cpu)?;
     let (_, center_dim) = centers_cpu.dims2()?;
     let residual_bytes = packops::temp_residual_bytes_for_dim(center_dim);
-    let packed_centers = fast_ops::PackedRight::new(centers)?;
     while !done {
         match records.next() {
             Some(record) => {
@@ -2429,8 +2711,7 @@ fn write_buckets_for_rowids(
                     "document embedding dimension {dim} does not match index center dimension {center_dim}"
                 );
                 let t = Tensor::embeddings_from_packed(&embeddings.embeddings, dim, &Device::Cpu)?;
-                let split = split_tensor(&t);
-                let m = split.len();
+                let (m, _) = t.dims2()?;
 
                 let docptrs = docptrs_for_counts(id, &embeddings.counts);
                 anyhow::ensure!(
@@ -2438,8 +2719,24 @@ fn write_buckets_for_rowids(
                     "document {id} has {m} embedding rows but {} document indices",
                     docptrs.len()
                 );
+                if batch > 0 && batch + m > INDEX_BATCH_SIZE {
+                    let (tmpfile, mmuls_ms, writes_ms) = write_bucket_batch(
+                        std::mem::take(&mut all_embeddings),
+                        std::mem::take(&mut document_indices),
+                        index_kmeans,
+                        &centers_cpu,
+                        residual_bytes,
+                        device,
+                    )?;
+                    tmpfiles.push(tmpfile);
+                    mmuls_total += mmuls_ms;
+                    writes_total += writes_ms;
+                    bar.inc(batch as u64);
+                    batch = 0;
+                }
+
                 document_indices.extend(docptrs);
-                all_embeddings.extend(split);
+                all_embeddings.push(t);
                 batch += m;
             }
             None => {
@@ -2451,70 +2748,20 @@ fn write_buckets_for_rowids(
             if batch == 0 {
                 continue;
             }
-            let now = std::time::Instant::now();
-
-            let take = batch.min(INDEX_BATCH_SIZE);
-            let left = batch - take;
-
-            let embeddings = all_embeddings.split_off(left);
-            let indices = document_indices.split_off(left);
-            let data = Tensor::cat(&embeddings, 0)?.to_device(device)?;
-
-            let cluster_assignments = matmul_argmax_batched(&data, &packed_centers, 1024)?
-                .to_device(&Device::Cpu)?
-                .to_vec1::<u32>()?;
-            mmuls_total += now.elapsed().as_millis();
-
-            let now = std::time::Instant::now();
-            let mut writer = merger::Writer::new(residual_bytes)?;
-
-            let mut pairs: Vec<(usize, u32)> = cluster_assignments
-                .iter()
-                .enumerate()
-                .map(|(i, &bucket)| (i, bucket))
-                .collect();
-            pairs.sort_by_key(|&(_, bucket)| bucket);
-
-            let mut keys: Vec<(u32, u32)> = Vec::with_capacity(take);
-            let mut residuals_bytes: Vec<u8> = Vec::with_capacity(take * residual_bytes);
-            let (_, mut prev_bucket) = pairs[0];
-
-            for (sample, bucket) in pairs.iter().copied().chain(std::iter::once((0, u32::MAX))) {
-                let bucket_done = bucket == u32::MAX;
-
-                if (bucket != prev_bucket || bucket_done) && !keys.is_empty() {
-                    assert!(prev_bucket < bucket);
-                    writer.write_record(prev_bucket, &keys, &residuals_bytes)?;
-
-                    keys.clear();
-                    residuals_bytes.clear();
-                    prev_bucket = bucket;
-                }
-
-                if bucket_done {
-                    break;
-                }
-
-                match indices.get(sample) {
-                    Some(pair) => {
-                        keys.push(*pair);
-                    }
-                    None => {
-                        warn!("unable to get key pair from indices @{sample}");
-                        keys.push((0, 0));
-                    }
-                }
-
-                let center = centers_cpu.get(bucket as usize)?;
-                let residual = (embeddings[sample].get(0) - &center)?;
-                let residual_quantized = packops::residual_to_temp_bytes(&residual)?;
-                residuals_bytes.extend(&residual_quantized);
-            }
-            tmpfiles.push(writer.finish()?);
-            writes_total += now.elapsed().as_millis();
-            bar.inc(take as u64);
-
-            batch = left;
+            let flushed = batch;
+            let (tmpfile, mmuls_ms, writes_ms) = write_bucket_batch(
+                std::mem::take(&mut all_embeddings),
+                std::mem::take(&mut document_indices),
+                index_kmeans,
+                &centers_cpu,
+                residual_bytes,
+                device,
+            )?;
+            tmpfiles.push(tmpfile);
+            mmuls_total += mmuls_ms;
+            writes_total += writes_ms;
+            bar.inc(flushed as u64);
+            batch = 0;
         }
     }
     bar.finish();
