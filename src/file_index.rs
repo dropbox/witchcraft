@@ -1,19 +1,21 @@
 use anyhow::Result;
+use crate::app_id::APP_ID_U32;
 use crate::file_writer::NewFileWriter;
+use log::warn;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-pub(crate) const GENERATION_DATA_VERSION: u32 = 4;
-pub(crate) const GENERATION_DATA_MAGIC: [u8; 8] = *b"WRPBKT04";
+pub(crate) const GENERATION_DATA_APP_ID: u32 = APP_ID_U32;
+pub(crate) const GENERATION_DATA_VERSION: u32 = 1;
 pub(crate) const GENERATION_DATA_HEADER_BYTES: usize =
-    std::mem::size_of::<u32>() + GENERATION_DATA_MAGIC.len() + 4 * std::mem::size_of::<u64>();
+    2 * std::mem::size_of::<u32>() + 4 * std::mem::size_of::<u64>();
 
 const ROWID_RECORD_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
 const ROWIDS_OFFSET_FIELD: usize =
-    std::mem::size_of::<u32>() + GENERATION_DATA_MAGIC.len() + 3 * std::mem::size_of::<u64>();
+    2 * std::mem::size_of::<u32>() + 3 * std::mem::size_of::<u64>();
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -39,7 +41,6 @@ pub(crate) struct FileIndexGeneration {
     pub(crate) level: u32,
     pub(crate) num_embeddings: usize,
     pub(crate) data_file: String,
-    pub(crate) rowids_file: Option<String>,
 }
 
 pub(crate) struct FileBackedIndex {
@@ -111,14 +112,14 @@ impl FileBackedIndex {
         let header = lines
             .next()
             .ok_or_else(|| anyhow::anyhow!("empty file index manifest {}", self.manifest_path.display()))?;
-        let version = match header {
-            "WITCHCRAFT_INDEX_V1" => 1,
-            "WITCHCRAFT_INDEX_V2" => 2,
-            _ => anyhow::bail!(
-                "bad file index manifest header in {}",
+        if let Some(reason) = file_index_manifest_stale_reason(header) {
+            warn!(
+                "file index manifest {} is stale ({reason}), resetting file-backed index",
                 self.manifest_path.display()
-            ),
-        };
+            );
+            self.remove_index_sidecars();
+            return Ok(vec![]);
+        }
         let mut generations = vec![];
         for line in lines {
             if line.trim().is_empty() {
@@ -137,16 +138,6 @@ impl FileBackedIndex {
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("missing generation file in file index manifest"))?
                 .to_string();
-            let rowids_file = if version == 1 {
-                Some(
-                    parts
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("missing rowids file in file index manifest"))?
-                        .to_string(),
-                )
-            } else {
-                None
-            };
             anyhow::ensure!(
                 parts.next().is_none(),
                 "extra fields in file index manifest"
@@ -155,10 +146,14 @@ impl FileBackedIndex {
                 level,
                 num_embeddings,
                 data_file,
-                rowids_file,
             });
         }
         generations.sort_by_key(|generation| generation.level);
+        if let Some(reason) = self.index_sidecars_stale_reason(&generations)? {
+            warn!("file-backed index sidecars are stale ({reason}), resetting file-backed index");
+            self.remove_index_sidecars();
+            return Ok(vec![]);
+        }
         Ok(generations)
     }
 
@@ -166,7 +161,7 @@ impl FileBackedIndex {
         std::fs::create_dir_all(&self.parent)?;
         let tmp = unique_tmp_path(&self.manifest_path, "manifest");
         let mut file = NewFileWriter::create_new(&tmp)?;
-        writeln!(file, "WITCHCRAFT_INDEX_V2")?;
+        writeln!(file, "{}\t{}", GENERATION_DATA_APP_ID, GENERATION_DATA_VERSION)?;
         for generation in generations {
             writeln!(
                 file,
@@ -224,10 +219,7 @@ impl FileBackedIndex {
         &self,
         generation: &FileIndexGeneration,
     ) -> Result<Vec<RowidRecord>> {
-        match &generation.rowids_file {
-            Some(rowids_file) => read_rowid_records(&self.path_for(rowids_file)),
-            None => read_generation_rowid_records(&self.path_for(&generation.data_file)),
-        }
+        read_generation_rowid_records(&self.path_for(&generation.data_file))
     }
 
     #[cfg(feature = "sqlite")]
@@ -282,11 +274,60 @@ impl FileBackedIndex {
     pub(crate) fn remove_generation_files(&self, generations: &[FileIndexGeneration]) {
         for generation in generations {
             let _ = std::fs::remove_file(self.path_for(&generation.data_file));
-            if let Some(rowids_file) = &generation.rowids_file {
-                let _ = std::fs::remove_file(self.path_for(rowids_file));
-            }
         }
     }
+
+    fn remove_index_sidecars(&self) {
+        let bucket_prefix = format!("{}.buckets.", self.prefix);
+        let rowids_prefix = format!("{}.rowids.", self.prefix);
+        let residuals_prefix = format!("{}.residuals.", self.prefix);
+        if let Ok(entries) = std::fs::read_dir(&self.parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&bucket_prefix)
+                    || name.starts_with(&rowids_prefix)
+                    || name.starts_with(&residuals_prefix)
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&self.manifest_path);
+    }
+
+    fn index_sidecars_stale_reason(
+        &self,
+        generations: &[FileIndexGeneration],
+    ) -> Result<Option<String>> {
+        for generation in generations {
+            match generation_sidecar_stale_reason(&self.path_for(&generation.data_file))? {
+                Some(reason) => return Ok(Some(format!("{}: {reason}", generation.data_file))),
+                None => {}
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn file_index_manifest_stale_reason(header: &str) -> Option<String> {
+    let mut parts = header.split('\t');
+    let Some(app_id) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
+        return Some("missing or invalid app id".to_string());
+    };
+    let Some(version) = parts.next().and_then(|part| part.parse::<u32>().ok()) else {
+        return Some("missing or invalid version".to_string());
+    };
+    if parts.next().is_some() {
+        return Some("extra manifest header fields".to_string());
+    }
+    if app_id != GENERATION_DATA_APP_ID {
+        return Some(format!("app id {app_id:#x} is not supported"));
+    }
+    if version != GENERATION_DATA_VERSION {
+        return Some(format!("version {version} is not supported"));
+    }
+    None
 }
 
 pub(crate) fn read_rowid_records(path: &PathBuf) -> Result<Vec<RowidRecord>> {
@@ -300,24 +341,19 @@ pub(crate) fn read_rowid_records(path: &PathBuf) -> Result<Vec<RowidRecord>> {
     parse_rowid_records(&bytes, &path.display().to_string())
 }
 
-pub(crate) fn read_generation_rowid_records(path: &PathBuf) -> Result<Vec<RowidRecord>> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+fn generation_rowids_offset_from_header(
+    header: &[u8; GENERATION_DATA_HEADER_BYTES],
+    file_len: u64,
+) -> Result<u64> {
+    let app_id = u32::from_le_bytes(header[..4].try_into()?);
     anyhow::ensure!(
-        file_len >= GENERATION_DATA_HEADER_BYTES as u64,
-        "generation sidecar {} is too small",
-        path.display()
+        app_id == GENERATION_DATA_APP_ID,
+        "generation sidecar app id {app_id:#x} is not supported"
     );
-    let mut header = [0u8; GENERATION_DATA_HEADER_BYTES];
-    file.read_exact(&mut header)?;
-    let version = u32::from_le_bytes(header[..4].try_into()?);
+    let version = u32::from_le_bytes(header[4..8].try_into()?);
     anyhow::ensure!(
         version == GENERATION_DATA_VERSION,
-        "generation sidecar version {version} is not supported; run ./warp-cli reindex"
-    );
-    anyhow::ensure!(
-        header[4..4 + GENERATION_DATA_MAGIC.len()] == GENERATION_DATA_MAGIC,
-        "generation sidecar has an invalid header; run ./warp-cli reindex"
+        "generation sidecar version {version} is not supported"
     );
     let rowids_offset = u64::from_le_bytes(
         header[ROWIDS_OFFSET_FIELD..ROWIDS_OFFSET_FIELD + 8].try_into()?,
@@ -328,6 +364,50 @@ pub(crate) fn read_generation_rowid_records(path: &PathBuf) -> Result<Vec<RowidR
         rowids_offset,
         file_len
     );
+    Ok(rowids_offset)
+}
+
+fn generation_sidecar_header(
+    path: &PathBuf,
+) -> Result<Option<([u8; GENERATION_DATA_HEADER_BYTES], u64)>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let file_len = file.metadata()?.len();
+    if file_len < GENERATION_DATA_HEADER_BYTES as u64 {
+        return Ok(None);
+    }
+    let mut header = [0u8; GENERATION_DATA_HEADER_BYTES];
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(Some((header, file_len))),
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn generation_sidecar_stale_reason(path: &PathBuf) -> Result<Option<String>> {
+    let Some((header, file_len)) = generation_sidecar_header(path)? else {
+        return Ok(Some("missing or truncated sidecar".to_string()));
+    };
+    match generation_rowids_offset_from_header(&header, file_len) {
+        Ok(_) => Ok(None),
+        Err(err) => Ok(Some(err.to_string())),
+    }
+}
+
+pub(crate) fn read_generation_rowid_records(path: &PathBuf) -> Result<Vec<RowidRecord>> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    anyhow::ensure!(
+        file_len >= GENERATION_DATA_HEADER_BYTES as u64,
+        "generation sidecar {} is too small",
+        path.display()
+    );
+    let mut header = [0u8; GENERATION_DATA_HEADER_BYTES];
+    file.read_exact(&mut header)?;
+    let rowids_offset = generation_rowids_offset_from_header(&header, file_len)?;
     file.seek(SeekFrom::Start(rowids_offset))?;
     let mut bytes = vec![];
     file.read_to_end(&mut bytes)?;
@@ -528,11 +608,21 @@ mod tests {
     fn manifest_roundtrip() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let index = FileBackedIndex::new(dir.path().join("standalone"));
+        let data_file = "standalone.buckets.2".to_string();
+        let data_path = index.path_for(&data_file);
+        let mut file = NewFileWriter::create_new(&data_path)?;
+        file.write_all(&GENERATION_DATA_APP_ID.to_le_bytes())?;
+        file.write_all(&GENERATION_DATA_VERSION.to_le_bytes())?;
+        file.write_all(&0u64.to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        file.finish()?;
+
         let generations = vec![FileIndexGeneration {
             level: 2,
             num_embeddings: 17,
-            data_file: "standalone.buckets.2".to_string(),
-            rowids_file: None,
+            data_file,
         }];
 
         index.write_manifest(&generations)?;
@@ -542,7 +632,6 @@ mod tests {
         assert_eq!(loaded[0].level, generations[0].level);
         assert_eq!(loaded[0].num_embeddings, generations[0].num_embeddings);
         assert_eq!(loaded[0].data_file, generations[0].data_file);
-        assert_eq!(loaded[0].rowids_file, generations[0].rowids_file);
         Ok(())
     }
 
@@ -555,8 +644,8 @@ mod tests {
             RowidRecord { rowid: 19, rows: 0 },
         ];
         let mut file = NewFileWriter::create_new(&path)?;
+        file.write_all(&GENERATION_DATA_APP_ID.to_le_bytes())?;
         file.write_all(&GENERATION_DATA_VERSION.to_le_bytes())?;
-        file.write_all(&GENERATION_DATA_MAGIC)?;
         file.write_all(&0u64.to_le_bytes())?;
         file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
         file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
@@ -565,6 +654,33 @@ mod tests {
         file.finish()?;
 
         assert_eq!(read_generation_rowid_records(&path)?, records);
+        Ok(())
+    }
+
+    #[test]
+    fn read_manifest_resets_stale_generation_sidecars() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = FileBackedIndex::new(dir.path().join("standalone"));
+        let data_file = "standalone.buckets.0.stale".to_string();
+        let data_path = index.path_for(&data_file);
+        let mut file = NewFileWriter::create_new(&data_path)?;
+        file.write_all(&GENERATION_DATA_APP_ID.to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_VERSION - 1).to_le_bytes())?;
+        file.write_all(&0u64.to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        file.finish()?;
+
+        index.write_manifest(&[FileIndexGeneration {
+            level: 0,
+            num_embeddings: 11,
+            data_file,
+        }])?;
+
+        assert!(index.read_manifest()?.is_empty());
+        assert!(!data_path.exists());
+        assert!(index.read_manifest()?.is_empty());
         Ok(())
     }
 }

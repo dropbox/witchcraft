@@ -380,12 +380,7 @@ impl Indexer {
                             }
                             if crate::count_unindexed_embeddings(&db).unwrap_or(0) > 1024 {
                                 let now = std::time::Instant::now();
-                                match crate::index_chunks(
-                                    &db,
-                                    &device,
-                                    None,
-                                    false,
-                                ) {
+                                match crate::index_chunks(&db, None, false) {
                                     Ok(()) => {}
                                     Err(v) => {
                                         warn!("index_chunks failed! {}", v);

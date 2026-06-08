@@ -54,8 +54,8 @@ mod tests {
     ];
     const THRESHOLD: f32 = 0.7;
 
-    fn index_chunks(db: &DB, device: &candle_core::Device) -> anyhow::Result<()> {
-        crate::index_chunks(db, device, None, false)
+    fn index_chunks(db: &DB, _device: &candle_core::Device) -> anyhow::Result<()> {
+        crate::index_chunks(db, None, false)
     }
 
     #[test]
@@ -181,7 +181,7 @@ mod tests {
         let embedding_cache =
             crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
         assert!(!embedding_cache.root().exists());
-        crate::index_chunks_with_cache(&db, &device, &embedding_cache, Some(&embedder), false).unwrap();
+        crate::index_chunks_with_cache(&db, &embedding_cache, Some(&embedder), false).unwrap();
 
         let cache_entries = std::fs::read_dir(embedding_cache.root()).unwrap().count();
         assert_eq!(cache_entries, 5);
@@ -621,20 +621,23 @@ mod tests {
         )?;
 
         assert_eq!(crate::count_unindexed_cached_embeddings(&db, &cache)?, 18);
-        let index = crate::file_index::FileBackedIndex::new(path.clone());
-        let rowids_file = "counts.sqlite.rowids.0.test".to_string();
-        let rowids_path = index.path_for(&rowids_file);
-        crate::file_index::write_rowid_records(
-            &rowids_path,
-            &[crate::file_index::RowidRecord {
-                rowid: rows[0].0.try_into()?,
-                rows: 7,
-            }],
-        )?;
+        let data_file = "counts.sqlite.buckets.0.test";
+        let mut sidecar = vec![];
+        sidecar.extend_from_slice(&crate::file_index::GENERATION_DATA_APP_ID.to_le_bytes());
+        sidecar.extend_from_slice(&crate::file_index::GENERATION_DATA_VERSION.to_le_bytes());
+        sidecar.extend_from_slice(&0u64.to_le_bytes());
+        sidecar.extend_from_slice(&(crate::file_index::GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes());
+        sidecar.extend_from_slice(&(crate::file_index::GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes());
+        sidecar.extend_from_slice(&(crate::file_index::GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes());
+        sidecar.extend_from_slice(&u64::try_from(rows[0].0)?.to_le_bytes());
+        sidecar.extend_from_slice(&7u32.to_le_bytes());
+        std::fs::write(dir.path().join(data_file), sidecar)?;
         std::fs::write(
             dir.path().join("counts.sqlite.index"),
             format!(
-                "WITCHCRAFT_INDEX_V1\n0\t7\tcounts.sqlite.buckets.0.test\t{rowids_file}\n"
+                "{}\t{}\n0\t7\t{data_file}\n",
+                crate::file_index::GENERATION_DATA_APP_ID,
+                crate::file_index::GENERATION_DATA_VERSION
             ),
         )?;
         assert_eq!(crate::count_unindexed_cached_embeddings(&db, &cache)?, 11);
@@ -767,7 +770,7 @@ mod tests {
         assert_eq!(queued, 1);
 
         let cache = crate::default_embedding_cache();
-        crate::index_chunks_with_cache(&db, &candle_core::Device::Cpu, &cache, None, false)?;
+        crate::index_chunks_with_cache(&db, &cache, None, false)?;
 
         let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
             .query_row((), |row| row.get(0))?;

@@ -1,4 +1,5 @@
 use super::types::SqlStatementInternal;
+use super::app_id::APP_ID;
 use super::document_cache_hash;
 use iso8601_timestamp::Timestamp;
 use log::{error, warn};
@@ -10,7 +11,6 @@ use uuid::Uuid;
 
 use super::sql_generator::build_filter_sql_and_params;
 
-const APP_ID: i32 = 0x07DB_DA55;
 const SCHEMA_VERSION: i32 = 13;
 const HASH_CHARS: usize = 32;
 const MAX_SQLITE_ROWID: u64 = i64::MAX as u64;

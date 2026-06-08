@@ -9,6 +9,9 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
+mod app_id;
+
 // Conditionally compile encoder backend based on features
 #[cfg(feature = "t5-quantized")]
 pub mod quantized_t5;
@@ -130,8 +133,8 @@ use candle_core::{DType, Device, IndexOp, Tensor, D};
 const DEFAULT_EMBEDDING_DIM: usize = 128;
 #[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
 const DOCUMENT_CACHE_HASH_CHARS: usize = 32;
+const BUCKET_DATA_APP_ID: u32 = file_index::GENERATION_DATA_APP_ID;
 const BUCKET_DATA_VERSION: u32 = file_index::GENERATION_DATA_VERSION;
-const BUCKET_DATA_MAGIC: [u8; 8] = file_index::GENERATION_DATA_MAGIC;
 const BUCKET_META_PREFIX_BYTES: usize = 20;
 const BUCKET_DATA_HEADER_BYTES: usize = file_index::GENERATION_DATA_HEADER_BYTES;
 #[cfg(not(test))]
@@ -635,8 +638,8 @@ fn write_bucket_data_header(
     payload_offset: usize,
     rowids_offset: usize,
 ) -> Result<()> {
+    writer.write_all(&BUCKET_DATA_APP_ID.to_le_bytes())?;
     writer.write_all(&BUCKET_DATA_VERSION.to_le_bytes())?;
-    writer.write_all(&BUCKET_DATA_MAGIC)?;
     writer.write_all(&(centroid_count as u64).to_le_bytes())?;
     writer.write_all(&(meta_offset as u64).to_le_bytes())?;
     writer.write_all(&(payload_offset as u64).to_le_bytes())?;
@@ -645,10 +648,18 @@ fn write_bucket_data_header(
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
+    anyhow::ensure!(
+        offset + std::mem::size_of::<u32>() <= bytes.len(),
+        "u32 field at offset {offset} is truncated"
+    );
     Ok(u32::from_le_bytes(bytes[offset..offset + 4].try_into()?))
 }
 
 fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
+    anyhow::ensure!(
+        offset + std::mem::size_of::<u64>() <= bytes.len(),
+        "u64 field at offset {offset} is truncated"
+    );
     Ok(u64::from_le_bytes(bytes[offset..offset + 8].try_into()?))
 }
 
@@ -852,23 +863,28 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
         prefix.len() >= std::mem::size_of::<u32>(),
         "bucket sidecar header is too small"
     );
-    let version = read_u32_le(prefix, 0)?;
+    let app_id = read_u32_le(prefix, 0)?;
+    anyhow::ensure!(
+        app_id == BUCKET_DATA_APP_ID,
+        "bucket sidecar app id {app_id:#x} is not supported"
+    );
+    let version = read_u32_le(prefix, std::mem::size_of::<u32>())?;
     anyhow::ensure!(
         version == BUCKET_DATA_VERSION,
-        "bucket sidecar version {version} is not supported; run ./warp-cli reindex"
+        "bucket sidecar version {version} is not supported"
     );
     anyhow::ensure!(
         BUCKET_DATA_HEADER_BYTES <= prefix.len(),
         "bucket sidecar header read was too short"
     );
-    anyhow::ensure!(
-        &prefix[4..4 + BUCKET_DATA_MAGIC.len()] == BUCKET_DATA_MAGIC.as_slice(),
-        "bucket sidecar has an invalid header; run ./warp-cli reindex"
-    );
-    let centroid_count: usize = read_u64_le(prefix, 12)?.try_into()?;
-    let meta_offset: usize = read_u64_le(prefix, 20)?.try_into()?;
-    let payload_offset: usize = read_u64_le(prefix, 28)?.try_into()?;
-    let rowids_offset: usize = read_u64_le(prefix, 36)?.try_into()?;
+    let mut offset = 2 * std::mem::size_of::<u32>();
+    let centroid_count: usize = read_u64_le(prefix, offset)?.try_into()?;
+    offset += std::mem::size_of::<u64>();
+    let meta_offset: usize = read_u64_le(prefix, offset)?.try_into()?;
+    offset += std::mem::size_of::<u64>();
+    let payload_offset: usize = read_u64_le(prefix, offset)?.try_into()?;
+    offset += std::mem::size_of::<u64>();
+    let rowids_offset: usize = read_u64_le(prefix, offset)?.try_into()?;
     anyhow::ensure!(
         meta_offset >= BUCKET_DATA_HEADER_BYTES
             && payload_offset >= meta_offset
@@ -2803,7 +2819,6 @@ fn build_index_generation(
         level,
         num_embeddings: total_embeddings,
         data_file,
-        rowids_file: None,
     }))
 }
 
