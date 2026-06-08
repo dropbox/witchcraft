@@ -210,12 +210,12 @@ fn main() -> Result<()> {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_fast(db_name).unwrap();
-        witchcraft::index_chunks(&db, &device, Some(&embedder), false).unwrap();
+        witchcraft::index_chunks(&db, Some(&embedder), false).unwrap();
     } else if args.len() == 2 && &args[1] == "reindex" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_fast(db_name).unwrap();
-        witchcraft::index_chunks(&db, &device, Some(&embedder), true).unwrap();
+        witchcraft::index_chunks(&db, Some(&embedder), true).unwrap();
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();

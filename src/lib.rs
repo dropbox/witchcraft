@@ -2103,7 +2103,6 @@ fn cached_embeddings_for_rowid(
 fn sample_embeddings_for_rowids(
     records: &[RowidRecord],
     cache: &dyn EmbeddingCache,
-    device: &Device,
 ) -> Result<(Tensor, usize)> {
     let mut total_embeddings = 0;
     #[cfg(any(test, feature = "deterministic"))]
@@ -2137,9 +2136,9 @@ fn sample_embeddings_for_rowids(
     }
 
     if all_embeddings.is_empty() {
-        return Ok((Tensor::zeros(&[0, DEFAULT_EMBEDDING_DIM], DType::F32, device)?, 0));
+        return Ok((Tensor::zeros(&[0, DEFAULT_EMBEDDING_DIM], DType::F32, &Device::Cpu)?, 0));
     }
-    let matrix = Tensor::stack(&all_embeddings, 0)?.to_device(device)?;
+    let matrix = Tensor::stack(&all_embeddings, 0)?;
     Ok((matrix, total_embeddings))
 }
 
@@ -2600,12 +2599,10 @@ fn write_bucket_batch(
     index_kmeans: &IndexKMeans,
     centers_cpu: &Tensor,
     residual_bytes: usize,
-    device: &Device,
 ) -> Result<(tempfile::NamedTempFile, u128, u128)> {
     let now = std::time::Instant::now();
     let data_cpu = Tensor::cat(&embeddings, 0)?;
-    let data = data_cpu.to_device(device)?;
-    let cluster_assignments = assign_with_index_kmeans(&data, &index_kmeans.routing)?;
+    let cluster_assignments = assign_with_index_kmeans(&data_cpu, &index_kmeans.routing)?;
     let mmuls_ms = now.elapsed().as_millis();
 
     let now = std::time::Instant::now();
@@ -2666,7 +2663,6 @@ fn write_buckets_for_rowids(
     records: &[RowidRecord],
     cache: &dyn EmbeddingCache,
     index_kmeans: &IndexKMeans,
-    device: &Device,
     expected_count: u64,
 ) -> Result<(Vec<tempfile::NamedTempFile>, Tensor)> {
     let _priority_mgr = PriorityManager::new();
@@ -2726,7 +2722,6 @@ fn write_buckets_for_rowids(
                         index_kmeans,
                         &centers_cpu,
                         residual_bytes,
-                        device,
                     )?;
                     tmpfiles.push(tmpfile);
                     mmuls_total += mmuls_ms;
@@ -2755,7 +2750,6 @@ fn write_buckets_for_rowids(
                 index_kmeans,
                 &centers_cpu,
                 residual_bytes,
-                device,
             )?;
             tmpfiles.push(tmpfile);
             mmuls_total += mmuls_ms;
@@ -2774,7 +2768,6 @@ fn write_buckets_for_rowids(
 
 fn build_index_generation(
     index: &FileBackedIndex,
-    device: &Device,
     cache: &dyn EmbeddingCache,
     level: u32,
     records: &[RowidRecord],
@@ -2784,7 +2777,7 @@ fn build_index_generation(
         return Ok(None);
     }
 
-    let (matrix, total_embeddings) = sample_embeddings_for_rowids(records, cache, device)?;
+    let (matrix, total_embeddings) = sample_embeddings_for_rowids(records, cache)?;
     if total_embeddings == 0 {
         return Ok(None);
     }
@@ -2800,7 +2793,7 @@ fn build_index_generation(
     let data_path = index.path_for(&data_file);
 
     let (tmpfiles, centers_cpu) =
-        write_buckets_for_rowids(records, cache, &centers, device, total_embeddings as u64)?;
+        write_buckets_for_rowids(records, cache, &centers, total_embeddings as u64)?;
     if let Err(err) = merge_and_write_buckets_to_path(tmpfiles, &centers_cpu, records, &data_path) {
         let _ = std::fs::remove_file(&data_path);
         return Err(err);
@@ -2816,7 +2809,6 @@ fn build_index_generation(
 
 pub(crate) fn index_buffered_embeddings(
     index: &FileBackedIndex,
-    device: &Device,
     cache: &dyn EmbeddingCache,
 ) -> Result<()> {
     let buffer = sort_dedup_rowid_records(read_rowid_records(index.rowid_buffer_path())?);
@@ -2870,7 +2862,7 @@ pub(crate) fn index_buffered_embeddings(
         merged.retain(|record| record.rows > 0);
     }
     if let Some(generation) =
-        build_index_generation(index, device, cache, target_level, &merged)?
+        build_index_generation(index, cache, target_level, &merged)?
     {
         kept_generations.push(generation);
     }

@@ -539,7 +539,7 @@ pub unsafe extern "C" fn witchcraft_index(
             .lock()
             .map_err(|_| anyhow!("witchcraft handle lock poisoned"))?;
         let embeddings = CallbackEmbeddingSource::new(embedding_callback, user_data);
-        index_buffered_embeddings(&state.index, &state.device, &embeddings)
+        index_buffered_embeddings(&state.index, &embeddings)
     }));
 
     match result {

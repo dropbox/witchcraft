@@ -674,17 +674,15 @@ fn cached_embeddings_for_document(
 
 pub fn index_chunks(
     db: &DB,
-    device: &Device,
     embedder: Option<&Embedder>,
     reset: bool,
 ) -> Result<()> {
     let cache = SqliteEmbeddingCache::new(db);
-    index_chunks_with_cache(db, device, &cache, embedder, reset)
+    index_chunks_with_cache(db, &cache, embedder, reset)
 }
 
 pub fn index_chunks_with_cache(
     db: &DB,
-    device: &Device,
     cache: &dyn EmbeddingCache,
     embedder: Option<&Embedder>,
     reset: bool,
@@ -717,7 +715,7 @@ pub fn index_chunks_with_cache(
     info!("database has {} unindexed embeddings ({} indexed)", x, indexed);
 
     let source = DocumentEmbeddingSource::new(cache, current.hashes);
-    index_buffered_embeddings(&index, device, &source)?;
+    index_buffered_embeddings(&index, &source)?;
     db.checkpoint();
     Ok(())
 }
