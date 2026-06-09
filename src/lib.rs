@@ -2024,6 +2024,8 @@ pub fn match_centroids_raw(
     sub_scores.copy_from_slice(&missing_similarities);
     let mut doc_scores = vec![0.0f32; n];
     doc_scores.copy_from_slice(&missing_similarities);
+    let mut best_sub_score = f32::NEG_INFINITY;
+    let mut best_sub_idx = 0u32;
 
     let mut scored_results: Vec<(f32, u32, u32)> = Vec::new();
     let mut prev_idx = 0u32;
@@ -2045,15 +2047,21 @@ pub fn match_centroids_raw(
 
             if sub_idx_change {
                 let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
-                if sub_score > cutoff {
-                    scored_results.push((sub_score, prev_idx, prev_sub_idx));
+                if sub_score > best_sub_score {
+                    best_sub_score = sub_score;
+                    best_sub_idx = prev_sub_idx;
                 }
                 vmax_inplace(&mut doc_scores, &sub_scores);
-                sub_scores.copy_from_slice(&doc_scores);
+                sub_scores.copy_from_slice(&missing_similarities);
             }
             if idx_change {
+                let doc_score = scaler * (doc_scores.iter().copied().sum::<f32>());
+                if doc_score > cutoff {
+                    scored_results.push((doc_score, prev_idx, best_sub_idx));
+                }
                 doc_scores.copy_from_slice(&missing_similarities);
-                sub_scores.copy_from_slice(&missing_similarities);
+                best_sub_score = f32::NEG_INFINITY;
+                best_sub_idx = sub_idx;
             }
         }
 

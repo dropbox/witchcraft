@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{DB, EmbeddingCache};
+    use candle_core::{Device, Tensor};
     use std::path::PathBuf;
     use tempfile::tempdir;
     use test_log::test;
@@ -241,6 +242,31 @@ mod tests {
         }
         db.clear();
         db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_sub_doc_scores_do_not_carry_between_subdocs() -> anyhow::Result<()> {
+        let query = Tensor::from_vec(
+            vec![1.0f32, 0.0, 0.0, 1.0],
+            (2, 2),
+            &Device::Cpu,
+        )?;
+        let embeddings = Tensor::from_vec(
+            vec![
+                0.9f32, 0.9, // subdoc 0 matches both query dimensions well.
+                1.0, 0.0,    // subdoc 1 only improves the first dimension.
+            ],
+            (2, 2),
+            &Device::Cpu,
+        )?;
+        let unindexed = vec![(vec![(1, 0), (1, 1)], embeddings)];
+
+        let results = crate::match_centroids_raw(&[], &query, &unindexed, 0.0, 10)?;
+
+        assert!(results[0].0 > 0.94);
+        assert_eq!(results[0].1, 1);
+        assert_eq!(results[0].2, 0);
         Ok(())
     }
 
