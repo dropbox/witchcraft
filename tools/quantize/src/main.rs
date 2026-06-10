@@ -1,11 +1,9 @@
 use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
 use candle_core::{Device, Result};
 use std::env;
+use std::path::PathBuf;
 
-fn run_quantize_safetensors(
-    in_file: std::path::PathBuf,
-    out_path: std::path::PathBuf,
-) -> Result<()> {
+fn run_quantize_safetensors(in_file: PathBuf, out_path: PathBuf) -> Result<()> {
     let tensors = candle_core::safetensors::load(in_file, &Device::Cpu)?;
     println!("tensors: {}", tensors.len());
 
@@ -24,26 +22,27 @@ fn run_quantize_safetensors(
             } else {
                 GgmlDType::F32
             };
-            println!("  {name} {qdtype:?} {tensor:?}");
             let tensor = QTensor::quantize(&tensor, qdtype)?;
             Ok((name, tensor))
         })
         .collect::<Result<Vec<_>>>()?;
     let qtensors = qtensors
         .iter()
-        .map(|(k, v)| (k.as_str(), v))
+        .map(|(name, tensor)| (name.as_str(), tensor))
         .collect::<Vec<_>>();
 
-    let mut out = std::fs::File::create(out_path)?;
+    let mut out = std::fs::File::create(&out_path)?;
     gguf_file::write(&mut out, &[], &qtensors)?;
     out.sync_all()?;
+    println!("wrote {}", out_path.display());
     Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let in_file = &args[1];
-    let out_file = &args[2];
-    run_quantize_safetensors(in_file.into(), out_file.into()).unwrap();
+    let args = env::args().collect::<Vec<_>>();
+    if args.len() != 3 {
+        anyhow::bail!("usage: {} IN.safetensors OUT.gguf", args[0]);
+    }
+    run_quantize_safetensors(PathBuf::from(&args[1]), PathBuf::from(&args[2]))?;
     Ok(())
 }

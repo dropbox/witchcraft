@@ -115,7 +115,7 @@ assets/xtr-config.json assets/xtr-tokenizer.json xtr.safetensors: env/bin/transf
 	$(PYTHON_BIN) downloadweights.py
 
 assets/xtr.gguf: xtr.safetensors | assets prereqs
-	cargo run -p quantize-tool xtr.safetensors assets/xtr.gguf
+	cargo run -p quantize xtr.safetensors assets/xtr.gguf
 
 modernbert-assets: | assets
 	@test -f assets/modernbert-config.json || (echo "missing assets/modernbert-config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
@@ -127,7 +127,7 @@ modernbert-quantized-assets: | assets
 	@test -f assets/modernbert-tokenizer.json || (echo "missing assets/modernbert-tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
 	@if [ ! -f assets/modernbert.gguf ]; then \
 		if [ -f assets/modernbert.safetensors ]; then \
-			cargo run -p quantize-tool --release -- assets/modernbert.safetensors assets/modernbert.gguf; \
+			cargo run -p quantize --release -- assets/modernbert.safetensors assets/modernbert.gguf; \
 		else \
 			echo "missing assets/modernbert.gguf; run scripts/export_modernbert.py <checkpoint> assets, then make ENCODER=modernbert-quantized" >&2; \
 			exit 1; \

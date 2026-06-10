@@ -5,7 +5,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace]                     # !Dash
-members = ["tools/quantize-tool", "tools/t5-bench", "tools/ov-stress", "tools/compare-backends", "crates/chromium-idb"] # !Dash
+members = ["tools/quantize", "tools/t5-bench", "tools/ov-stress", "tools/compare-backends", "crates/chromium-idb"] # !Dash
 
 [[bin]]                         # !Dash
 name = "warp-cli"               # !Dash
