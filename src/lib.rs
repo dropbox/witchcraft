@@ -59,9 +59,6 @@ compile_error!("Cannot enable multiple encoder backends simultaneously");
 #[cfg(all(feature = "hybrid-dequant", feature = "metal"))]
 compile_error!("hybrid-dequant is incompatible with metal (use accelerate only for CPU, or metal without hybrid-dequant for GPU)");
 
-#[cfg(all(feature = "polar-quant-2bit", feature = "polar-quant-3bit"))]
-compile_error!("polar-quant-2bit and polar-quant-3bit are mutually exclusive");
-
 #[cfg(feature = "sqlite")]
 mod db;
 #[cfg(feature = "sqlite")]
@@ -112,7 +109,8 @@ mod sqlite_index;
 pub use sqlite_index::{
     count_unindexed_cached_embeddings, count_unindexed_embeddings,
     count_unindexed_embeddings_with_cache, embed_chunks, embed_chunks_with_cache, fulltext_search,
-    index_chunks, index_chunks_with_cache, match_centroids, match_centroids_with_cache, search,
+    index_chunks, index_chunks_with_cache, index_chunks_with_cache_and_options,
+    index_chunks_with_options, match_centroids, match_centroids_with_cache, search,
     search_cached_rowids_with_cache, search_rowids,
 };
 #[cfg(all(test, feature = "sqlite"))]
@@ -157,6 +155,32 @@ const INDEX_BATCH_SIZE: usize = 0x10000;
 /// Allows precise location of results within subdivided documents
 pub type DocPtr = (u32, u32);
 
+#[derive(Clone, Copy, Debug)]
+pub struct IndexOptions {
+    residual_quant_bits: u8,
+}
+
+impl IndexOptions {
+    pub fn new(residual_quant_bits: u8) -> Result<Self> {
+        packops::validate_residual_quant_bits(residual_quant_bits)?;
+        Ok(Self {
+            residual_quant_bits,
+        })
+    }
+
+    pub fn residual_quant_bits(&self) -> u8 {
+        self.residual_quant_bits
+    }
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            residual_quant_bits: packops::DEFAULT_RESIDUAL_QUANT_BITS,
+        }
+    }
+}
+
 fn center_bytes_for_dim(dim: usize) -> usize {
     dim * std::mem::size_of::<f32>()
 }
@@ -165,19 +189,8 @@ fn bucket_meta_bytes_for_dim(dim: usize) -> usize {
     BUCKET_META_PREFIX_BYTES + center_bytes_for_dim(dim)
 }
 
-fn residual_bytes_for_dim(dim: usize) -> usize {
-    #[cfg(feature = "polar-quant")]
-    {
-        packops::polar_row_bytes(dim)
-    }
-    #[cfg(not(feature = "polar-quant"))]
-    {
-        assert!(
-            dim % 2 == 0,
-            "embedding dimension must be even for q4 residuals"
-        );
-        dim / 2
-    }
+fn residual_bytes_for_dim(dim: usize, residual_quant_bits: u8) -> Result<usize> {
+    packops::temp_residual_bytes_for_dim(dim, residual_quant_bits)
 }
 
 fn model_id_prefix() -> &'static str {
@@ -625,6 +638,7 @@ struct BucketSidecarMeta {
 struct BucketDataHeader {
     centroid_count: usize,
     embedding_dim: usize,
+    residual_quant_bits: u8,
     meta_bytes: usize,
     meta_offset: usize,
     payload_offset: usize,
@@ -634,16 +648,18 @@ struct BucketDataHeader {
 fn write_bucket_data_header(
     writer: &mut impl Write,
     centroid_count: usize,
+    residual_quant_bits: u8,
     meta_offset: usize,
     payload_offset: usize,
     rowids_offset: usize,
 ) -> Result<()> {
     writer.write_all(&BUCKET_DATA_APP_ID.to_le_bytes())?;
     writer.write_all(&BUCKET_DATA_VERSION.to_le_bytes())?;
-    writer.write_all(&(centroid_count as u64).to_le_bytes())?;
-    writer.write_all(&(meta_offset as u64).to_le_bytes())?;
-    writer.write_all(&(payload_offset as u64).to_le_bytes())?;
-    writer.write_all(&(rowids_offset as u64).to_le_bytes())?;
+    writer.write_all(&(residual_quant_bits as u32).to_le_bytes())?;
+    writer.write_all(&u32::try_from(centroid_count)?.to_le_bytes())?;
+    writer.write_all(&u32::try_from(meta_offset)?.to_le_bytes())?;
+    writer.write_all(&u32::try_from(payload_offset)?.to_le_bytes())?;
+    writer.write_all(&u64::try_from(rowids_offset)?.to_le_bytes())?;
     Ok(())
 }
 
@@ -878,12 +894,15 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
         "bucket sidecar header read was too short"
     );
     let mut offset = 2 * std::mem::size_of::<u32>();
-    let centroid_count: usize = read_u64_le(prefix, offset)?.try_into()?;
-    offset += std::mem::size_of::<u64>();
-    let meta_offset: usize = read_u64_le(prefix, offset)?.try_into()?;
-    offset += std::mem::size_of::<u64>();
-    let payload_offset: usize = read_u64_le(prefix, offset)?.try_into()?;
-    offset += std::mem::size_of::<u64>();
+    let residual_quant_bits: u8 = read_u32_le(prefix, offset)?.try_into()?;
+    packops::validate_residual_quant_bits(residual_quant_bits)?;
+    offset += std::mem::size_of::<u32>();
+    let centroid_count: usize = read_u32_le(prefix, offset)?.try_into()?;
+    offset += std::mem::size_of::<u32>();
+    let meta_offset: usize = read_u32_le(prefix, offset)?.try_into()?;
+    offset += std::mem::size_of::<u32>();
+    let payload_offset: usize = read_u32_le(prefix, offset)?.try_into()?;
+    offset += std::mem::size_of::<u32>();
     let rowids_offset: usize = read_u64_le(prefix, offset)?.try_into()?;
     anyhow::ensure!(
         meta_offset >= BUCKET_DATA_HEADER_BYTES
@@ -919,6 +938,7 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
     Ok(BucketDataHeader {
         centroid_count,
         embedding_dim,
+        residual_quant_bits,
         meta_bytes,
         meta_offset,
         payload_offset,
@@ -944,7 +964,7 @@ fn bucket_data_bucket_meta_from_file(
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar metadata range is invalid"))?;
     let mut meta_block = vec![0; meta_len];
     let mut buffers = [meta_block.as_mut_slice()];
-    readv_exact_at(file, header.meta_offset as u64, &mut buffers)?;
+    readv_exact_at(file, u64::try_from(header.meta_offset)?, &mut buffers)?;
     bucket_data_bucket_meta_from_block(&meta_block, header)
 }
 
@@ -966,7 +986,7 @@ fn bucket_data_bucket_meta_from_block(
         let center_start = offset + BUCKET_META_PREFIX_BYTES;
         let center_end = offset + header.meta_bytes;
         anyhow::ensure!(
-            data_offset >= header.payload_offset as u64,
+            data_offset >= u64::try_from(header.payload_offset)?,
             "bucket {bucket_idx} data offset is before payload block"
         );
         let bucket_end = data_offset
@@ -974,7 +994,7 @@ fn bucket_data_bucket_meta_from_block(
             .and_then(|offset| offset.checked_add(u64::try_from(residual_len).ok()?))
             .ok_or_else(|| anyhow::anyhow!("bucket {bucket_idx} data length overflow"))?;
         anyhow::ensure!(
-            bucket_end <= header.rowids_offset as u64,
+            bucket_end <= u64::try_from(header.rowids_offset)?,
             "bucket {bucket_idx} data ends beyond bucket payload"
         );
         metas.push(BucketSidecarMeta {
@@ -1025,7 +1045,7 @@ fn bucket_data_coarse_tree_from_file(
     );
     let mut tree_bytes = vec![0; tree_len];
     let mut buffers = [tree_bytes.as_mut_slice()];
-    readv_exact_at(file, payload_end as u64, &mut buffers)?;
+    readv_exact_at(file, u64::try_from(payload_end)?, &mut buffers)?;
     deserialize_coarse_tree(&tree_bytes, device)
 }
 
@@ -1069,6 +1089,7 @@ fn merge_and_write_buckets_to_path(
     centers_cpu: &Tensor,
     rowid_records: &[RowidRecord],
     final_path: &Path,
+    residual_quant_bits: u8,
 ) -> Result<()> {
     let mut tmp_path = final_path.as_os_str().to_os_string();
     tmp_path.push(format!(
@@ -1088,7 +1109,7 @@ fn merge_and_write_buckets_to_path(
     let (centroid_count, center_dim) = centers_cpu.dims2()?;
     let center_bytes = center_bytes_for_dim(center_dim);
     let bucket_meta_bytes = bucket_meta_bytes_for_dim(center_dim);
-    let residual_bytes = residual_bytes_for_dim(center_dim);
+    let residual_bytes = residual_bytes_for_dim(center_dim, residual_quant_bits)?;
     let mut bucket_meta: Vec<BucketSidecarMeta> = (0..centroid_count)
         .map(|_| BucketSidecarMeta {
             size: 0,
@@ -1164,6 +1185,7 @@ fn merge_and_write_buckets_to_path(
     write_bucket_data_header(
         &mut bucket_data_writer,
         centroid_count,
+        residual_quant_bits,
         meta_offset,
         payload_start.try_into()?,
         rowids_offset.try_into()?,
@@ -1355,6 +1377,7 @@ struct IndexKMeansNode {
 /// Per-generation centroid data loaded from sidecar files.
 pub struct GenerationCentroids {
     dim: usize,
+    residual_quant_bits: u8,
     residual_bytes: usize,
     bucket_indices: Vec<usize>,
     sizes: Vec<usize>,
@@ -1744,7 +1767,8 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
         let header = bucket_data_header_from_file(&file, sidecar_len)?;
         let metas = bucket_data_bucket_meta_from_file(&file, &header)?;
         let coarse_tree = bucket_data_coarse_tree_from_file(&file, &header, &metas, device)?;
-        let residual_bytes = residual_bytes_for_dim(header.embedding_dim);
+        let residual_bytes =
+            residual_bytes_for_dim(header.embedding_dim, header.residual_quant_bits)?;
 
         let mut bucket_indices = vec![];
         let mut sizes = vec![];
@@ -1773,6 +1797,7 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
         };
         all.push(GenerationCentroids {
             dim: header.embedding_dim,
+            residual_quant_bits: header.residual_quant_bits,
             residual_bytes,
             bucket_indices,
             sizes,
@@ -1915,6 +1940,7 @@ pub fn match_centroids_raw(
                 residual_bytes,
                 gen.dim,
                 &table,
+                gen.residual_quant_bits,
                 &Device::Cpu,
             )?;
             let (num_docs, _) = residuals.dims2()?;
@@ -1953,6 +1979,7 @@ pub fn match_centroids_raw(
         for (doc_idx, &(gen_idx, cluster_idx)) in
             document_clusters.iter().enumerate()
         {
+            let gen = &generations[gen_idx];
             let centroid_scores = &gen_centroid_scores_all[gen_idx];
             let centroid_score_ranges = &gen_centroid_score_ranges_all[gen_idx];
             for (query_idx, scores) in centroid_scores.iter().enumerate().take(n) {
@@ -1961,6 +1988,7 @@ pub fn match_centroids_raw(
                 let residual_weight = packops::residual_centroid_confidence_weight(
                     centroid_score,
                     centroid_score_ranges[query_idx],
+                    gen.residual_quant_bits,
                 );
                 residual_sims_flat[offset] =
                     centroid_score + residual_weight * residual_sims_flat[offset];
@@ -2623,6 +2651,7 @@ fn write_bucket_batch(
     index_kmeans: &IndexKMeans,
     centers_cpu: &Tensor,
     residual_bytes: usize,
+    residual_quant_bits: u8,
 ) -> Result<(tempfile::NamedTempFile, u128, u128)> {
     let now = std::time::Instant::now();
     let data_cpu = Tensor::cat(&embeddings, 0)?;
@@ -2671,7 +2700,7 @@ fn write_bucket_batch(
 
         let center = centers_cpu.get(bucket as usize)?;
         let residual = (&data_cpu.get(sample)? - &center)?;
-        let residual_quantized = packops::residual_to_temp_bytes(&residual)?;
+        let residual_quantized = packops::residual_to_temp_bytes(&residual, residual_quant_bits)?;
         residuals_bytes.extend(&residual_quantized);
     }
 
@@ -2688,6 +2717,7 @@ fn write_buckets_for_rowids(
     cache: &dyn EmbeddingCache,
     index_kmeans: &IndexKMeans,
     expected_count: u64,
+    residual_quant_bits: u8,
 ) -> Result<(Vec<tempfile::NamedTempFile>, Tensor)> {
     let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
@@ -2705,7 +2735,7 @@ fn write_buckets_for_rowids(
     let centers = &index_kmeans.centers;
     let centers_cpu = centers.to_device(&Device::Cpu)?;
     let (_, center_dim) = centers_cpu.dims2()?;
-    let residual_bytes = packops::temp_residual_bytes_for_dim(center_dim);
+    let residual_bytes = packops::temp_residual_bytes_for_dim(center_dim, residual_quant_bits)?;
     while !done {
         match records.next() {
             Some(record) => {
@@ -2746,6 +2776,7 @@ fn write_buckets_for_rowids(
                         index_kmeans,
                         &centers_cpu,
                         residual_bytes,
+                        residual_quant_bits,
                     )?;
                     tmpfiles.push(tmpfile);
                     mmuls_total += mmuls_ms;
@@ -2774,6 +2805,7 @@ fn write_buckets_for_rowids(
                 index_kmeans,
                 &centers_cpu,
                 residual_bytes,
+                residual_quant_bits,
             )?;
             tmpfiles.push(tmpfile);
             mmuls_total += mmuls_ms;
@@ -2795,6 +2827,7 @@ fn build_index_generation(
     cache: &dyn EmbeddingCache,
     level: u32,
     records: &[RowidRecord],
+    options: IndexOptions,
 ) -> Result<Option<FileIndexGeneration>> {
     let active_embeddings = rowid_records_embedding_count(records);
     if active_embeddings == 0 {
@@ -2815,10 +2848,22 @@ fn build_index_generation(
 
     let data_file = index.generation_file_name(level);
     let data_path = index.path_for(&data_file);
+    let residual_quant_bits = options.residual_quant_bits();
 
-    let (tmpfiles, centers_cpu) =
-        write_buckets_for_rowids(records, cache, &centers, total_embeddings as u64)?;
-    if let Err(err) = merge_and_write_buckets_to_path(tmpfiles, &centers_cpu, records, &data_path) {
+    let (tmpfiles, centers_cpu) = write_buckets_for_rowids(
+        records,
+        cache,
+        &centers,
+        total_embeddings as u64,
+        residual_quant_bits,
+    )?;
+    if let Err(err) = merge_and_write_buckets_to_path(
+        tmpfiles,
+        &centers_cpu,
+        records,
+        &data_path,
+        residual_quant_bits,
+    ) {
         let _ = std::fs::remove_file(&data_path);
         return Err(err);
     }
@@ -2833,6 +2878,14 @@ fn build_index_generation(
 pub(crate) fn index_buffered_embeddings(
     index: &FileBackedIndex,
     cache: &dyn EmbeddingCache,
+) -> Result<()> {
+    index_buffered_embeddings_with_options(index, cache, IndexOptions::default())
+}
+
+pub(crate) fn index_buffered_embeddings_with_options(
+    index: &FileBackedIndex,
+    cache: &dyn EmbeddingCache,
+    options: IndexOptions,
 ) -> Result<()> {
     let buffer = sort_dedup_rowid_records(read_rowid_records(index.rowid_buffer_path())?);
     let x = rowid_records_embedding_count(&buffer);
@@ -2885,7 +2938,7 @@ pub(crate) fn index_buffered_embeddings(
         merged.retain(|record| record.rows > 0);
     }
     if let Some(generation) =
-        build_index_generation(index, cache, target_level, &merged)?
+        build_index_generation(index, cache, target_level, &merged, options)?
     {
         kept_generations.push(generation);
     }

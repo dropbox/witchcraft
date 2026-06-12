@@ -5,11 +5,11 @@ use crate::packops::TensorPackOps;
 use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
-    cached_embeddings_for_rowid, clear_generations_cache,
-    dim_from_model_id, docptrs_for_counts, document_cache_hash, index_buffered_embeddings,
-    hybrid_reciprocal_rank_fusion, load_cached_embeddings, load_or_compute_cached_embeddings,
-    match_centroids_raw, reciprocal_rank_fusion, split_by_codepoints, CachedEmbeddings, DB,
-    DocPtr, Embedder, EmbeddingCache, EmbeddingsCache, SqlStatementInternal,
+    cached_embeddings_for_rowid, clear_generations_cache, dim_from_model_id, docptrs_for_counts,
+    document_cache_hash, hybrid_reciprocal_rank_fusion, index_buffered_embeddings_with_options,
+    load_cached_embeddings, load_or_compute_cached_embeddings, match_centroids_raw,
+    reciprocal_rank_fusion, split_by_codepoints, CachedEmbeddings, DB, DocPtr, Embedder,
+    EmbeddingCache, EmbeddingsCache, IndexOptions, SqlStatementInternal,
 };
 use anyhow::Result;
 use candle_core::{Device, Tensor};
@@ -677,8 +677,17 @@ pub fn index_chunks(
     embedder: Option<&Embedder>,
     reset: bool,
 ) -> Result<()> {
+    index_chunks_with_options(db, embedder, reset, IndexOptions::default())
+}
+
+pub fn index_chunks_with_options(
+    db: &DB,
+    embedder: Option<&Embedder>,
+    reset: bool,
+    options: IndexOptions,
+) -> Result<()> {
     let cache = SqliteEmbeddingCache::new(db);
-    index_chunks_with_cache(db, &cache, embedder, reset)
+    index_chunks_with_cache_and_options(db, &cache, embedder, reset, options)
 }
 
 pub fn index_chunks_with_cache(
@@ -686,6 +695,16 @@ pub fn index_chunks_with_cache(
     cache: &dyn EmbeddingCache,
     embedder: Option<&Embedder>,
     reset: bool,
+) -> Result<()> {
+    index_chunks_with_cache_and_options(db, cache, embedder, reset, IndexOptions::default())
+}
+
+pub fn index_chunks_with_cache_and_options(
+    db: &DB,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+    reset: bool,
+    options: IndexOptions,
 ) -> Result<()> {
     let index = index_for_db(db);
     if reset {
@@ -715,7 +734,7 @@ pub fn index_chunks_with_cache(
     info!("database has {} unindexed embeddings ({} indexed)", x, indexed);
 
     let source = DocumentEmbeddingSource::new(cache, current.hashes);
-    index_buffered_embeddings(&index, &source)?;
+    index_buffered_embeddings_with_options(&index, &source, options)?;
     db.checkpoint();
     Ok(())
 }

@@ -182,7 +182,15 @@ mod tests {
         let embedding_cache =
             crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
         assert!(!embedding_cache.root().exists());
-        crate::index_chunks_with_cache(&db, &embedding_cache, Some(&embedder), false).unwrap();
+        let options = crate::IndexOptions::new(3).unwrap();
+        crate::index_chunks_with_cache_and_options(
+            &db,
+            &embedding_cache,
+            Some(&embedder),
+            false,
+            options,
+        )
+        .unwrap();
 
         let cache_entries = std::fs::read_dir(embedding_cache.root()).unwrap().count();
         assert_eq!(cache_entries, 5);
@@ -648,13 +656,15 @@ mod tests {
 
         assert_eq!(crate::count_unindexed_cached_embeddings(&db, &cache)?, 18);
         let data_file = "counts.sqlite.buckets.0.test";
+        let header_bytes = u32::try_from(crate::file_index::GENERATION_DATA_HEADER_BYTES)?;
         let mut sidecar = vec![];
         sidecar.extend_from_slice(&crate::file_index::GENERATION_DATA_APP_ID.to_le_bytes());
         sidecar.extend_from_slice(&crate::file_index::GENERATION_DATA_VERSION.to_le_bytes());
-        sidecar.extend_from_slice(&0u64.to_le_bytes());
-        sidecar.extend_from_slice(&(crate::file_index::GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes());
-        sidecar.extend_from_slice(&(crate::file_index::GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes());
-        sidecar.extend_from_slice(&(crate::file_index::GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes());
+        sidecar.extend_from_slice(&0u32.to_le_bytes());
+        sidecar.extend_from_slice(&0u32.to_le_bytes());
+        sidecar.extend_from_slice(&header_bytes.to_le_bytes());
+        sidecar.extend_from_slice(&header_bytes.to_le_bytes());
+        sidecar.extend_from_slice(&u64::from(header_bytes).to_le_bytes());
         sidecar.extend_from_slice(&u64::try_from(rows[0].0)?.to_le_bytes());
         sidecar.extend_from_slice(&7u32.to_le_bytes());
         std::fs::write(dir.path().join(data_file), sidecar)?;

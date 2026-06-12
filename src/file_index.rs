@@ -9,13 +9,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const GENERATION_DATA_APP_ID: u32 = APP_ID_U32;
-pub(crate) const GENERATION_DATA_VERSION: u32 = 1;
+pub(crate) const GENERATION_DATA_VERSION: u32 = 2;
 pub(crate) const GENERATION_DATA_HEADER_BYTES: usize =
-    2 * std::mem::size_of::<u32>() + 4 * std::mem::size_of::<u64>();
+    6 * std::mem::size_of::<u32>() + std::mem::size_of::<u64>();
 
 const ROWID_RECORD_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
-const ROWIDS_OFFSET_FIELD: usize =
-    2 * std::mem::size_of::<u32>() + 3 * std::mem::size_of::<u64>();
+const ROWIDS_OFFSET_FIELD: usize = 6 * std::mem::size_of::<u32>();
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -376,7 +375,8 @@ fn generation_sidecar_header(
         Err(err) => return Err(err.into()),
     };
     let file_len = file.metadata()?.len();
-    if file_len < GENERATION_DATA_HEADER_BYTES as u64 {
+    let header_bytes = u64::try_from(GENERATION_DATA_HEADER_BYTES)?;
+    if file_len < header_bytes {
         return Ok(None);
     }
     let mut header = [0u8; GENERATION_DATA_HEADER_BYTES];
@@ -400,8 +400,9 @@ fn generation_sidecar_stale_reason(path: &PathBuf) -> Result<Option<String>> {
 pub(crate) fn read_generation_rowid_records(path: &PathBuf) -> Result<Vec<RowidRecord>> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
+    let header_bytes = u64::try_from(GENERATION_DATA_HEADER_BYTES)?;
     anyhow::ensure!(
-        file_len >= GENERATION_DATA_HEADER_BYTES as u64,
+        file_len >= header_bytes,
         "generation sidecar {} is too small",
         path.display()
     );
@@ -549,6 +550,21 @@ impl PartialOrd for RowidHeapEntry {
 mod tests {
     use super::*;
 
+    fn write_generation_test_header(
+        file: &mut impl Write,
+        version: u32,
+    ) -> Result<()> {
+        let header_bytes = u32::try_from(GENERATION_DATA_HEADER_BYTES)?;
+        file.write_all(&GENERATION_DATA_APP_ID.to_le_bytes())?;
+        file.write_all(&version.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&header_bytes.to_le_bytes())?;
+        file.write_all(&header_bytes.to_le_bytes())?;
+        file.write_all(&u64::from(header_bytes).to_le_bytes())?;
+        Ok(())
+    }
+
     #[test]
     fn rowid_records_roundtrip() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -611,12 +627,7 @@ mod tests {
         let data_file = "standalone.buckets.2".to_string();
         let data_path = index.path_for(&data_file);
         let mut file = NewFileWriter::create_new(&data_path)?;
-        file.write_all(&GENERATION_DATA_APP_ID.to_le_bytes())?;
-        file.write_all(&GENERATION_DATA_VERSION.to_le_bytes())?;
-        file.write_all(&0u64.to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        write_generation_test_header(&mut file, GENERATION_DATA_VERSION)?;
         file.finish()?;
 
         let generations = vec![FileIndexGeneration {
@@ -644,12 +655,7 @@ mod tests {
             RowidRecord { rowid: 19, rows: 0 },
         ];
         let mut file = NewFileWriter::create_new(&path)?;
-        file.write_all(&GENERATION_DATA_APP_ID.to_le_bytes())?;
-        file.write_all(&GENERATION_DATA_VERSION.to_le_bytes())?;
-        file.write_all(&0u64.to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        write_generation_test_header(&mut file, GENERATION_DATA_VERSION)?;
         write_rowid_records_to_writer(&mut file, &records)?;
         file.finish()?;
 
@@ -664,12 +670,7 @@ mod tests {
         let data_file = "standalone.buckets.0.stale".to_string();
         let data_path = index.path_for(&data_file);
         let mut file = NewFileWriter::create_new(&data_path)?;
-        file.write_all(&GENERATION_DATA_APP_ID.to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_VERSION - 1).to_le_bytes())?;
-        file.write_all(&0u64.to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
-        file.write_all(&(GENERATION_DATA_HEADER_BYTES as u64).to_le_bytes())?;
+        write_generation_test_header(&mut file, GENERATION_DATA_VERSION - 1)?;
         file.finish()?;
 
         index.write_manifest(&[FileIndexGeneration {
