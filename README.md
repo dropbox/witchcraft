@@ -97,6 +97,7 @@ Other flags:
 - `fbgemm` -- fbgemm-rs packed GEMM (bf16 weights, faster on x86)
 - `hybrid-dequant` -- F32 attention + Q4K FFN with fused gated-gelu (x86, requires `fbgemm`)
 - `napi` -- Node.js native module via napi-rs
+- `python` -- Python extension module via PyO3/maturin
 - `embed-assets` -- bake weights into binary
 - `progress` -- progress bars for CLI
 
@@ -104,6 +105,74 @@ Platform-specific recommended features (these are what `make` uses automatically
 - **Apple Silicon**: `t5-quantized,metal`
 - **Intel Mac (x86_64)**: `t5-quantized,fbgemm,hybrid-dequant`
 - **Intel Windows (x86_64)**: `t5-openvino,fbgemm`
+- **Linux x86_64 (CPU)**: `t5-quantized,fbgemm,hybrid-dequant`
+- **Linux x86_64 (CUDA)**: `t5-quantized,cuda`
+- **Linux ARM (Graviton, Pi, Ampere)**: `t5-quantized` (`fbgemm`/`hybrid-dequant` are x86-only)
+
+## Using as a Python module ##
+
+Requires [maturin](https://github.com/PyO3/maturin):
+
+```
+pip install maturin
+```
+
+Build a wheel for your current platform (auto-selects the right backend features):
+
+```
+make python-wheel
+pip install target/wheels/witchcraft-*.whl
+```
+
+Or, inside a virtualenv, install directly for development:
+
+```
+make python-dev
+```
+
+The Makefile picks the correct feature set automatically (`metal` on Apple Silicon,
+`fbgemm,hybrid-dequant` on Intel, `cuda` on Linux with a GPU). The wheel works on
+Python 3.8+, including 3.14+.
+
+To run the Python test suite after installing the wheel:
+
+```
+pip install pytest
+pytest tests/test_witchcraft.py
+```
+
+Tests that exercise the embedder (search, score, add, etc.) are skipped unless
+model assets are present. Run `make download` first to enable them.
+
+Then in Python:
+
+```python
+import witchcraft
+
+wc = witchcraft.Witchcraft('/path/to/db.sqlite', '/path/to/assets')
+
+# Add documents (fire-and-forget, processed by background thread)
+wc.add('550e8400-e29b-41d4-a716-446655440000',
+       '2024-01-15T10:00:00Z',
+       '{"source": "dropbox"}',
+       'The document text goes here')
+
+# Trigger embedding + index build
+wc.index()
+
+# Hybrid semantic + BM25 search
+results = wc.search('does milk intake cause acne?', threshold=0.3, top_k=5)
+for r in results:
+    print(r['score'], r['body'])
+
+# Score individual sentences against a query
+scores = wc.score('acne and diet', ['milk causes acne', 'exercise helps skin'])
+
+# Shut down the background indexer cleanly
+wc.shutdown()
+```
+
+`search` returns a list of dicts with keys: `score`, `metadata`, `body`, `idx`, `date`.
 
 ## Using as Node module ##
 

@@ -64,6 +64,9 @@ use sql_generator::build_filter_sql_and_params;
 #[allow(dead_code)]
 mod napi;
 
+#[cfg(feature = "python")]
+mod python;
+
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 

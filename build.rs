@@ -1,3 +1,5 @@
 fn main() {
-    napi_build::setup(); // enables N-API compatibility
+    if std::env::var("CARGO_FEATURE_NAPI").is_ok() {
+        napi_build::setup();
+    }
 }

@@ -11,12 +11,14 @@ ifeq ($(UNAME_S),Darwin)
     # Apple Silicon: Metal GPU + Accelerate BLAS
     CLI_FEATURES := t5-quantized,metal,progress
     NAPI_FEATURES := t5-quantized,metal,napi
+    PYTHON_FEATURES := t5-quantized,metal,python
     RUSTFLAGS_EXTRA :=
     TARGET := aarch64-apple-darwin
   else
     # Intel Mac: CPU-only with FBGEMM + hybrid-dequant
     CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
     NAPI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,napi
+    PYTHON_FEATURES := t5-quantized,fbgemm,hybrid-dequant,python
     RUSTFLAGS_EXTRA := -C target-feature=+avx2,+fma
     TARGET := x86_64-apple-darwin
   endif
@@ -26,9 +28,17 @@ else ifeq ($(UNAME_S),Linux)
   ifneq ($(NVCC),)
     CLI_FEATURES := t5-quantized,cuda,progress
     NAPI_FEATURES := t5-quantized,cuda,napi
+    PYTHON_FEATURES := t5-quantized,cuda,python
+  else ifeq ($(UNAME_M),aarch64)
+    # Linux ARM (Graviton, Pi, Ampere): fbgemm/hybrid-dequant are x86-only
+    CLI_FEATURES := t5-quantized,progress
+    NAPI_FEATURES := t5-quantized,napi
+    PYTHON_FEATURES := t5-quantized,python
   else
+    # Linux x86_64 CPU-only
     CLI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,progress
     NAPI_FEATURES := t5-quantized,fbgemm,hybrid-dequant,napi
+    PYTHON_FEATURES := t5-quantized,fbgemm,hybrid-dequant,python
   endif
   PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
   RUSTFLAGS_EXTRA :=
@@ -163,6 +173,14 @@ run: module
 	ln -sf target/release/warp-macos-universal.node warp.node
 	node index.cjs
 
+python-wheel: prereqs download
+	@command -v maturin >/dev/null 2>&1 || { echo "maturin not found — run: pip install maturin" >&2; exit 1; }
+	maturin build --release $(BUILD_TARGET) --features $(PYTHON_FEATURES)
+
+python-dev: prereqs download
+	@command -v maturin >/dev/null 2>&1 || { echo "maturin not found — run: pip install maturin" >&2; exit 1; }
+	maturin develop --features $(PYTHON_FEATURES)
+
 distclean:
 	rm -rf target env html xtr-base-en openvino_model
 	rm -f warp-cli warp.node pickbrain Cargo.lock lcov.info output.txt
@@ -179,4 +197,4 @@ distclean:
 	fi
 	rm -rf .make-stamps .stamp* stamp-* *.stamp */.stamp* */*.stamp */stamp-*
 
-.PHONY: prereqs download ovdownload build buildemb warp-cli pickbrain pickbrain-install module macintel winintel win test bench nfcorpus nfcorpus-score run distclean
+.PHONY: prereqs download ovdownload build buildemb warp-cli pickbrain pickbrain-install module macintel winintel win test bench nfcorpus nfcorpus-score run python-wheel python-dev distclean

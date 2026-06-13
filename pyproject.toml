@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "witchcraft"
+version = "0.1.2"
+description = "Semantic search with hybrid dense/sparse retrieval"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+
+[tool.maturin]
+features = ["python"]
+module-name = "witchcraft"
