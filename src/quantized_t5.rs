@@ -48,7 +48,7 @@ fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     }
 }
 
-#[cfg(feature = "hybrid-dequant")]
+#[cfg(all(feature = "hybrid-dequant", not(feature = "fbgemm")))]
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     let ws = vb.get((out_d, in_d), "weight")?;
     Ok(QMatMul::from_qtensor(ws))
@@ -181,6 +181,9 @@ struct T5DenseActDense {
 
 impl T5DenseActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        #[cfg(all(feature = "hybrid-dequant", feature = "fbgemm"))]
+        let wi = new_qmm_dequant(cfg.d_model, cfg.d_ff, vb.pp("wi"))?;
+        #[cfg(not(all(feature = "hybrid-dequant", feature = "fbgemm")))]
         let wi = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi"))?;
         #[cfg(feature = "hybrid-dequant")]
         let wo = new_qmm_dequant(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
@@ -213,7 +216,13 @@ struct T5DenseGatedActDense {
 
 impl T5DenseGatedActDense {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        #[cfg(all(feature = "hybrid-dequant", feature = "fbgemm"))]
+        let wi_0 = new_qmm_dequant(cfg.d_model, cfg.d_ff, vb.pp("wi_0"))?;
+        #[cfg(not(all(feature = "hybrid-dequant", feature = "fbgemm")))]
         let wi_0 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_0"))?;
+        #[cfg(all(feature = "hybrid-dequant", feature = "fbgemm"))]
+        let wi_1 = new_qmm_dequant(cfg.d_model, cfg.d_ff, vb.pp("wi_1"))?;
+        #[cfg(not(all(feature = "hybrid-dequant", feature = "fbgemm")))]
         let wi_1 = new_qmm(cfg.d_model, cfg.d_ff, vb.pp("wi_1"))?;
         #[cfg(feature = "hybrid-dequant")]
         let wo = new_qmm_dequant(cfg.d_ff, cfg.d_model, vb.pp("wo"))?;
@@ -687,6 +696,9 @@ impl T5EncoderModel {
         let shared = Embedding::new(cfg.vocab_size, cfg.d_model, shared_vb)?;
         let shared = Arc::new(shared);
         let encoder = T5Stack::load(vb.pp("encoder"), &shared, cfg)?;
+        #[cfg(all(feature = "hybrid-dequant", feature = "fbgemm"))]
+        let final_projection = new_qmm_dequant(768, 128, vb.pp("linear"))?;
+        #[cfg(not(all(feature = "hybrid-dequant", feature = "fbgemm")))]
         let final_projection = new_qmm(768, 128, vb.pp("linear"))?;
         Ok(Self {
             encoder,

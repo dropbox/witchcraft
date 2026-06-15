@@ -252,6 +252,9 @@ impl CustomOp1 for QGatedMatMul {
 struct FbgemmBf16Op(Arc<PackedMatrixBf16>);
 
 #[cfg(feature = "fbgemm")]
+struct FbgemmBf16GatedGeluOp(Arc<PackedMatrixBf16>, Arc<PackedMatrixBf16>);
+
+#[cfg(feature = "fbgemm")]
 impl CustomOp1 for FbgemmBf16Op {
     fn name(&self) -> &'static str {
         "fbgemm-bf16-matmul"
@@ -286,6 +289,64 @@ impl CustomOp1 for FbgemmBf16Op {
         let mut dst_storage = vec![0f32; dst_shape.elem_count()];
 
         fbgemm_rs::sgemm_bf16_simple(m, slice, &self.0, &mut dst_storage);
+
+        Ok((CpuStorage::F32(dst_storage), dst_shape))
+    }
+}
+
+#[cfg(feature = "fbgemm")]
+impl CustomOp1 for FbgemmBf16GatedGeluOp {
+    fn name(&self) -> &'static str {
+        "fbgemm-bf16-gated-gelu"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        if !layout.is_contiguous() {
+            candle_core::bail!("input tensor is not contiguous {layout:?}")
+        }
+        let src_shape = layout.shape();
+        let k = self.0.k();
+        let n = self.0.n();
+        if self.1.k() != k || self.1.n() != n {
+            candle_core::bail!(
+                "gated fbgemm weight shape mismatch: gate is {}x{}, up is {}x{}",
+                k,
+                n,
+                self.1.k(),
+                self.1.n()
+            )
+        }
+        if src_shape.rank() < 2 {
+            candle_core::bail!("input tensor has only one dimension {layout:?}")
+        }
+        let mut dst_shape = src_shape.dims().to_vec();
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            candle_core::bail!(
+                "input tensor {layout:?} incompatible with packed bf16 matrix ({k}x{n})"
+            )
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let m = dst_shape.elem_count() / n;
+
+        if storage.dtype() != DType::F32 {
+            candle_core::bail!("FbgemmBf16GatedGeluOp only supports f32 input")
+        }
+        let slice = storage.as_slice::<f32>()?;
+        let slice = &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
+        let mut gate = vec![0f32; dst_shape.elem_count()];
+        let mut dst_storage = vec![0f32; dst_shape.elem_count()];
+
+        fbgemm_rs::sgemm_bf16_simple(m, slice, &self.0, &mut gate);
+        fbgemm_rs::sgemm_bf16_simple(m, slice, &self.1, &mut dst_storage);
+
+        for (gate, up) in gate.into_iter().zip(dst_storage.iter_mut()) {
+            let gate = 0.5
+                * gate
+                * (1.0 + fast_tanh(0.7978845608_f32 * gate * (1.0 + 0.044715 * gate * gate)));
+            *up *= gate;
+        }
 
         Ok((CpuStorage::F32(dst_storage), dst_shape))
     }
@@ -388,6 +449,11 @@ impl Module for MatMul {
 /// Fused gated-gelu: `gelu(xs @ w0.T) * (xs @ w1.T)`.
 pub fn forward_gated_gelu(w0: &MatMul, w1: &MatMul, xs: &Tensor) -> Result<Tensor> {
     match (w0, w1) {
+        #[cfg(feature = "fbgemm")]
+        (MatMul::PackedBf16(w0), MatMul::PackedBf16(w1)) => {
+            let op = FbgemmBf16GatedGeluOp(w0.clone(), w1.clone());
+            xs.apply_op1_no_bwd(&op)
+        }
         (MatMul::QTensor(w0_qt), MatMul::QTensor(w1_qt)) => {
             // QGatedMatMul custom op is CPU-only; fall back to unfused path on Metal
             if matches!(xs.device(), candle_core::Device::Metal(_)) {

@@ -27,12 +27,12 @@ mod openvino_t5;
 use openvino_t5 as t5_encoder;
 
 #[cfg(feature = "modernbert")]
-mod modernbert;
+pub mod modernbert;
 #[cfg(feature = "modernbert")]
 use modernbert as t5_encoder;
 
 #[cfg(feature = "modernbert-quantized")]
-mod quantized_modernbert;
+pub mod quantized_modernbert;
 #[cfg(feature = "modernbert-quantized")]
 use quantized_modernbert as t5_encoder;
 

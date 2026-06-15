@@ -73,8 +73,15 @@ fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
 
 #[cfg(feature = "hybrid-dequant")]
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
-    let ws = vb.get((out_d, in_d), "weight")?;
-    Ok(QMatMul::from_qtensor(ws))
+    #[cfg(feature = "fbgemm")]
+    {
+        new_qmm_dequant(in_d, out_d, vb)
+    }
+    #[cfg(not(feature = "fbgemm"))]
+    {
+        let ws = vb.get((out_d, in_d), "weight")?;
+        Ok(QMatMul::from_qtensor(ws))
+    }
 }
 
 #[cfg(feature = "hybrid-dequant")]

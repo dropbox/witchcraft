@@ -253,7 +253,7 @@ impl FileBackedIndex {
             .collect())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "sqlite"))]
     pub(crate) fn level_embedding_counts(&self) -> Result<Vec<(u32, usize)>> {
         Ok(self
             .read_manifest()?
