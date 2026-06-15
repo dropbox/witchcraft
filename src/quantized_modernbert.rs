@@ -12,6 +12,11 @@ use candle_nn::Activation;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
 use std::io::Error;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    OnceLock,
+};
+use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 
 use crate::embed_asset;
@@ -149,6 +154,187 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     Tensor::cat(&[&r1, &r2], 3)?.contiguous()
 }
 
+static PROFILE_REMAINING: OnceLock<AtomicUsize> = OnceLock::new();
+
+#[derive(Default)]
+struct ForwardProfile {
+    seq_len: usize,
+    started: Option<Instant>,
+    embedding: Duration,
+    final_norm: Duration,
+    projection: Duration,
+    layers: Vec<LayerProfile>,
+}
+
+#[derive(Default)]
+struct LayerProfile {
+    index: usize,
+    attention_kind: &'static str,
+    attn_norm: Duration,
+    qkv: Duration,
+    rope: Duration,
+    full_scores: Duration,
+    mask: Duration,
+    softmax: Duration,
+    value: Duration,
+    fused_local: Duration,
+    output_projection: Duration,
+    attention_total: Duration,
+    mlp_norm: Duration,
+    mlp_wi: Duration,
+    mlp_activation: Duration,
+    mlp_wo: Duration,
+    mlp_total: Duration,
+    total: Duration,
+}
+
+fn profile_enabled() -> bool {
+    match std::env::var("WARP_MODERNBERT_PROFILE") {
+        Ok(value) => value != "0" && !value.eq_ignore_ascii_case("false"),
+        Err(_) => false,
+    }
+}
+
+fn profile_target_tokens() -> Option<usize> {
+    std::env::var("WARP_MODERNBERT_PROFILE_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+fn profile_take(seq_len: usize) -> bool {
+    if !profile_enabled() {
+        return false;
+    }
+    if let Some(target) = profile_target_tokens() {
+        if seq_len != target {
+            return false;
+        }
+    }
+    let remaining = PROFILE_REMAINING.get_or_init(|| {
+        let limit = std::env::var("WARP_MODERNBERT_PROFILE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        AtomicUsize::new(limit)
+    });
+    remaining
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_sub(1)
+        })
+        .is_ok()
+}
+
+impl ForwardProfile {
+    fn new(seq_len: usize) -> Self {
+        Self {
+            seq_len,
+            started: Some(Instant::now()),
+            ..Self::default()
+        }
+    }
+
+    fn print(&self) {
+        let total = self
+            .started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let mut attn_norm = Duration::default();
+        let mut qkv = Duration::default();
+        let mut rope = Duration::default();
+        let mut full_scores = Duration::default();
+        let mut mask = Duration::default();
+        let mut softmax = Duration::default();
+        let mut value = Duration::default();
+        let mut fused_local = Duration::default();
+        let mut output_projection = Duration::default();
+        let mut attention_total = Duration::default();
+        let mut mlp_norm = Duration::default();
+        let mut mlp_wi = Duration::default();
+        let mut mlp_activation = Duration::default();
+        let mut mlp_wo = Duration::default();
+        let mut mlp_total = Duration::default();
+        let mut layers_total = Duration::default();
+
+        for layer in &self.layers {
+            attn_norm += layer.attn_norm;
+            qkv += layer.qkv;
+            rope += layer.rope;
+            full_scores += layer.full_scores;
+            mask += layer.mask;
+            softmax += layer.softmax;
+            value += layer.value;
+            fused_local += layer.fused_local;
+            output_projection += layer.output_projection;
+            attention_total += layer.attention_total;
+            mlp_norm += layer.mlp_norm;
+            mlp_wi += layer.mlp_wi;
+            mlp_activation += layer.mlp_activation;
+            mlp_wo += layer.mlp_wo;
+            mlp_total += layer.mlp_total;
+            layers_total += layer.total;
+        }
+
+        eprintln!(
+            "modernbert-profile: seq={} total={:.2}ms embedding={:.2}ms layers={:.2}ms final_norm={:.2}ms projection={:.2}ms",
+            self.seq_len,
+            ms(total),
+            ms(self.embedding),
+            ms(layers_total),
+            ms(self.final_norm),
+            ms(self.projection),
+        );
+        eprintln!(
+            "modernbert-profile: attention total={:.2}ms norm={:.2}ms qkv={:.2}ms rope={:.2}ms full_scores={:.2}ms mask={:.2}ms softmax={:.2}ms value={:.2}ms fused_local={:.2}ms out={:.2}ms",
+            ms(attention_total),
+            ms(attn_norm),
+            ms(qkv),
+            ms(rope),
+            ms(full_scores),
+            ms(mask),
+            ms(softmax),
+            ms(value),
+            ms(fused_local),
+            ms(output_projection),
+        );
+        eprintln!(
+            "modernbert-profile: mlp total={:.2}ms norm={:.2}ms wi={:.2}ms act_mul={:.2}ms wo={:.2}ms",
+            ms(mlp_total),
+            ms(mlp_norm),
+            ms(mlp_wi),
+            ms(mlp_activation),
+            ms(mlp_wo),
+        );
+        for layer in &self.layers {
+            eprintln!(
+                "modernbert-profile: layer {:02} {:>11} total={:.2}ms attn={:.2}ms mlp={:.2}ms qkv={:.2}ms attn_core={:.2}ms mlp_wi={:.2}ms mlp_wo={:.2}ms",
+                layer.index,
+                layer.attention_kind,
+                ms(layer.total),
+                ms(layer.attention_total),
+                ms(layer.mlp_total),
+                ms(layer.qkv),
+                ms(layer.full_scores + layer.softmax + layer.value + layer.fused_local),
+                ms(layer.mlp_wi),
+                ms(layer.mlp_wo),
+            );
+        }
+    }
+}
+
+fn ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn attention_kind(seq_len: usize, local_window: Option<usize>) -> &'static str {
+    match local_window {
+        None => "global",
+        Some(window) if crate::fast_ops::should_use_modernbert_local_attention(seq_len, window) => {
+            "local-fused"
+        }
+        Some(_) => "local-full",
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Attention {
     wqkv: QMatMul,
@@ -179,22 +365,70 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         local_window: Option<usize>,
+        mut profile: Option<&mut LayerProfile>,
     ) -> Result<Tensor> {
+        let attention_started = Instant::now();
         let (b, s, _) = xs.dims3()?;
+        let started = Instant::now();
         let qkv = self.wqkv.forward(xs)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.qkv = started.elapsed();
+        }
+
+        let started = Instant::now();
         let qkv = qkv
             .reshape((b, s, 3, self.n_heads, self.head_dim))?
             .permute((2, 0, 3, 1, 4))?
             .contiguous()?;
-        let q = apply_rope(&qkv.get(0)?, cos, sin)?;
-        let k = apply_rope(&qkv.get(1)?, cos, sin)?;
-        let v = qkv.get(2)?;
+        let (q, k, v) = if matches!(qkv.device(), Device::Cpu) {
+            let qkv = crate::fast_ops::modernbert_rope_qkv(&qkv, cos, sin)?;
+            (qkv.get(0)?, qkv.get(1)?, qkv.get(2)?)
+        } else {
+            (
+                apply_rope(&qkv.get(0)?, cos, sin)?,
+                apply_rope(&qkv.get(1)?, cos, sin)?,
+                qkv.get(2)?,
+            )
+        };
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.rope = started.elapsed();
+        }
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
+        if let Some(w) = local_window {
+            if crate::fast_ops::should_use_modernbert_local_attention(s, w)
+                && matches!(q.device(), Device::Cpu)
+            {
+                let started = Instant::now();
+                let out = crate::fast_ops::modernbert_local_attention(&q, &k, &v, scale as f32, w)?;
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.fused_local = started.elapsed();
+                }
+
+                let started = Instant::now();
+                let out = out.transpose(1, 2)?.contiguous()?.reshape((
+                    b,
+                    s,
+                    self.n_heads * self.head_dim,
+                ))?;
+                let out = self.wo.forward(&out)?;
+                if let Some(profile) = profile {
+                    profile.output_projection = started.elapsed();
+                    profile.attention_total = attention_started.elapsed();
+                }
+                return Ok(out);
+            }
+        }
+
+        let started = Instant::now();
         let mut attn = (q.matmul(&k.t()?)? * scale)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.full_scores = started.elapsed();
+        }
 
         if let Some(w) = local_window {
             if s > w {
+                let started = Instant::now();
                 let half_w = w / 2;
                 let mask: Vec<f32> = (0..s)
                     .flat_map(|i| {
@@ -209,16 +443,35 @@ impl Attention {
                     .collect();
                 let mask = Tensor::new(mask.as_slice(), attn.device())?.reshape((1, 1, s, s))?;
                 attn = attn.broadcast_add(&mask)?;
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.mask = started.elapsed();
+                }
             }
         }
 
+        let started = Instant::now();
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.softmax = started.elapsed();
+        }
+
+        let started = Instant::now();
         let out = attn.matmul(&v)?;
         let out =
             out.transpose(1, 2)?
                 .contiguous()?
                 .reshape((b, s, self.n_heads * self.head_dim))?;
-        self.wo.forward(&out)
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.value = started.elapsed();
+        }
+
+        let started = Instant::now();
+        let out = self.wo.forward(&out)?;
+        if let Some(profile) = profile {
+            profile.output_projection = started.elapsed();
+            profile.attention_total = attention_started.elapsed();
+        }
+        Ok(out)
     }
 }
 
@@ -228,6 +481,7 @@ struct Mlp {
     wo: QMatMul,
     intermediate_size: usize,
     activation: Activation,
+    fast_activation: crate::fast_ops::ModernBertActivation,
 }
 
 impl Mlp {
@@ -237,24 +491,56 @@ impl Mlp {
         let wo = new_qmm_dequant(cfg.intermediate_size, cfg.hidden_size, vb.pp("Wo"))?;
         #[cfg(not(feature = "hybrid-dequant"))]
         let wo = new_qmm(cfg.intermediate_size, cfg.hidden_size, vb.pp("Wo"))?;
-        let activation = match cfg.hidden_activation.as_str() {
-            "silu" | "swish" => Activation::Silu,
-            _ => Activation::Gelu,
+        let (activation, fast_activation) = match cfg.hidden_activation.as_str() {
+            "silu" | "swish" => (
+                Activation::Silu,
+                crate::fast_ops::ModernBertActivation::Silu,
+            ),
+            _ => (
+                Activation::Gelu,
+                crate::fast_ops::ModernBertActivation::Gelu,
+            ),
         };
         Ok(Self {
             wi,
             wo,
             intermediate_size: cfg.intermediate_size,
             activation,
+            fast_activation,
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward(&self, xs: &Tensor, mut profile: Option<&mut LayerProfile>) -> Result<Tensor> {
+        let mlp_started = Instant::now();
+        let started = Instant::now();
         let h = self.wi.forward(xs)?;
-        let gate = h.narrow(D::Minus1, 0, self.intermediate_size)?;
-        let up = h.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-        let h = self.activation.forward(&gate)?.broadcast_mul(&up)?;
-        self.wo.forward(&h)
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.mlp_wi = started.elapsed();
+        }
+
+        let started = Instant::now();
+        let h = if matches!(h.device(), Device::Cpu) {
+            crate::fast_ops::modernbert_gated_activation(
+                &h,
+                self.intermediate_size,
+                self.fast_activation,
+            )?
+        } else {
+            let gate = h.narrow(D::Minus1, 0, self.intermediate_size)?;
+            let up = h.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+            self.activation.forward(&gate)?.broadcast_mul(&up)?
+        };
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.mlp_activation = started.elapsed();
+        }
+
+        let started = Instant::now();
+        let out = self.wo.forward(&h)?;
+        if let Some(profile) = profile {
+            profile.mlp_wo = started.elapsed();
+            profile.mlp_total = mlp_started.elapsed();
+        }
+        Ok(out)
     }
 }
 
@@ -294,14 +580,35 @@ impl Layer {
         cos: &Tensor,
         sin: &Tensor,
         local_window: Option<usize>,
+        profile: Option<&mut LayerProfile>,
     ) -> Result<Tensor> {
+        let layer_started = Instant::now();
+        let mut profile = profile;
+        let started = Instant::now();
         let normed = match &self.attn_norm {
             Some(norm) => candle_core::Module::forward(norm, xs)?,
             None => xs.clone(),
         };
-        let xs = (xs + self.attn.forward(&normed, cos, sin, local_window)?)?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.attn_norm = started.elapsed();
+        }
+
+        let xs = (xs
+            + self
+                .attn
+                .forward(&normed, cos, sin, local_window, profile.as_deref_mut())?)?;
+
+        let started = Instant::now();
         let normed = candle_core::Module::forward(&self.mlp_norm, &xs)?;
-        xs + self.mlp.forward(&normed)?
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.mlp_norm = started.elapsed();
+        }
+
+        let xs = (xs + self.mlp.forward(&normed, profile.as_deref_mut())?)?;
+        if let Some(profile) = profile {
+            profile.total = layer_started.elapsed();
+        }
+        Ok(xs)
     }
 }
 
@@ -361,12 +668,18 @@ impl Encoder {
         })
     }
 
-    fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+    fn forward(&self, input_ids: &Tensor, profile: Option<&mut ForwardProfile>) -> Result<Tensor> {
+        let mut profile = profile;
         let seq_len = input_ids.dim(D::Minus1)?;
+        let started = Instant::now();
         let mut xs = candle_core::Module::forward(
             &self.embedding_norm,
             &self.embedding.forward(input_ids)?,
         )?;
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.embedding = started.elapsed();
+        }
+
         let local_cos = self.local_rope_cos.narrow(0, 0, seq_len)?;
         let local_sin = self.local_rope_sin.narrow(0, 0, seq_len)?;
         let global_cos = self.global_rope_cos.narrow(0, 0, seq_len)?;
@@ -378,9 +691,24 @@ impl Encoder {
             } else {
                 (&local_cos, &local_sin, Some(self.local_attention))
             };
-            xs = layer.forward(&xs, cos, sin, local_window)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                let mut layer_profile = LayerProfile {
+                    index: i,
+                    attention_kind: attention_kind(seq_len, local_window),
+                    ..LayerProfile::default()
+                };
+                xs = layer.forward(&xs, cos, sin, local_window, Some(&mut layer_profile))?;
+                profile.layers.push(layer_profile);
+            } else {
+                xs = layer.forward(&xs, cos, sin, local_window, None)?;
+            }
         }
-        candle_core::Module::forward(&self.final_norm, &xs)
+        let started = Instant::now();
+        let xs = candle_core::Module::forward(&self.final_norm, &xs)?;
+        if let Some(profile) = profile {
+            profile.final_norm = started.elapsed();
+        }
+        Ok(xs)
     }
 }
 
@@ -422,7 +750,16 @@ pub struct T5EncoderModel {
 
 impl T5EncoderModel {
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.projection.forward(&self.encoder.forward(input_ids)?)
+        let seq_len = input_ids.dim(D::Minus1)?;
+        let mut profile = profile_take(seq_len).then(|| ForwardProfile::new(seq_len));
+        let encoder_output = self.encoder.forward(input_ids, profile.as_mut())?;
+        let started = Instant::now();
+        let output = self.projection.forward(&encoder_output)?;
+        if let Some(mut profile) = profile {
+            profile.projection = started.elapsed();
+            profile.print();
+        }
+        Ok(output)
     }
 
     pub fn device(&self) -> &Device {

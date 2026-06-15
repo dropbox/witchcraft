@@ -13,7 +13,9 @@ use candle_core::{CpuStorage, CustomOp1, DType, Layout, Module, Result, Shape, T
 #[cfg(feature = "fbgemm")]
 use fbgemm_rs::{PackedBMatrixI8, PackedMatrix, PackedMatrixBf16};
 use rayon::prelude::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "fbgemm")]
+use std::sync::Mutex;
 
 fn as_block_slice<T>(data: &[u8]) -> &[T] {
     let size = std::mem::size_of::<T>();

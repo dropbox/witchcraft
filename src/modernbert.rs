@@ -147,11 +147,32 @@ impl Attention {
             .reshape((b, s, 3, self.n_heads, self.head_dim))?
             .permute((2, 0, 3, 1, 4))?
             .contiguous()?;
-        let q = apply_rope(&qkv.get(0)?, cos, sin)?;
-        let k = apply_rope(&qkv.get(1)?, cos, sin)?;
-        let v = qkv.get(2)?;
+        let (q, k, v) = if matches!(qkv.device(), Device::Cpu) {
+            let qkv = crate::fast_ops::modernbert_rope_qkv(&qkv, cos, sin)?;
+            (qkv.get(0)?, qkv.get(1)?, qkv.get(2)?)
+        } else {
+            (
+                apply_rope(&qkv.get(0)?, cos, sin)?,
+                apply_rope(&qkv.get(1)?, cos, sin)?,
+                qkv.get(2)?,
+            )
+        };
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
+        if let Some(w) = local_window {
+            if crate::fast_ops::should_use_modernbert_local_attention(s, w)
+                && matches!(q.device(), Device::Cpu)
+            {
+                let out = crate::fast_ops::modernbert_local_attention(&q, &k, &v, scale as f32, w)?;
+                let out = out.transpose(1, 2)?.contiguous()?.reshape((
+                    b,
+                    s,
+                    self.n_heads * self.head_dim,
+                ))?;
+                return self.wo.forward(&out);
+            }
+        }
+
         let mut attn = (q.matmul(&k.t()?)? * scale)?;
 
         // Apply sliding window mask for local attention layers.
@@ -192,6 +213,7 @@ struct Mlp {
     wo: Linear,
     intermediate_size: usize,
     activation: Activation,
+    fast_activation: crate::fast_ops::ModernBertActivation,
 }
 
 impl Mlp {
@@ -199,23 +221,38 @@ impl Mlp {
         let wi =
             candle_nn::linear_no_bias(cfg.hidden_size, 2 * cfg.intermediate_size, vb.pp("Wi"))?;
         let wo = candle_nn::linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("Wo"))?;
-        let activation = match cfg.hidden_activation.as_str() {
-            "silu" | "swish" => Activation::Silu,
-            _ => Activation::Gelu,
+        let (activation, fast_activation) = match cfg.hidden_activation.as_str() {
+            "silu" | "swish" => (
+                Activation::Silu,
+                crate::fast_ops::ModernBertActivation::Silu,
+            ),
+            _ => (
+                Activation::Gelu,
+                crate::fast_ops::ModernBertActivation::Gelu,
+            ),
         };
         Ok(Self {
             wi,
             wo,
             intermediate_size: cfg.intermediate_size,
             activation,
+            fast_activation,
         })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let h = self.wi.forward(xs)?;
-        let gate = h.narrow(D::Minus1, 0, self.intermediate_size)?;
-        let up = h.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-        let h = self.activation.forward(&gate)?.broadcast_mul(&up)?;
+        let h = if matches!(h.device(), Device::Cpu) {
+            crate::fast_ops::modernbert_gated_activation(
+                &h,
+                self.intermediate_size,
+                self.fast_activation,
+            )?
+        } else {
+            let gate = h.narrow(D::Minus1, 0, self.intermediate_size)?;
+            let up = h.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+            self.activation.forward(&gate)?.broadcast_mul(&up)?
+        };
         self.wo.forward(&h)
     }
 }
