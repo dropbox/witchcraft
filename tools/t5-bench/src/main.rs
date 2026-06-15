@@ -26,6 +26,7 @@ fn make_input(tokenizer: &tokenizers::Tokenizer, base: &str, min_tokens: usize) 
 
 fn bench_candle(assets: &PathBuf, tokenizer: &tokenizers::Tokenizer, sizes: &[usize]) -> Result<()> {
     let device = witchcraft::make_device();
+    eprintln!("candle: device {:?}", device.location());
 
     let cfg_bytes = std::fs::read(assets.join("xtr-config.json"))?;
     let config: quantized_t5::Config = serde_json::from_slice(&cfg_bytes)?;
@@ -182,7 +183,7 @@ fn main() -> Result<()> {
     let only = std::env::args().nth(2);
 
     if only.as_deref() != Some("ov") {
-        eprintln!("\n=== Candle (Q4K -> F32 on CPU) ===");
+        eprintln!("\n=== Candle (Q4K -> F32) ===");
         if let Err(e) = bench_candle(&assets, &tokenizer, &sizes) {
             eprintln!("candle error: {e}");
         }
