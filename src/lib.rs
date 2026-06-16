@@ -1349,6 +1349,23 @@ struct BucketReadBatch {
     buckets: Vec<BucketRead>,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BucketReadStats {
+    batches: usize,
+    buckets: usize,
+    bytes: usize,
+}
+
+impl BucketReadStats {
+    fn from_batches(batches: &[BucketReadBatch]) -> Self {
+        Self {
+            batches: batches.len(),
+            buckets: batches.iter().map(|batch| batch.buckets.len()).sum(),
+            bytes: batches.iter().map(|batch| batch.len).sum(),
+        }
+    }
+}
+
 struct BucketPayload<'a> {
     keys: &'a [u8],
     residuals: &'a [u8],
@@ -1372,6 +1389,22 @@ struct IndexKMeansNode {
     packed_centers: fast_ops::PackedRight,
     children: Vec<IndexKMeansNode>,
     leaf_offset: usize,
+}
+
+#[derive(Default)]
+struct MatchIoCounters {
+    candidate_buckets: usize,
+    selected_buckets: usize,
+    selected_slots: usize,
+    read: BucketReadStats,
+}
+
+impl MatchIoCounters {
+    fn add_read_stats(&mut self, read: BucketReadStats) {
+        self.read.batches += read.batches;
+        self.read.buckets += read.buckets;
+        self.read.bytes += read.bytes;
+    }
 }
 
 /// Per-generation centroid data loaded from sidecar files.
@@ -1681,11 +1714,15 @@ impl GenerationCentroids {
         Ok(payloads)
     }
 
-    fn prefetch_bucket_payloads(&self, bucket_indices: &[usize]) -> Result<Vec<Option<Vec<u8>>>> {
+    fn prefetch_bucket_payloads(
+        &self,
+        bucket_indices: &[usize],
+    ) -> Result<(Vec<Option<Vec<u8>>>, BucketReadStats)> {
         let batches = self.bucket_read_batches(bucket_indices)?;
+        let stats = BucketReadStats::from_batches(&batches);
         let mut payloads = vec![None; self.bucket_indices.len()];
         if batches.is_empty() {
-            return Ok(payloads);
+            return Ok((payloads, stats));
         }
 
         for batch in &batches {
@@ -1700,7 +1737,7 @@ impl GenerationCentroids {
                 payloads[bucket.bucket_idx] = Some(data);
             }
         }
-        Ok(payloads)
+        Ok((payloads, stats))
     }
 
     fn bucket_payload<'a>(
@@ -1842,6 +1879,7 @@ pub fn match_centroids_raw(
     let mut all = vec![];
     let mut count = 0;
     let mut missing = vec![0.0f32; m];
+    let mut io_counters = MatchIoCounters::default();
 
     let table = packops::make_residual_dequant_table()?;
 
@@ -1860,6 +1898,7 @@ pub fn match_centroids_raw(
         let n_centroids = gen.sizes.len();
 
         let candidates = gen.routed_centroid_candidates(query_embeddings)?;
+        io_counters.candidate_buckets += candidates.len();
         let candidate_indices: Vec<u32> = candidates.iter().map(|&idx| idx as u32).collect();
         let candidate_index_tensor =
             Tensor::from_slice(candidate_indices.as_slice(), (candidate_indices.len(),), device)?;
@@ -1890,10 +1929,14 @@ pub fn match_centroids_raw(
             let row = row.to_vec1::<u32>()?;
             let mut cumsum = 0;
             let selection_limit = candidates.len().min(k);
+            if selection_limit == 0 {
+                continue;
+            }
             let mut tail_rank = 0;
             for j in 0..selection_limit {
                 let idx = candidates[row[j] as usize];
                 topk_clusters.push(idx);
+                io_counters.selected_slots += 1;
                 cumsum += gen.sizes[idx];
                 tail_rank = j;
                 if cumsum >= t_prime {
@@ -1913,6 +1956,7 @@ pub fn match_centroids_raw(
         gen_centroid_score_ranges_all.push(gen_centroid_score_ranges);
         topk_clusters.sort_unstable();
         topk_clusters.dedup();
+        io_counters.selected_buckets += topk_clusters.len();
 
         debug!(
             "hierarchical centroid routing: candidates={} selected={} / {} buckets",
@@ -1921,7 +1965,8 @@ pub fn match_centroids_raw(
             n_centroids
         );
 
-        let prefetched_payloads = gen.prefetch_bucket_payloads(&topk_clusters)?;
+        let (prefetched_payloads, read_stats) = gen.prefetch_bucket_payloads(&topk_clusters)?;
+        io_counters.add_read_stats(read_stats);
         for &i in &topk_clusters {
             let bucket_idx = i as usize;
             let bucket_id = gen.bucket_indices[bucket_idx];
@@ -2109,6 +2154,15 @@ pub fn match_centroids_raw(
     scored_results.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     scored_results.truncate(top_k);
 
+    info!(
+        "bucket io counters: candidates={} selected={} slots={} read_batches={} read_buckets={} read_bytes={}",
+        io_counters.candidate_buckets,
+        io_counters.selected_buckets,
+        io_counters.selected_slots,
+        io_counters.read.batches,
+        io_counters.read.buckets,
+        io_counters.read.bytes,
+    );
     debug!(
         "match_centroids_raw: {} embeddings in {} ms.",
         count,
