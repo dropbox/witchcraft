@@ -135,6 +135,8 @@ const BUCKET_DATA_APP_ID: u32 = file_index::GENERATION_DATA_APP_ID;
 const BUCKET_DATA_VERSION: u32 = file_index::GENERATION_DATA_VERSION;
 const BUCKET_SCALAR_META_BYTES: usize = 20;
 const BUCKET_DATA_HEADER_BYTES: usize = file_index::GENERATION_DATA_HEADER_BYTES;
+pub(crate) const CENTER_FORMAT_Q8: u32 = 1;
+const BUCKET_CENTER_FORMAT: u32 = CENTER_FORMAT_Q8;
 #[cfg(not(test))]
 const L0_CAPACITY: usize = 1024;
 #[cfg(test)]
@@ -181,8 +183,26 @@ impl Default for IndexOptions {
     }
 }
 
-fn center_bytes_for_dim(dim: usize) -> usize {
+fn f32_center_bytes_for_dim(dim: usize) -> usize {
     dim * std::mem::size_of::<f32>()
+}
+
+fn center_block_bytes_for_count(
+    centroid_count: usize,
+    dim: usize,
+    center_format: u32,
+) -> Result<usize> {
+    match center_format {
+        CENTER_FORMAT_Q8 => centroid_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .and_then(|scale_len| {
+                centroid_count
+                    .checked_mul(dim)
+                    .and_then(|code_len| scale_len.checked_add(code_len))
+            })
+            .ok_or_else(|| anyhow::anyhow!("bucket center block length overflow")),
+        _ => anyhow::bail!("bucket center format {center_format} is not supported"),
+    }
 }
 
 fn residual_bytes_for_dim(dim: usize, residual_quant_bits: u8) -> Result<usize> {
@@ -634,6 +654,7 @@ struct BucketDataHeader {
     centroid_count: usize,
     embedding_dim: usize,
     residual_quant_bits: u8,
+    center_format: u32,
     meta_offset: usize,
     centers_offset: usize,
     payload_offset: usize,
@@ -645,6 +666,7 @@ fn write_bucket_data_header(
     centroid_count: usize,
     embedding_dim: usize,
     residual_quant_bits: u8,
+    center_format: u32,
     meta_offset: usize,
     payload_offset: usize,
     rowids_offset: usize,
@@ -654,6 +676,7 @@ fn write_bucket_data_header(
     writer.write_all(&(residual_quant_bits as u32).to_le_bytes())?;
     writer.write_all(&u32::try_from(centroid_count)?.to_le_bytes())?;
     writer.write_all(&u32::try_from(embedding_dim)?.to_le_bytes())?;
+    writer.write_all(&center_format.to_le_bytes())?;
     writer.write_all(&u32::try_from(meta_offset)?.to_le_bytes())?;
     writer.write_all(&u32::try_from(payload_offset)?.to_le_bytes())?;
     writer.write_all(&u64::try_from(rowids_offset)?.to_le_bytes())?;
@@ -674,6 +697,114 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
         "u64 field at offset {offset} is truncated"
     );
     Ok(u64::from_le_bytes(bytes[offset..offset + 8].try_into()?))
+}
+
+fn encode_q8_center_block(
+    f32_block: &[u8],
+    centroid_count: usize,
+    dim: usize,
+) -> Result<Vec<u8>> {
+    let f32_row_bytes = f32_center_bytes_for_dim(dim);
+    let expected_f32_len = centroid_count
+        .checked_mul(f32_row_bytes)
+        .ok_or_else(|| anyhow::anyhow!("f32 center block length overflow"))?;
+    anyhow::ensure!(
+        f32_block.len() == expected_f32_len,
+        "f32 center block length is invalid"
+    );
+    let scale_len = centroid_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("q8 center scale block length overflow"))?;
+    let code_len = centroid_count
+        .checked_mul(dim)
+        .ok_or_else(|| anyhow::anyhow!("q8 center code block length overflow"))?;
+    let encoded_len = scale_len
+        .checked_add(code_len)
+        .ok_or_else(|| anyhow::anyhow!("q8 center block length overflow"))?;
+    let mut encoded = vec![0; encoded_len];
+
+    for centroid_idx in 0..centroid_count {
+        let f32_start = centroid_idx
+            .checked_mul(f32_row_bytes)
+            .ok_or_else(|| anyhow::anyhow!("f32 center row offset overflow"))?;
+        let mut max_abs = 0.0f32;
+        for dim_idx in 0..dim {
+            let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
+            let value = f32::from_le_bytes(f32_block[offset..offset + 4].try_into()?);
+            anyhow::ensure!(value.is_finite(), "bucket center contains non-finite value");
+            max_abs = max_abs.max(value.abs());
+        }
+
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 };
+        let scale_offset = centroid_idx * std::mem::size_of::<f32>();
+        encoded[scale_offset..scale_offset + 4].copy_from_slice(&scale.to_le_bytes());
+        if scale == 0.0 {
+            continue;
+        }
+
+        let code_start = scale_len + centroid_idx * dim;
+        for dim_idx in 0..dim {
+            let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
+            let value = f32::from_le_bytes(f32_block[offset..offset + 4].try_into()?);
+            let code = (value / scale).round().clamp(-127.0, 127.0) as i8;
+            encoded[code_start + dim_idx] = code as u8;
+        }
+    }
+
+    Ok(encoded)
+}
+
+fn decode_q8_center_block(
+    q8_block: &[u8],
+    centroid_count: usize,
+    dim: usize,
+) -> Result<Vec<u8>> {
+    let expected_q8_len = center_block_bytes_for_count(centroid_count, dim, CENTER_FORMAT_Q8)?;
+    anyhow::ensure!(
+        q8_block.len() == expected_q8_len,
+        "q8 center block length is invalid"
+    );
+    let scale_len = centroid_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("q8 center scale block length overflow"))?;
+    let f32_row_bytes = f32_center_bytes_for_dim(dim);
+    let f32_len = centroid_count
+        .checked_mul(f32_row_bytes)
+        .ok_or_else(|| anyhow::anyhow!("f32 center block length overflow"))?;
+    let mut decoded = vec![0; f32_len];
+
+    for centroid_idx in 0..centroid_count {
+        let scale_offset = centroid_idx * std::mem::size_of::<f32>();
+        let scale = f32::from_le_bytes(q8_block[scale_offset..scale_offset + 4].try_into()?);
+        anyhow::ensure!(
+            scale.is_finite() && scale >= 0.0,
+            "q8 center scale is invalid"
+        );
+        let code_start = scale_len + centroid_idx * dim;
+        let f32_start = centroid_idx
+            .checked_mul(f32_row_bytes)
+            .ok_or_else(|| anyhow::anyhow!("f32 center row offset overflow"))?;
+        for dim_idx in 0..dim {
+            let code = i8::from_ne_bytes([q8_block[code_start + dim_idx]]);
+            let value = code as f32 * scale;
+            let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
+            decoded[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    Ok(decoded)
+}
+
+fn center_block_to_f32_bytes(
+    center_block: &[u8],
+    centroid_count: usize,
+    dim: usize,
+    center_format: u32,
+) -> Result<Vec<u8>> {
+    match center_format {
+        CENTER_FORMAT_Q8 => decode_q8_center_block(center_block, centroid_count, dim),
+        _ => anyhow::bail!("bucket center format {center_format} is not supported"),
+    }
 }
 
 fn write_u64_le(bytes: &mut Vec<u8>, value: usize) -> Result<()> {
@@ -899,6 +1030,12 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
     let embedding_dim: usize = read_u32_le(prefix, offset)?.try_into()?;
     anyhow::ensure!(embedding_dim > 0, "bucket sidecar embedding dimension is zero");
     offset += std::mem::size_of::<u32>();
+    let center_format = read_u32_le(prefix, offset)?;
+    match center_format {
+        CENTER_FORMAT_Q8 => {}
+        _ => anyhow::bail!("bucket center format {center_format} is not supported"),
+    }
+    offset += std::mem::size_of::<u32>();
     let meta_offset: usize = read_u32_le(prefix, offset)?.try_into()?;
     offset += std::mem::size_of::<u32>();
     let payload_offset: usize = read_u32_le(prefix, offset)?.try_into()?;
@@ -910,9 +1047,7 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
     let centers_offset = meta_offset
         .checked_add(scalar_meta_len)
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar centers offset overflow"))?;
-    let centers_len = centroid_count
-        .checked_mul(center_bytes_for_dim(embedding_dim))
-        .ok_or_else(|| anyhow::anyhow!("bucket sidecar centers length overflow"))?;
+    let centers_len = center_block_bytes_for_count(centroid_count, embedding_dim, center_format)?;
     let expected_payload_offset = centers_offset
         .checked_add(centers_len)
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload offset overflow"))?;
@@ -927,6 +1062,7 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
         centroid_count,
         embedding_dim,
         residual_quant_bits,
+        center_format,
         meta_offset,
         centers_offset,
         payload_offset,
@@ -1053,7 +1189,7 @@ fn build_coarse_tree_from_bucket_meta(
     center_block: &[u8],
     center_dim: usize,
 ) -> Result<CoarseTree> {
-    let center_bytes = center_bytes_for_dim(center_dim);
+    let center_bytes = f32_center_bytes_for_dim(center_dim);
     let expected_center_block_len = bucket_meta
         .len()
         .checked_mul(center_bytes)
@@ -1149,7 +1285,7 @@ fn merge_and_write_buckets_to_path(
     let data_tmp = tempfile::NamedTempFile::new_in(temp_dir)?;
     let mut data_writer = data_tmp.reopen()?;
     let (centroid_count, center_dim) = centers_cpu.dims2()?;
-    let center_bytes = center_bytes_for_dim(center_dim);
+    let center_bytes = f32_center_bytes_for_dim(center_dim);
     let residual_bytes = residual_bytes_for_dim(center_dim, residual_quant_bits)?;
     let mut bucket_meta: Vec<BucketSidecarMeta> = (0..centroid_count)
         .map(|_| BucketSidecarMeta {
@@ -1177,11 +1313,11 @@ fn merge_and_write_buckets_to_path(
         let center = centers_cpu.get(bucket_idx)?;
         let center_bytes_data = center.to_f32_bytes()?;
         anyhow::ensure!(
-            center_bytes_data.len() == center_bytes_for_dim(center_dim),
+            center_bytes_data.len() == f32_center_bytes_for_dim(center_dim),
             "bucket {} center byte length {} does not match expected {}",
             entry.value,
             center_bytes_data.len(),
-            center_bytes_for_dim(center_dim)
+            f32_center_bytes_for_dim(center_dim)
         );
         let compressed_keys = compress_keys(&entry.keys);
         anyhow::ensure!(
@@ -1218,6 +1354,8 @@ fn merge_and_write_buckets_to_path(
 
     let coarse_tree = build_coarse_tree_from_bucket_meta(&bucket_meta, &center_block, center_dim)?;
     let coarse_tree_bytes = serialize_coarse_tree(&coarse_tree)?;
+    let stored_center_block =
+        encode_q8_center_block(&center_block, centroid_count, center_dim)?;
     let nonempty_buckets: Vec<usize> = bucket_meta
         .iter()
         .enumerate()
@@ -1243,7 +1381,7 @@ fn merge_and_write_buckets_to_path(
         .checked_add(meta_block_len)
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar center block offset overflow"))?;
     let payload_start = centers_offset
-        .checked_add(center_block.len())
+        .checked_add(stored_center_block.len())
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload start overflow"))?;
     let payload_start = u64::try_from(payload_start)?;
     let payload_len = payload_chunks
@@ -1269,6 +1407,7 @@ fn merge_and_write_buckets_to_path(
         centroid_count,
         center_dim,
         residual_quant_bits,
+        BUCKET_CENTER_FORMAT,
         meta_offset,
         payload_start.try_into()?,
         rowids_offset.try_into()?,
@@ -1293,7 +1432,7 @@ fn merge_and_write_buckets_to_path(
     for meta in &bucket_meta {
         write_bucket_meta(&mut bucket_data_writer, meta)?;
     }
-    bucket_data_writer.write_all(&center_block)?;
+    bucket_data_writer.write_all(&stored_center_block)?;
     let mut data_reader = data_tmp.reopen()?;
     for &(_, temp_offset, len) in &payload_chunks {
         data_reader.seek(SeekFrom::Start(temp_offset))?;
@@ -1912,7 +2051,14 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
         }
 
         let centers_matrix = if !bucket_indices.is_empty() {
-            let centers = Tensor::from_f32_bytes(&center_block, header.embedding_dim, &Device::Cpu)?;
+            let center_f32_bytes = center_block_to_f32_bytes(
+                &center_block,
+                header.centroid_count,
+                header.embedding_dim,
+                header.center_format,
+            )?;
+            let centers =
+                Tensor::from_f32_bytes(&center_f32_bytes, header.embedding_dim, &Device::Cpu)?;
             if bucket_indices.len() == header.centroid_count {
                 centers.to_device(device)?
             } else {

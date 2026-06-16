@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 pub(crate) const GENERATION_DATA_APP_ID: u32 = APP_ID_U32;
 pub(crate) const GENERATION_DATA_VERSION: u32 = 2;
 pub(crate) const GENERATION_DATA_HEADER_BYTES: usize =
-    7 * std::mem::size_of::<u32>() + std::mem::size_of::<u64>();
+    8 * std::mem::size_of::<u32>() + std::mem::size_of::<u64>();
 
 const ROWID_RECORD_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
-const ROWIDS_OFFSET_FIELD: usize = 7 * std::mem::size_of::<u32>();
+const ROWIDS_OFFSET_FIELD: usize = 8 * std::mem::size_of::<u32>();
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -560,6 +560,7 @@ mod tests {
         file.write_all(&0u32.to_le_bytes())?;
         file.write_all(&0u32.to_le_bytes())?;
         file.write_all(&128u32.to_le_bytes())?;
+        file.write_all(&crate::CENTER_FORMAT_Q8.to_le_bytes())?;
         file.write_all(&header_bytes.to_le_bytes())?;
         file.write_all(&header_bytes.to_le_bytes())?;
         file.write_all(&u64::from(header_bytes).to_le_bytes())?;

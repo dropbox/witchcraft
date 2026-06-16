@@ -663,6 +663,7 @@ mod tests {
         sidecar.extend_from_slice(&0u32.to_le_bytes());
         sidecar.extend_from_slice(&0u32.to_le_bytes());
         sidecar.extend_from_slice(&(crate::DEFAULT_EMBEDDING_DIM as u32).to_le_bytes());
+        sidecar.extend_from_slice(&crate::CENTER_FORMAT_Q8.to_le_bytes());
         sidecar.extend_from_slice(&header_bytes.to_le_bytes());
         sidecar.extend_from_slice(&header_bytes.to_le_bytes());
         sidecar.extend_from_slice(&u64::from(header_bytes).to_le_bytes());
