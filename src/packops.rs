@@ -15,6 +15,64 @@ pub(crate) const DEFAULT_RESIDUAL_QUANT_BITS: u8 = 2;
 #[cfg(not(feature = "polar-quant"))]
 pub(crate) const DEFAULT_RESIDUAL_QUANT_BITS: u8 = 0;
 
+const fn signed_q4_decode_nibble(code: u8) -> f32 {
+    if code >= 8 {
+        (code as i16 - 16) as f32
+    } else {
+        code as f32
+    }
+}
+
+const fn make_signed_q4_pair_decode_table() -> [[f32; 2]; 256] {
+    let mut table = [[0.0; 2]; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let low = (byte as u8) & 0x0f;
+        let high = (byte as u8) >> 4;
+        table[byte] = [signed_q4_decode_nibble(low), signed_q4_decode_nibble(high)];
+        byte += 1;
+    }
+    table
+}
+
+const SIGNED_Q4_PAIR_DECODE_TABLE: [[f32; 2]; 256] = make_signed_q4_pair_decode_table();
+const SIGNED_Q4_MAX_MAGNITUDE: f32 = 7.0;
+
+pub(crate) fn signed_q4_row_bytes(cols: usize) -> usize {
+    cols.div_ceil(2)
+}
+
+pub(crate) fn signed_q4_scale(max_abs: f32) -> f32 {
+    if max_abs > 0.0 {
+        max_abs / SIGNED_Q4_MAX_MAGNITUDE
+    } else {
+        0.0
+    }
+}
+
+pub(crate) fn quantize_signed_q4(value: f32, scale: f32) -> u8 {
+    if scale == 0.0 {
+        return 0;
+    }
+    let code = (value / scale)
+        .round()
+        .clamp(-SIGNED_Q4_MAX_MAGNITUDE, SIGNED_Q4_MAX_MAGNITUDE) as i8;
+    (code as u8) & 0x0f
+}
+
+pub(crate) fn write_signed_q4_code(bytes: &mut [u8], index: usize, code: u8) {
+    let byte = &mut bytes[index / 2];
+    if index % 2 == 0 {
+        *byte = (*byte & 0xf0) | code;
+    } else {
+        *byte = (*byte & 0x0f) | (code << 4);
+    }
+}
+
+pub(crate) fn signed_q4_pair_values(byte: u8) -> [f32; 2] {
+    SIGNED_Q4_PAIR_DECODE_TABLE[byte as usize]
+}
+
 #[cfg(feature = "polar-quant")]
 fn quantize_polar_radius_with_scale(radius: f32, scale: f32, max_code: u8) -> u8 {
     let normalized = (radius * scale).clamp(0.0, 1.0);

@@ -560,7 +560,7 @@ mod tests {
         file.write_all(&0u32.to_le_bytes())?;
         file.write_all(&0u32.to_le_bytes())?;
         file.write_all(&128u32.to_le_bytes())?;
-        file.write_all(&crate::CENTER_FORMAT_Q8.to_le_bytes())?;
+        file.write_all(&crate::BUCKET_CENTER_FORMAT.to_le_bytes())?;
         file.write_all(&header_bytes.to_le_bytes())?;
         file.write_all(&header_bytes.to_le_bytes())?;
         file.write_all(&u64::from(header_bytes).to_le_bytes())?;

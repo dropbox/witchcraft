@@ -135,8 +135,7 @@ const BUCKET_DATA_APP_ID: u32 = file_index::GENERATION_DATA_APP_ID;
 const BUCKET_DATA_VERSION: u32 = file_index::GENERATION_DATA_VERSION;
 const BUCKET_SCALAR_META_BYTES: usize = 20;
 const BUCKET_DATA_HEADER_BYTES: usize = file_index::GENERATION_DATA_HEADER_BYTES;
-pub(crate) const CENTER_FORMAT_Q8: u32 = 1;
-const BUCKET_CENTER_FORMAT: u32 = CENTER_FORMAT_Q8;
+pub(crate) const BUCKET_CENTER_FORMAT: u32 = 3;
 #[cfg(not(test))]
 const L0_CAPACITY: usize = 1024;
 #[cfg(test)]
@@ -193,14 +192,16 @@ fn center_block_bytes_for_count(
     center_format: u32,
 ) -> Result<usize> {
     match center_format {
-        CENTER_FORMAT_Q8 => centroid_count
-            .checked_mul(std::mem::size_of::<f32>())
-            .and_then(|scale_len| {
-                centroid_count
-                    .checked_mul(dim)
-                    .and_then(|code_len| scale_len.checked_add(code_len))
-            })
-            .ok_or_else(|| anyhow::anyhow!("bucket center block length overflow")),
+        BUCKET_CENTER_FORMAT => {
+            let scale_len = centroid_count
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| anyhow::anyhow!("bucket center scale block length overflow"))?;
+            let row_bytes = packops::signed_q4_row_bytes(dim);
+            centroid_count
+                .checked_mul(row_bytes)
+                .and_then(|code_len| scale_len.checked_add(code_len))
+                .ok_or_else(|| anyhow::anyhow!("bucket center block length overflow"))
+        }
         _ => anyhow::bail!("bucket center format {center_format} is not supported"),
     }
 }
@@ -661,6 +662,13 @@ struct BucketDataHeader {
     rowids_offset: usize,
 }
 
+struct CenterSidecarData {
+    bucket_indices: Vec<usize>,
+    stored_center_block: Vec<u8>,
+    residual_centers_cpu: Tensor,
+    coarse_tree: CoarseTree,
+}
+
 fn write_bucket_data_header(
     writer: &mut impl Write,
     centroid_count: usize,
@@ -699,8 +707,92 @@ fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes[offset..offset + 8].try_into()?))
 }
 
-fn encode_q8_center_block(
+fn coarse_tree_leaf_parent_centers(
+    tree: &CoarseTree,
+    leaf_count: usize,
+    dim: usize,
+) -> Result<Option<(Vec<usize>, Vec<u8>)>> {
+    if tree.levels.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        tree.levels.len() == 1,
+        "bucket center residuals require a single-level coarse tree"
+    );
+    let level = &tree.levels[0];
+    let (parent_count, parent_dim) = level.centers.dims2()?;
+    anyhow::ensure!(
+        parent_count == level.children.len(),
+        "coarse tree parent count does not match child lists"
+    );
+    anyhow::ensure!(
+        parent_dim == dim,
+        "coarse tree parent dimension {parent_dim} does not match center dimension {dim}"
+    );
+    let mut parents = vec![usize::MAX; leaf_count];
+    for (parent_idx, children) in level.children.iter().enumerate() {
+        for &leaf_idx in children {
+            anyhow::ensure!(
+                leaf_idx < leaf_count,
+                "coarse tree leaf {leaf_idx} is outside leaf count {leaf_count}"
+            );
+            anyhow::ensure!(
+                parents[leaf_idx] == usize::MAX,
+                "coarse tree leaf {leaf_idx} has multiple parents"
+            );
+            parents[leaf_idx] = parent_idx;
+        }
+    }
+    for (leaf_idx, &parent_idx) in parents.iter().enumerate() {
+        anyhow::ensure!(
+            parent_idx != usize::MAX,
+            "coarse tree is missing parent for leaf {leaf_idx}"
+        );
+    }
+    let parent_bytes = level.centers.to_device(&Device::Cpu)?.to_f32_bytes()?;
+    Ok(Some((parents, parent_bytes)))
+}
+
+fn bucket_leaf_indices(
+    bucket_indices: &[usize],
+    centroid_count: usize,
+) -> Result<Vec<usize>> {
+    let mut leaf_by_bucket = vec![usize::MAX; centroid_count];
+    for (leaf_idx, &bucket_idx) in bucket_indices.iter().enumerate() {
+        anyhow::ensure!(
+            bucket_idx < centroid_count,
+            "bucket index {bucket_idx} is outside centroid count {centroid_count}"
+        );
+        anyhow::ensure!(
+            leaf_by_bucket[bucket_idx] == usize::MAX,
+            "bucket index {bucket_idx} appears more than once"
+        );
+        leaf_by_bucket[bucket_idx] = leaf_idx;
+    }
+    Ok(leaf_by_bucket)
+}
+
+fn parent_value(
+    parent_info: Option<&(Vec<usize>, Vec<u8>)>,
+    leaf_idx: usize,
+    dim: usize,
+    dim_idx: usize,
+) -> Result<f32> {
+    let Some((parents, parent_bytes)) = parent_info else {
+        return Ok(0.0);
+    };
+    let parent_idx = parents[leaf_idx];
+    let offset = parent_idx
+        .checked_mul(f32_center_bytes_for_dim(dim))
+        .and_then(|offset| offset.checked_add(dim_idx * std::mem::size_of::<f32>()))
+        .ok_or_else(|| anyhow::anyhow!("parent center offset overflow"))?;
+    Ok(f32::from_le_bytes(parent_bytes[offset..offset + 4].try_into()?))
+}
+
+fn encode_q4_center_residual_block(
     f32_block: &[u8],
+    bucket_indices: &[usize],
+    coarse_tree: &CoarseTree,
     centroid_count: usize,
     dim: usize,
 ) -> Result<Vec<u8>> {
@@ -714,81 +806,118 @@ fn encode_q8_center_block(
     );
     let scale_len = centroid_count
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| anyhow::anyhow!("q8 center scale block length overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("q4 center scale block length overflow"))?;
+    let packed_row_bytes = packops::signed_q4_row_bytes(dim);
     let code_len = centroid_count
-        .checked_mul(dim)
-        .ok_or_else(|| anyhow::anyhow!("q8 center code block length overflow"))?;
+        .checked_mul(packed_row_bytes)
+        .ok_or_else(|| anyhow::anyhow!("q4 center code block length overflow"))?;
     let encoded_len = scale_len
         .checked_add(code_len)
-        .ok_or_else(|| anyhow::anyhow!("q8 center block length overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("q4 center block length overflow"))?;
     let mut encoded = vec![0; encoded_len];
+    let leaf_by_bucket = bucket_leaf_indices(bucket_indices, centroid_count)?;
+    let parent_info = coarse_tree_leaf_parent_centers(coarse_tree, bucket_indices.len(), dim)?;
 
     for centroid_idx in 0..centroid_count {
         let f32_start = centroid_idx
             .checked_mul(f32_row_bytes)
             .ok_or_else(|| anyhow::anyhow!("f32 center row offset overflow"))?;
+        let leaf_idx = leaf_by_bucket[centroid_idx];
         let mut max_abs = 0.0f32;
         for dim_idx in 0..dim {
             let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
             let value = f32::from_le_bytes(f32_block[offset..offset + 4].try_into()?);
             anyhow::ensure!(value.is_finite(), "bucket center contains non-finite value");
-            max_abs = max_abs.max(value.abs());
+            let base = if leaf_idx == usize::MAX {
+                0.0
+            } else {
+                parent_value(parent_info.as_ref(), leaf_idx, dim, dim_idx)?
+            };
+            max_abs = max_abs.max((value - base).abs());
         }
 
-        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 };
+        let scale = packops::signed_q4_scale(max_abs);
         let scale_offset = centroid_idx * std::mem::size_of::<f32>();
         encoded[scale_offset..scale_offset + 4].copy_from_slice(&scale.to_le_bytes());
         if scale == 0.0 {
             continue;
         }
 
-        let code_start = scale_len + centroid_idx * dim;
+        let code_start = scale_len + centroid_idx * packed_row_bytes;
+        let code_end = code_start + packed_row_bytes;
+        let codes = &mut encoded[code_start..code_end];
         for dim_idx in 0..dim {
             let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
             let value = f32::from_le_bytes(f32_block[offset..offset + 4].try_into()?);
-            let code = (value / scale).round().clamp(-127.0, 127.0) as i8;
-            encoded[code_start + dim_idx] = code as u8;
+            let base = if leaf_idx == usize::MAX {
+                0.0
+            } else {
+                parent_value(parent_info.as_ref(), leaf_idx, dim, dim_idx)?
+            };
+            let packed = packops::quantize_signed_q4(value - base, scale);
+            packops::write_signed_q4_code(codes, dim_idx, packed);
         }
     }
 
     Ok(encoded)
 }
 
-fn decode_q8_center_block(
-    q8_block: &[u8],
+fn decode_q4_center_residual_block(
+    q4_block: &[u8],
+    bucket_indices: &[usize],
+    coarse_tree: &CoarseTree,
     centroid_count: usize,
     dim: usize,
 ) -> Result<Vec<u8>> {
-    let expected_q8_len = center_block_bytes_for_count(centroid_count, dim, CENTER_FORMAT_Q8)?;
+    let expected_len = center_block_bytes_for_count(centroid_count, dim, BUCKET_CENTER_FORMAT)?;
     anyhow::ensure!(
-        q8_block.len() == expected_q8_len,
-        "q8 center block length is invalid"
+        q4_block.len() == expected_len,
+        "q4 center block length is invalid"
     );
     let scale_len = centroid_count
         .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| anyhow::anyhow!("q8 center scale block length overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("q4 center scale block length overflow"))?;
     let f32_row_bytes = f32_center_bytes_for_dim(dim);
     let f32_len = centroid_count
         .checked_mul(f32_row_bytes)
         .ok_or_else(|| anyhow::anyhow!("f32 center block length overflow"))?;
     let mut decoded = vec![0; f32_len];
+    let leaf_by_bucket = bucket_leaf_indices(bucket_indices, centroid_count)?;
+    let parent_info = coarse_tree_leaf_parent_centers(coarse_tree, bucket_indices.len(), dim)?;
+    let packed_row_bytes = packops::signed_q4_row_bytes(dim);
 
     for centroid_idx in 0..centroid_count {
         let scale_offset = centroid_idx * std::mem::size_of::<f32>();
-        let scale = f32::from_le_bytes(q8_block[scale_offset..scale_offset + 4].try_into()?);
+        let scale = f32::from_le_bytes(q4_block[scale_offset..scale_offset + 4].try_into()?);
         anyhow::ensure!(
             scale.is_finite() && scale >= 0.0,
-            "q8 center scale is invalid"
+            "q4 center scale is invalid"
         );
-        let code_start = scale_len + centroid_idx * dim;
+        let code_start = scale_len + centroid_idx * packed_row_bytes;
         let f32_start = centroid_idx
             .checked_mul(f32_row_bytes)
             .ok_or_else(|| anyhow::anyhow!("f32 center row offset overflow"))?;
-        for dim_idx in 0..dim {
-            let code = i8::from_ne_bytes([q8_block[code_start + dim_idx]]);
-            let value = code as f32 * scale;
-            let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
-            decoded[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        let leaf_idx = leaf_by_bucket[centroid_idx];
+        for (byte_idx, &byte) in q4_block[code_start..code_start + packed_row_bytes]
+            .iter()
+            .enumerate()
+        {
+            let values = packops::signed_q4_pair_values(byte);
+            let dim_idx = byte_idx * 2;
+            for lane in 0..2 {
+                let dim_idx = dim_idx + lane;
+                if dim_idx >= dim {
+                    break;
+                }
+                let base = if leaf_idx == usize::MAX {
+                    0.0
+                } else {
+                    parent_value(parent_info.as_ref(), leaf_idx, dim, dim_idx)?
+                };
+                let value = base + values[lane] * scale;
+                let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
+                decoded[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
         }
     }
 
@@ -797,12 +926,22 @@ fn decode_q8_center_block(
 
 fn center_block_to_f32_bytes(
     center_block: &[u8],
+    bucket_indices: &[usize],
+    coarse_tree: &CoarseTree,
     centroid_count: usize,
     dim: usize,
     center_format: u32,
 ) -> Result<Vec<u8>> {
     match center_format {
-        CENTER_FORMAT_Q8 => decode_q8_center_block(center_block, centroid_count, dim),
+        BUCKET_CENTER_FORMAT => {
+            decode_q4_center_residual_block(
+                center_block,
+                bucket_indices,
+                coarse_tree,
+                centroid_count,
+                dim,
+            )
+        }
         _ => anyhow::bail!("bucket center format {center_format} is not supported"),
     }
 }
@@ -1032,7 +1171,7 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
     offset += std::mem::size_of::<u32>();
     let center_format = read_u32_le(prefix, offset)?;
     match center_format {
-        CENTER_FORMAT_Q8 => {}
+        BUCKET_CENTER_FORMAT => {}
         _ => anyhow::bail!("bucket center format {center_format} is not supported"),
     }
     offset += std::mem::size_of::<u32>();
@@ -1184,35 +1323,75 @@ fn write_bucket_meta(writer: &mut impl Write, meta: &BucketSidecarMeta) -> Resul
     Ok(())
 }
 
-fn build_coarse_tree_from_bucket_meta(
-    bucket_meta: &[BucketSidecarMeta],
+fn build_coarse_tree_from_bucket_indices(
+    bucket_indices: &[usize],
     center_block: &[u8],
     center_dim: usize,
 ) -> Result<CoarseTree> {
     let center_bytes = f32_center_bytes_for_dim(center_dim);
-    let expected_center_block_len = bucket_meta
-        .len()
-        .checked_mul(center_bytes)
+    anyhow::ensure!(
+        center_block.len() % center_bytes == 0,
+        "bucket center block length is invalid"
+    );
+    let centroid_count = center_block.len() / center_bytes;
+    for &bucket_idx in bucket_indices {
+        anyhow::ensure!(
+            bucket_idx < centroid_count,
+            "bucket index {bucket_idx} is outside centroid count {centroid_count}"
+        );
+    }
+    if bucket_indices.is_empty() {
+        Ok(CoarseTree { levels: vec![] })
+    } else {
+        let centers = Tensor::from_f32_bytes(center_block, center_dim, &Device::Cpu)?;
+        let indices: Vec<u32> = bucket_indices
+            .iter()
+            .map(|&idx| u32::try_from(idx))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let index = Tensor::from_slice(indices.as_slice(), (indices.len(),), &Device::Cpu)?;
+        let centers = centers.index_select(&index, 0)?;
+        build_coarse_tree_from_centers(&centers, &Device::Cpu)
+    }
+}
+
+fn prepare_center_sidecar_data(
+    centers_cpu: &Tensor,
+    bucket_indices: Vec<usize>,
+) -> Result<CenterSidecarData> {
+    let (centroid_count, center_dim) = centers_cpu.dims2()?;
+    let center_block = centers_cpu.to_f32_bytes()?;
+    let expected_center_block_len = centroid_count
+        .checked_mul(f32_center_bytes_for_dim(center_dim))
         .ok_or_else(|| anyhow::anyhow!("bucket center block length overflow"))?;
     anyhow::ensure!(
         center_block.len() == expected_center_block_len,
         "bucket center block length is invalid"
     );
-    let mut nonempty = vec![];
-    for (bucket_idx, meta) in bucket_meta.iter().enumerate() {
-        if meta.size == 0 {
-            continue;
-        }
-        nonempty.push(bucket_idx as u32);
-    }
-    if nonempty.is_empty() {
-        Ok(CoarseTree { levels: vec![] })
-    } else {
-        let centers = Tensor::from_f32_bytes(center_block, center_dim, &Device::Cpu)?;
-        let index = Tensor::from_slice(nonempty.as_slice(), (nonempty.len(),), &Device::Cpu)?;
-        let centers = centers.index_select(&index, 0)?;
-        build_coarse_tree_from_centers(&centers, &Device::Cpu)
-    }
+    let coarse_tree =
+        build_coarse_tree_from_bucket_indices(&bucket_indices, &center_block, center_dim)?;
+    let stored_center_block = encode_q4_center_residual_block(
+        &center_block,
+        &bucket_indices,
+        &coarse_tree,
+        centroid_count,
+        center_dim,
+    )?;
+    let residual_center_block = center_block_to_f32_bytes(
+        &stored_center_block,
+        &bucket_indices,
+        &coarse_tree,
+        centroid_count,
+        center_dim,
+        BUCKET_CENTER_FORMAT,
+    )?;
+    let residual_centers_cpu =
+        Tensor::from_f32_bytes(&residual_center_block, center_dim, &Device::Cpu)?;
+    Ok(CenterSidecarData {
+        bucket_indices,
+        stored_center_block,
+        residual_centers_cpu,
+        coarse_tree,
+    })
 }
 
 fn coarse_tree_leaf_order(tree: &CoarseTree, leaf_count: usize) -> Result<Vec<usize>> {
@@ -1264,7 +1443,7 @@ fn copy_exact_bytes(reader: &mut File, writer: &mut impl Write, len: usize) -> R
 
 fn merge_and_write_buckets_to_path(
     tmpfiles: Vec<tempfile::NamedTempFile>,
-    centers_cpu: &Tensor,
+    center_sidecar: &CenterSidecarData,
     rowid_records: &[RowidRecord],
     final_path: &Path,
     residual_quant_bits: u8,
@@ -1284,8 +1463,7 @@ fn merge_and_write_buckets_to_path(
         .unwrap_or_else(|| std::path::Path::new("."));
     let data_tmp = tempfile::NamedTempFile::new_in(temp_dir)?;
     let mut data_writer = data_tmp.reopen()?;
-    let (centroid_count, center_dim) = centers_cpu.dims2()?;
-    let center_bytes = f32_center_bytes_for_dim(center_dim);
+    let (centroid_count, center_dim) = center_sidecar.residual_centers_cpu.dims2()?;
     let residual_bytes = residual_bytes_for_dim(center_dim, residual_quant_bits)?;
     let mut bucket_meta: Vec<BucketSidecarMeta> = (0..centroid_count)
         .map(|_| BucketSidecarMeta {
@@ -1295,10 +1473,6 @@ fn merge_and_write_buckets_to_path(
             residual_len: 0,
         })
         .collect();
-    let center_block_len = centroid_count
-        .checked_mul(center_bytes)
-        .ok_or_else(|| anyhow::anyhow!("bucket center block length overflow"))?;
-    let mut center_block = vec![0; center_block_len];
     let mut data_offset = 0u64;
 
     let mut merger = merger::Merger::from_tempfiles(tmpfiles, residual_bytes)?;
@@ -1309,15 +1483,6 @@ fn merge_and_write_buckets_to_path(
             bucket_idx < centroid_count,
             "bucket {} is outside centroid count {centroid_count}",
             entry.value
-        );
-        let center = centers_cpu.get(bucket_idx)?;
-        let center_bytes_data = center.to_f32_bytes()?;
-        anyhow::ensure!(
-            center_bytes_data.len() == f32_center_bytes_for_dim(center_dim),
-            "bucket {} center byte length {} does not match expected {}",
-            entry.value,
-            center_bytes_data.len(),
-            f32_center_bytes_for_dim(center_dim)
         );
         let compressed_keys = compress_keys(&entry.keys);
         anyhow::ensure!(
@@ -1334,13 +1499,6 @@ fn merge_and_write_buckets_to_path(
         meta.data_offset = data_offset;
         meta.indices_len = compressed_keys.len();
         meta.residual_len = entry.data.len();
-        let center_start = bucket_idx
-            .checked_mul(center_bytes)
-            .ok_or_else(|| anyhow::anyhow!("bucket center offset overflow"))?;
-        let center_end = center_start
-            .checked_add(center_bytes)
-            .ok_or_else(|| anyhow::anyhow!("bucket center offset overflow"))?;
-        center_block[center_start..center_end].copy_from_slice(&center_bytes_data);
         let payload_len = compressed_keys
             .len()
             .checked_add(entry.data.len())
@@ -1352,16 +1510,17 @@ fn merge_and_write_buckets_to_path(
     data_writer.flush()?;
     drop(data_writer);
 
-    let coarse_tree = build_coarse_tree_from_bucket_meta(&bucket_meta, &center_block, center_dim)?;
-    let coarse_tree_bytes = serialize_coarse_tree(&coarse_tree)?;
-    let stored_center_block =
-        encode_q8_center_block(&center_block, centroid_count, center_dim)?;
     let nonempty_buckets: Vec<usize> = bucket_meta
         .iter()
         .enumerate()
         .filter_map(|(bucket_idx, meta)| (meta.size > 0).then_some(bucket_idx))
         .collect();
-    let leaf_order = coarse_tree_leaf_order(&coarse_tree, nonempty_buckets.len())?;
+    anyhow::ensure!(
+        nonempty_buckets == center_sidecar.bucket_indices,
+        "routed bucket set changed while writing bucket payloads"
+    );
+    let coarse_tree_bytes = serialize_coarse_tree(&center_sidecar.coarse_tree)?;
+    let leaf_order = coarse_tree_leaf_order(&center_sidecar.coarse_tree, nonempty_buckets.len())?;
     let mut payload_chunks = Vec::with_capacity(nonempty_buckets.len());
     for leaf_idx in leaf_order {
         let bucket_idx = nonempty_buckets[leaf_idx];
@@ -1381,7 +1540,7 @@ fn merge_and_write_buckets_to_path(
         .checked_add(meta_block_len)
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar center block offset overflow"))?;
     let payload_start = centers_offset
-        .checked_add(stored_center_block.len())
+        .checked_add(center_sidecar.stored_center_block.len())
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload start overflow"))?;
     let payload_start = u64::try_from(payload_start)?;
     let payload_len = payload_chunks
@@ -1432,7 +1591,7 @@ fn merge_and_write_buckets_to_path(
     for meta in &bucket_meta {
         write_bucket_meta(&mut bucket_data_writer, meta)?;
     }
-    bucket_data_writer.write_all(&stored_center_block)?;
+    bucket_data_writer.write_all(&center_sidecar.stored_center_block)?;
     let mut data_reader = data_tmp.reopen()?;
     for &(_, temp_offset, len) in &payload_chunks {
         data_reader.seek(SeekFrom::Start(temp_offset))?;
@@ -2053,6 +2212,8 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
         let centers_matrix = if !bucket_indices.is_empty() {
             let center_f32_bytes = center_block_to_f32_bytes(
                 &center_block,
+                &bucket_indices,
+                &coarse_tree,
                 header.centroid_count,
                 header.embedding_dim,
                 header.center_format,
@@ -2943,7 +3104,7 @@ fn write_bucket_batch(
     embeddings: Vec<Tensor>,
     indices: Vec<DocPtr>,
     index_kmeans: &IndexKMeans,
-    centers_cpu: &Tensor,
+    residual_centers_cpu: &Tensor,
     residual_bytes: usize,
     residual_quant_bits: u8,
 ) -> Result<(tempfile::NamedTempFile, u128, u128)> {
@@ -2992,7 +3153,7 @@ fn write_bucket_batch(
             }
         }
 
-        let center = centers_cpu.get(bucket as usize)?;
+        let center = residual_centers_cpu.get(bucket as usize)?;
         let residual = (&data_cpu.get(sample)? - &center)?;
         let residual_quantized = packops::residual_to_temp_bytes(&residual, residual_quant_bits)?;
         residuals_bytes.extend(&residual_quantized);
@@ -3000,6 +3161,53 @@ fn write_bucket_batch(
 
     let tmpfile = writer.finish()?;
     Ok((tmpfile, mmuls_ms, now.elapsed().as_millis()))
+}
+
+fn assigned_bucket_indices_for_rowids(
+    records: &[RowidRecord],
+    cache: &dyn EmbeddingCache,
+    index_kmeans: &IndexKMeans,
+    expected_count: u64,
+) -> Result<Vec<usize>> {
+    let (centroid_count, center_dim) = index_kmeans.centers.dims2()?;
+    let mut assigned = vec![false; centroid_count];
+    let bar = progress::new_with_label(expected_count, "routing");
+
+    for record in active_rowid_records(records) {
+        let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
+        anyhow::ensure!(
+            embeddings.embedding_count == record.rows as usize,
+            "rowid {} catalog says {} vectors but embedding blob has {}",
+            record.rowid,
+            record.rows,
+            embeddings.embedding_count
+        );
+
+        let dim = dim_from_model_id(&embeddings.model);
+        anyhow::ensure!(
+            dim == center_dim,
+            "document embedding dimension {dim} does not match index center dimension {center_dim}"
+        );
+        let t = Tensor::embeddings_from_packed(&embeddings.embeddings, dim, &Device::Cpu)?;
+        let (m, _) = t.dims2()?;
+        let assignments = assign_with_index_kmeans(&t, &index_kmeans.routing)?;
+        for bucket in assignments {
+            let bucket: usize = bucket.try_into()?;
+            anyhow::ensure!(
+                bucket < centroid_count,
+                "assigned bucket {bucket} is outside centroid count {centroid_count}"
+            );
+            assigned[bucket] = true;
+        }
+        bar.inc(m as u64);
+    }
+    bar.finish();
+
+    Ok(assigned
+        .iter()
+        .enumerate()
+        .filter_map(|(bucket_idx, &seen)| seen.then_some(bucket_idx))
+        .collect())
 }
 
 fn level_capacity(level: u32) -> usize {
@@ -3012,17 +3220,14 @@ fn write_buckets_for_rowids(
     index_kmeans: &IndexKMeans,
     expected_count: u64,
     residual_quant_bits: u8,
-) -> Result<(Vec<tempfile::NamedTempFile>, Tensor)> {
+) -> Result<(Vec<tempfile::NamedTempFile>, CenterSidecarData)> {
     let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
     let mut writes_total = 0;
 
-    let bar = progress::new_with_label(expected_count, "indexing");
-
     let mut document_indices = Vec::<(u32, u32)>::new();
     let mut all_embeddings = vec![];
 
-    let mut records = active_rowid_records(records);
     let mut done = false;
     let mut batch = 0;
     let mut tmpfiles = vec![];
@@ -3030,6 +3235,12 @@ fn write_buckets_for_rowids(
     let centers_cpu = centers.to_device(&Device::Cpu)?;
     let (_, center_dim) = centers_cpu.dims2()?;
     let residual_bytes = packops::temp_residual_bytes_for_dim(center_dim, residual_quant_bits)?;
+    let bucket_indices =
+        assigned_bucket_indices_for_rowids(records, cache, index_kmeans, expected_count)?;
+    let center_sidecar = prepare_center_sidecar_data(&centers_cpu, bucket_indices)?;
+    let residual_centers_cpu = &center_sidecar.residual_centers_cpu;
+    let bar = progress::new_with_label(expected_count, "indexing");
+    let mut records = active_rowid_records(records);
     while !done {
         match records.next() {
             Some(record) => {
@@ -3068,7 +3279,7 @@ fn write_buckets_for_rowids(
                         std::mem::take(&mut all_embeddings),
                         std::mem::take(&mut document_indices),
                         index_kmeans,
-                        &centers_cpu,
+                        residual_centers_cpu,
                         residual_bytes,
                         residual_quant_bits,
                     )?;
@@ -3097,7 +3308,7 @@ fn write_buckets_for_rowids(
                 std::mem::take(&mut all_embeddings),
                 std::mem::take(&mut document_indices),
                 index_kmeans,
-                &centers_cpu,
+                residual_centers_cpu,
                 residual_bytes,
                 residual_quant_bits,
             )?;
@@ -3113,7 +3324,7 @@ fn write_buckets_for_rowids(
     debug!("mmuls took {} ms.", mmuls_total);
     debug!("writes took {} ms.", writes_total);
 
-    Ok((tmpfiles, centers_cpu))
+    Ok((tmpfiles, center_sidecar))
 }
 
 fn build_index_generation(
@@ -3144,7 +3355,7 @@ fn build_index_generation(
     let data_path = index.path_for(&data_file);
     let residual_quant_bits = options.residual_quant_bits();
 
-    let (tmpfiles, centers_cpu) = write_buckets_for_rowids(
+    let (tmpfiles, center_sidecar) = write_buckets_for_rowids(
         records,
         cache,
         &centers,
@@ -3153,7 +3364,7 @@ fn build_index_generation(
     )?;
     if let Err(err) = merge_and_write_buckets_to_path(
         tmpfiles,
-        &centers_cpu,
+        &center_sidecar,
         records,
         &data_path,
         residual_quant_bits,
