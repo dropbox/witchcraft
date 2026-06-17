@@ -3163,6 +3163,29 @@ fn write_bucket_batch(
     Ok((tmpfile, mmuls_ms, now.elapsed().as_millis()))
 }
 
+fn mark_assigned_bucket_batch(
+    embeddings: Vec<Tensor>,
+    assigned: &mut [bool],
+    index_kmeans: &IndexKMeans,
+) -> Result<()> {
+    if embeddings.is_empty() {
+        return Ok(());
+    }
+
+    let centroid_count = assigned.len();
+    let data_cpu = Tensor::cat(&embeddings, 0)?;
+    let assignments = assign_with_index_kmeans(&data_cpu, &index_kmeans.routing)?;
+    for bucket in assignments {
+        let bucket: usize = bucket.try_into()?;
+        anyhow::ensure!(
+            bucket < centroid_count,
+            "assigned bucket {bucket} is outside centroid count {centroid_count}"
+        );
+        assigned[bucket] = true;
+    }
+    Ok(())
+}
+
 fn assigned_bucket_indices_for_rowids(
     records: &[RowidRecord],
     cache: &dyn EmbeddingCache,
@@ -3172,6 +3195,8 @@ fn assigned_bucket_indices_for_rowids(
     let (centroid_count, center_dim) = index_kmeans.centers.dims2()?;
     let mut assigned = vec![false; centroid_count];
     let bar = progress::new_with_label(expected_count, "routing");
+    let mut all_embeddings = vec![];
+    let mut batch = 0usize;
 
     for record in active_rowid_records(records) {
         let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
@@ -3190,16 +3215,38 @@ fn assigned_bucket_indices_for_rowids(
         );
         let t = Tensor::embeddings_from_packed(&embeddings.embeddings, dim, &Device::Cpu)?;
         let (m, _) = t.dims2()?;
-        let assignments = assign_with_index_kmeans(&t, &index_kmeans.routing)?;
-        for bucket in assignments {
-            let bucket: usize = bucket.try_into()?;
-            anyhow::ensure!(
-                bucket < centroid_count,
-                "assigned bucket {bucket} is outside centroid count {centroid_count}"
-            );
-            assigned[bucket] = true;
+
+        if batch > 0 && batch + m > INDEX_BATCH_SIZE {
+            mark_assigned_bucket_batch(
+                std::mem::take(&mut all_embeddings),
+                &mut assigned,
+                index_kmeans,
+            )?;
+            bar.inc(batch as u64);
+            batch = 0;
         }
-        bar.inc(m as u64);
+
+        all_embeddings.push(t);
+        batch += m;
+
+        if batch >= INDEX_BATCH_SIZE {
+            mark_assigned_bucket_batch(
+                std::mem::take(&mut all_embeddings),
+                &mut assigned,
+                index_kmeans,
+            )?;
+            bar.inc(batch as u64);
+            batch = 0;
+        }
+    }
+
+    if batch > 0 {
+        mark_assigned_bucket_batch(
+            std::mem::take(&mut all_embeddings),
+            &mut assigned,
+            index_kmeans,
+        )?;
+        bar.inc(batch as u64);
     }
     bar.finish();
 
