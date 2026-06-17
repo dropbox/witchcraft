@@ -151,6 +151,7 @@ const INDEX_ASSIGNMENT_BEAM: usize = 2;
 const KMEANS_MATMUL_BATCH: usize = 4096;
 const INDEX_KMEANS_ITERATIONS: usize = 5;
 const INDEX_BATCH_SIZE: usize = 0x10000;
+const INDEX_TARGET_BUCKET_VECTORS: usize = INDEX_BATCH_SIZE / INDEX_KMEANS_BRANCHING;
 
 /// A document pointer combining document ID and sub-chunk index
 /// Allows precise location of results within subdivided documents
@@ -2998,9 +2999,14 @@ fn hierarchical_kmeans_for_index(
 
 fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<IndexKMeans> {
     let now = std::time::Instant::now();
-    let mut k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
+    let sqrt_k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
+    let size_k = total_embeddings.div_ceil(INDEX_TARGET_BUCKET_VECTORS);
+    let mut k = sqrt_k.max(size_k);
     k = k.max(1);
-    debug!("total_embeddings={} k={}", total_embeddings, k);
+    debug!(
+        "total_embeddings={} k={} sqrt_k={} size_k={} target_bucket_vectors={}",
+        total_embeddings, k, sqrt_k, size_k, INDEX_TARGET_BUCKET_VECTORS
+    );
     let (m, _) = matrix.dims2()?;
     if m < k {
         k = (m / 4).max(1);
