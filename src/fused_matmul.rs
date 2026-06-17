@@ -284,7 +284,7 @@ struct FbgemmBf16Op(Arc<PackedMatrixBf16>);
 #[cfg(feature = "fbgemm")]
 struct FbgemmI8Op(
     Arc<PackedBMatrixI8>,
-    f32,
+    Arc<Vec<f32>>,
     Arc<Mutex<fbgemm_rs::I8GemmScratch>>,
 );
 
@@ -294,10 +294,10 @@ struct FbgemmBf16GatedGeluOp(Arc<PackedMatrixBf16>, Arc<PackedMatrixBf16>);
 #[cfg(feature = "fbgemm")]
 struct FbgemmI8GatedGeluOp(
     Arc<PackedBMatrixI8>,
-    f32,
+    Arc<Vec<f32>>,
     Arc<Mutex<fbgemm_rs::I8GemmScratch>>,
     Arc<PackedBMatrixI8>,
-    f32,
+    Arc<Vec<f32>>,
     Arc<Mutex<fbgemm_rs::I8GemmScratch>>,
 );
 
@@ -367,14 +367,8 @@ impl CustomOp1 for FbgemmI8Op {
             .2
             .lock()
             .map_err(|_| candle_core::Error::Msg("i8 GEMM scratch lock poisoned".into()))?;
-        fbgemm_rs::i8gemm_f32_with_scratch(
-            m,
-            slice,
-            &self.0,
-            self.1,
-            &mut dst_storage,
-            &mut scratch,
-        );
+        fbgemm_rs::i8gemm_f32_with_scratch(m, slice, &self.0, 1.0, &mut dst_storage, &mut scratch);
+        apply_column_scales(&mut dst_storage, n, &self.1);
 
         Ok((CpuStorage::F32(dst_storage), dst_shape))
     }
@@ -443,7 +437,8 @@ impl CustomOp1 for FbgemmI8GatedGeluOp {
                 .2
                 .lock()
                 .map_err(|_| candle_core::Error::Msg("i8 GEMM scratch lock poisoned".into()))?;
-            fbgemm_rs::i8gemm_f32_with_scratch(m, slice, &self.0, self.1, &mut gate, &mut scratch);
+            fbgemm_rs::i8gemm_f32_with_scratch(m, slice, &self.0, 1.0, &mut gate, &mut scratch);
+            apply_column_scales(&mut gate, n, &self.1);
         }
         {
             let mut scratch = self
@@ -454,10 +449,11 @@ impl CustomOp1 for FbgemmI8GatedGeluOp {
                 m,
                 slice,
                 &self.3,
-                self.4,
+                1.0,
                 &mut dst_storage,
                 &mut scratch,
             );
+            apply_column_scales(&mut dst_storage, n, &self.4);
         }
 
         for (gate, up) in gate.into_iter().zip(dst_storage.iter_mut()) {
@@ -472,22 +468,36 @@ impl CustomOp1 for FbgemmI8GatedGeluOp {
 }
 
 #[cfg(feature = "fbgemm")]
-fn quantize_weight_i8_transposed(k: usize, n: usize, data: &[f32]) -> (PackedBMatrixI8, f32) {
-    let max_abs = data.iter().fold(0f32, |acc, value| acc.max(value.abs()));
-    if max_abs == 0.0 {
-        let quantized = vec![0; k * n];
-        return (PackedBMatrixI8::new(k, n, &quantized), 1.0);
+fn apply_column_scales(values: &mut [f32], n: usize, scales: &[f32]) {
+    debug_assert_eq!(scales.len(), n);
+    for row in values.chunks_exact_mut(n) {
+        for (value, scale) in row.iter_mut().zip(scales) {
+            *value *= *scale;
+        }
     }
-    let scale = max_abs / 127.0;
-    let inv_scale = scale.recip();
+}
+
+#[cfg(feature = "fbgemm")]
+fn quantize_weight_i8_transposed(k: usize, n: usize, data: &[f32]) -> (PackedBMatrixI8, Vec<f32>) {
+    let mut scales = vec![1.0f32; n];
     let mut quantized = vec![0i8; k * n];
-    for row in 0..k {
-        for col in 0..n {
+    for col in 0..n {
+        let mut max_abs = 0f32;
+        for row in 0..k {
+            max_abs = max_abs.max(data[col * k + row].abs());
+        }
+        if max_abs == 0.0 {
+            continue;
+        }
+        let scale = max_abs / 127.0;
+        scales[col] = scale;
+        let inv_scale = scale.recip();
+        for row in 0..k {
             let value = data[col * k + row];
             quantized[row * n + col] = (value * inv_scale).round().clamp(-127.0, 127.0) as i8;
         }
     }
-    (PackedBMatrixI8::new(k, n, &quantized), scale)
+    (PackedBMatrixI8::new(k, n, &quantized), scales)
 }
 
 // ---- MatMul: drop-in replacement for QMatMul ----
@@ -502,7 +512,7 @@ pub enum MatMul {
     #[cfg(feature = "fbgemm")]
     PackedI8(
         Arc<PackedBMatrixI8>,
-        f32,
+        Arc<Vec<f32>>,
         Arc<Mutex<fbgemm_rs::I8GemmScratch>>,
     ),
     Tensor(Tensor),
@@ -515,7 +525,9 @@ impl Clone for MatMul {
             #[cfg(feature = "fbgemm")]
             Self::PackedBf16(p) => Self::PackedBf16(p.clone()),
             #[cfg(feature = "fbgemm")]
-            Self::PackedI8(p, scale, scratch) => Self::PackedI8(p.clone(), *scale, scratch.clone()),
+            Self::PackedI8(p, scales, scratch) => {
+                Self::PackedI8(p.clone(), scales.clone(), scratch.clone())
+            }
             Self::Tensor(t) => Self::Tensor(t.clone()),
         }
     }
@@ -561,7 +573,7 @@ impl MatMul {
                         let (packed, scale) = quantize_weight_i8_transposed(k, n, &data);
                         Self::PackedI8(
                             Arc::new(packed),
-                            scale,
+                            Arc::new(scale),
                             Arc::new(Mutex::new(fbgemm_rs::I8GemmScratch::new())),
                         )
                     }
@@ -593,8 +605,8 @@ impl Module for MatMul {
             #[cfg(feature = "fbgemm")]
             Self::PackedBf16(p) => xs.apply_op1_no_bwd(&FbgemmBf16Op(p.clone())),
             #[cfg(feature = "fbgemm")]
-            Self::PackedI8(p, scale, scratch) => {
-                xs.apply_op1_no_bwd(&FbgemmI8Op(p.clone(), *scale, scratch.clone()))
+            Self::PackedI8(p, scales, scratch) => {
+                xs.apply_op1_no_bwd(&FbgemmI8Op(p.clone(), scales.clone(), scratch.clone()))
             }
             Self::Tensor(w) => {
                 let w = match *xs.dims() {
@@ -620,10 +632,10 @@ pub fn forward_gated_gelu(w0: &MatMul, w1: &MatMul, xs: &Tensor) -> Result<Tenso
         (MatMul::PackedI8(w0, scale0, scratch0), MatMul::PackedI8(w1, scale1, scratch1)) => {
             let op = FbgemmI8GatedGeluOp(
                 w0.clone(),
-                *scale0,
+                scale0.clone(),
                 scratch0.clone(),
                 w1.clone(),
-                *scale1,
+                scale1.clone(),
                 scratch1.clone(),
             );
             xs.apply_op1_no_bwd(&op)
