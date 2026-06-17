@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const GENERATION_DATA_APP_ID: u32 = APP_ID_U32;
-pub(crate) const GENERATION_DATA_VERSION: u32 = 2;
+pub(crate) const GENERATION_DATA_VERSION: u32 = 3;
 pub(crate) const GENERATION_DATA_HEADER_BYTES: usize =
     8 * std::mem::size_of::<u32>() + std::mem::size_of::<u64>();
 
