@@ -741,7 +741,7 @@ pub fn index_chunks_with_cache_and_options(
 
 pub fn search(
     db: &DB,
-    embedder: &Embedder,
+    embedder: Option<&Embedder>,
     cache: &mut EmbeddingsCache,
     q: &str,
     threshold: f32,
@@ -759,31 +759,35 @@ pub fn search(
         vec![]
     };
 
-    let sem_matches = if q.len() > 3 {
-        let qe = match cache.get(&q) {
-            Some(existing) => existing,
-            None => {
-                let (qe, _) = embedder.embed(&q)?;
-                let qe = qe.get(0)?;
-                cache.put(&q, &qe);
-                qe
+    let sem_matches = if let Some(embedder) = embedder {
+        if q.len() > 3 {
+            let qe = match cache.get(&q) {
+                Some(existing) => existing,
+                None => {
+                    let (qe, _) = embedder.embed(&q)?;
+                    let qe = qe.get(0)?;
+                    cache.put(&q, &qe);
+                    qe
+                }
+            };
+            let embedding_cache = SqliteEmbeddingCache::new(db);
+            match match_centroids_with_cache(
+                db,
+                &qe,
+                threshold,
+                top_k,
+                sql_filter,
+                embedder,
+                &embedding_cache,
+            ) {
+                Ok(result) => result,
+                Err(v) => {
+                    warn!("match_centroids failed {v}");
+                    vec![]
+                }
             }
-        };
-        let embedding_cache = SqliteEmbeddingCache::new(db);
-        match match_centroids_with_cache(
-            db,
-            &qe,
-            threshold,
-            top_k,
-            sql_filter,
-            embedder,
-            &embedding_cache,
-        ) {
-            Ok(result) => result,
-            Err(v) => {
-                warn!("match_centroids failed {v}");
-                vec![]
-            }
+        } else {
+            vec![]
         }
     } else {
         vec![]

@@ -216,15 +216,19 @@ fn main() -> Result<()> {
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_fast(db_name).unwrap();
         witchcraft::index_chunks(&db, Some(&embedder), true).unwrap();
-    } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
-        let device = witchcraft::make_device();
-        let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
+    } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid" || args[1] == "fulltext") {
+        let embedder = if args[1] != "fulltext" {
+            let device = witchcraft::make_device();
+            Some(witchcraft::Embedder::new(&device, &assets).unwrap())
+        } else {
+            None
+        };
         let mut cache = witchcraft::EmbeddingsCache::new(1);
         let db = DB::new_reader(db_name).unwrap();
         let q = &args[2..].join(" ");
-        let use_fulltext = args[1] == "hybrid";
+        let use_fulltext = args[1] == "hybrid" || args[1] == "fulltext";
         let results =
-            witchcraft::search(&db, &embedder, &mut cache, q, 0.7, 10, use_fulltext, None).unwrap();
+            witchcraft::search(&db, embedder.as_ref(), &mut cache, q, 0.7, 10, use_fulltext, None).unwrap();
         for (score, _metadata, bodies, sub_idx, _date) in results {
             let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
             let body = &bodies[idx];
