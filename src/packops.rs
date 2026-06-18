@@ -371,6 +371,13 @@ impl PolarMode for Polar4Bit {
         }
         out
     }
+
+    fn residual_centroid_confidence_weight(
+        centroid_score: f32,
+        score_range: (f32, f32),
+    ) -> f32 {
+        centroid_confidence_weight(centroid_score, score_range)
+    }
 }
 
 #[cfg(feature = "polar-quant")]
