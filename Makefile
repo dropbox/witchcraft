@@ -65,6 +65,7 @@ endif
 EXTRA_FEATURES :=
 comma := ,
 export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
+BEIR_CACHE ?= .cache/beir
 
 VENV_DIR := $(abspath env)
 PYTHON_BIN := $(VENV_DIR)/bin/python
@@ -209,10 +210,42 @@ bench: prereqs
 %: %.zst
 	zstd -dk $<
 
+TRECCOVID_FILES := \
+	datasets/treccovid.tsv \
+	testset/treccovid/collection_map.json \
+	testset/treccovid/qrels.test.json \
+	testset/treccovid/questions.test.tsv
+TRECCOVID_STAMP := .make-stamps/treccovid-data
+
+$(TRECCOVID_STAMP): scripts/prepare_beir_dataset.py env/pyvenv.cfg | prereqs
+	mkdir -p $(dir $@)
+	env/bin/python scripts/prepare_beir_dataset.py trec-covid --output-name treccovid --cache-dir $(BEIR_CACHE)
+	touch $@
+
+$(TRECCOVID_FILES): $(TRECCOVID_STAMP)
+	@if [ ! -f "$@" ]; then \
+		rm -f "$(TRECCOVID_STAMP)"; \
+		$(MAKE) "$(TRECCOVID_STAMP)"; \
+	fi
+
+treccovid-files: $(TRECCOVID_FILES)
+
+treccovid-testset: \
+	testset/treccovid/collection_map.json \
+	testset/treccovid/qrels.test.json \
+	testset/treccovid/questions.test.tsv
+
 nfcorpus: prereqs datasets/nfcorpus.tsv
 	make warp-cli EXTRA_FEATURES=deterministic
 	rm -rf mydb.sqlite*
 	$(CLI_BIN) readcsv datasets/nfcorpus.tsv
+	$(CLI_BIN) embed
+	$(CLI_BIN) index
+
+treccovid: prereqs datasets/treccovid.tsv
+	make warp-cli EXTRA_FEATURES=deterministic
+	rm -rf mydb.sqlite*
+	$(CLI_BIN) readcsv datasets/treccovid.tsv
 	$(CLI_BIN) embed
 	$(CLI_BIN) index
 
@@ -224,6 +257,9 @@ nfcorpus-score: prereqs env/pyvenv.cfg testset/nfcorpus/questions.test.tsv tests
 	$(CLI_BIN) querycsv testset/nfcorpus/questions.test.tsv output.txt
 	echo scoring...
 	$(PYTHON_BIN) score.py output.txt testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
+
+treccovid-score: treccovid-testset
+	./treccovid-score.sh querycsv output-treccovid.txt
 
 reindex:
 	make warp-cli EXTRA_FEATURES=deterministic
@@ -250,6 +286,9 @@ distclean:
 	rm -f xtr.safetensors
 	rm -f datasets/nfcorpus.tsv
 	rm -f testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json testset/nfcorpus/questions.test.tsv
+	rm -f datasets/treccovid.tsv
+	rm -f testset/treccovid/collection_map.json testset/treccovid/qrels.test.json testset/treccovid/questions.test.tsv
+	rm -rf .cache/beir
 	@if [ -d assets ]; then \
 		for path in assets/* assets/.[!.]* assets/..?*; do \
 			[ -e "$$path" ] || continue; \
@@ -283,6 +322,10 @@ distclean:
 	reindex \
 	run \
 	test \
+	treccovid \
+	treccovid-files \
+	treccovid-score \
+	treccovid-testset \
 	warp-cli \
 	win \
 	winintel

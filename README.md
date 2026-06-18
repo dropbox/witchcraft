@@ -224,6 +224,20 @@ NOTICE that nextest is necessary, simply using "cargo test" will lead
 to random test failures, because individual tests run in the same process,
 leading to "history effects".
 
+## TRECCOVID ##
+
+TRECCOVID is prepared from the BEIR `trec-covid` archive on demand:
+
+```
+make treccovid-files
+make treccovid
+make treccovid-score
+```
+
+`make treccovid` builds `mydb.sqlite` from `datasets/treccovid.tsv`, and
+`make treccovid-score` runs `treccovid-score.sh` against the test queries and
+prints NDCG@10.
+
 # License
 
 Unless otherwise noted:

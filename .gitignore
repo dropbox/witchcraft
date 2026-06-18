@@ -29,11 +29,16 @@ __pycache__/
 *.pyc
 env/
 
-# Decompressed dataset/testset files (versioned as .zst)
+# Generated or decompressed dataset/testset files
 datasets/nfcorpus.tsv
 testset/nfcorpus/collection_map.json
 testset/nfcorpus/qrels.test.json
 testset/nfcorpus/questions.test.tsv
+datasets/treccovid.tsv
+testset/treccovid/collection_map.json
+testset/treccovid/qrels.test.json
+testset/treccovid/questions.test.tsv
+.cache/
 
 # Test/local data
 backup/
