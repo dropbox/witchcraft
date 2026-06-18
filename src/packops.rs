@@ -74,8 +74,8 @@ pub(crate) fn signed_q4_pair_values(byte: u8) -> [f32; 2] {
 }
 
 #[cfg(feature = "polar-quant")]
-fn quantize_polar_radius_with_scale(radius: f32, scale: f32, max_code: u8) -> u8 {
-    let normalized = (radius * scale).clamp(0.0, 1.0);
+fn quantize_polar_radius(radius: f32, max_radius: f32, max_code: u8) -> u8 {
+    let normalized = (radius.clamp(0.0, max_radius)) / max_radius;
     let companded =
         (1.0 + POLAR_COMPANDING_PARAM * normalized).ln() / (1.0 + POLAR_COMPANDING_PARAM).ln();
     let max_code = max_code as f32;
@@ -83,11 +83,11 @@ fn quantize_polar_radius_with_scale(radius: f32, scale: f32, max_code: u8) -> u8
 }
 
 #[cfg(feature = "polar-quant")]
-fn dequantize_polar_radius_with_scale(code: u8, scale: f32, max_code: u8) -> f32 {
+fn dequantize_polar_radius(code: u8, max_radius: f32, max_code: u8) -> f32 {
     let companded = (code.min(max_code) as f32) / (max_code as f32);
     let normalized =
         ((1.0 + POLAR_COMPANDING_PARAM).powf(companded) - 1.0) / POLAR_COMPANDING_PARAM;
-    normalized / scale
+    normalized * max_radius
 }
 
 #[cfg(feature = "polar-quant")]
@@ -106,7 +106,7 @@ pub(crate) trait PolarMode {
 
     const RADIUS_MAX_CODE: u8;
     const ANGLE_MAX_CODE: u8;
-    const RADIUS_SCALE: f32;
+    const RADIUS_MAX: f32;
     const RADIUS_SHIFT: u8;
     const ANGLE_MASK: u8;
 
@@ -132,11 +132,11 @@ pub(crate) trait PolarMode {
     }
 
     fn quantize_radius(radius: f32) -> u8 {
-        quantize_polar_radius_with_scale(radius, Self::RADIUS_SCALE, Self::RADIUS_MAX_CODE)
+        quantize_polar_radius(radius, Self::RADIUS_MAX, Self::RADIUS_MAX_CODE)
     }
 
     fn dequantize_radius(code: u8) -> f32 {
-        dequantize_polar_radius_with_scale(code, Self::RADIUS_SCALE, Self::RADIUS_MAX_CODE)
+        dequantize_polar_radius(code, Self::RADIUS_MAX, Self::RADIUS_MAX_CODE)
     }
 
     fn quantize_angle(angle: f32) -> u8 {
@@ -177,7 +177,7 @@ impl PolarMode for Polar2Bit {
 
     const RADIUS_MAX_CODE: u8 = 3;
     const ANGLE_MAX_CODE: u8 = 3;
-    const RADIUS_SCALE: f32 = 1.0;
+    const RADIUS_MAX: f32 = 1.0;
     const RADIUS_SHIFT: u8 = 2;
     const ANGLE_MASK: u8 = 0x03;
 
@@ -246,7 +246,7 @@ impl PolarMode for Polar3Bit {
 
     const RADIUS_MAX_CODE: u8 = 7;
     const ANGLE_MAX_CODE: u8 = 7;
-    const RADIUS_SCALE: f32 = 1.0;
+    const RADIUS_MAX: f32 = 1.0;
     const RADIUS_SHIFT: u8 = 3;
     const ANGLE_MASK: u8 = 0x07;
 
@@ -336,7 +336,7 @@ impl PolarMode for Polar4Bit {
 
     const RADIUS_MAX_CODE: u8 = 15;
     const ANGLE_MAX_CODE: u8 = 15;
-    const RADIUS_SCALE: f32 = 4.0;
+    const RADIUS_MAX: f32 = 0.25;
     const RADIUS_SHIFT: u8 = 4;
     const ANGLE_MASK: u8 = 0x0f;
 
