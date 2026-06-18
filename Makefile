@@ -5,8 +5,8 @@ SHELL := /bin/bash
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
-#ENCODER ?= modernbert-quantized
-ENCODER ?= t5-quantized
+ENCODER ?= modernbert-quantized
+#ENCODER ?= t5-quantized
 
 # Determine features and flags based on platform
 ifeq ($(UNAME_S),Darwin)
