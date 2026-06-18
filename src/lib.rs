@@ -152,6 +152,7 @@ const KMEANS_MATMUL_BATCH: usize = 4096;
 const INDEX_KMEANS_ITERATIONS: usize = 5;
 const INDEX_BATCH_SIZE: usize = 0x10000;
 const INDEX_TARGET_BUCKET_VECTORS: usize = INDEX_BATCH_SIZE / INDEX_KMEANS_BRANCHING;
+const BUCKET_READ_COALESCE_GAP_BYTES: usize = 16 * 1024;
 
 /// A document pointer combining document ID and sub-chunk index
 /// Allows precise location of results within subdivided documents
@@ -1740,6 +1741,7 @@ mod reciprocal_rank_fusion_tests {
 
 struct BucketRead {
     bucket_idx: usize,
+    start: usize,
     len: usize,
 }
 
@@ -2043,19 +2045,31 @@ impl GenerationCentroids {
                     .len
                     .checked_add(batch.offset)
                     .ok_or_else(|| anyhow::anyhow!("bucket read batch range overflow"))?;
-                if batch_end == data_offset {
-                    batch.buckets.push(BucketRead { bucket_idx, len });
-                    batch.len = batch
-                        .len
-                        .checked_add(len)
-                        .ok_or_else(|| anyhow::anyhow!("bucket read batch length overflow"))?;
+                if data_offset <= batch_end + BUCKET_READ_COALESCE_GAP_BYTES {
+                    let start = data_offset
+                        .checked_sub(batch.offset)
+                        .ok_or_else(|| anyhow::anyhow!("bucket read batch range underflow"))?;
+                    batch.buckets.push(BucketRead {
+                        bucket_idx,
+                        start,
+                        len,
+                    });
+                    batch.len = batch.len.max(
+                        start
+                            .checked_add(len)
+                            .ok_or_else(|| anyhow::anyhow!("bucket read batch length overflow"))?,
+                    );
                     continue;
                 }
             }
             batches.push(BucketReadBatch {
                 offset: data_offset,
                 len,
-                buckets: vec![BucketRead { bucket_idx, len }],
+                buckets: vec![BucketRead {
+                    bucket_idx,
+                    start: 0,
+                    len,
+                }],
             });
         }
         Ok(batches)
@@ -2063,40 +2077,47 @@ impl GenerationCentroids {
 
     #[cfg(unix)]
     fn read_bucket_batch(file: &File, batch: &BucketReadBatch) -> Result<Vec<Vec<u8>>> {
-        let mut payloads: Vec<Vec<u8>> =
-            batch.buckets.iter().map(|bucket| vec![0; bucket.len]).collect();
-        let mut slices: Vec<&mut [u8]> =
-            payloads.iter_mut().map(|payload| payload.as_mut_slice()).collect();
-        readv_exact_at(file, batch.offset as u64, &mut slices)?;
-        drop(slices);
-        Ok(payloads)
+        let mut data = vec![0; batch.len];
+        let mut buffers = [data.as_mut_slice()];
+        readv_exact_at(file, batch.offset as u64, &mut buffers)?;
+        batch
+            .buckets
+            .iter()
+            .map(|bucket| {
+                let end = bucket
+                    .start
+                    .checked_add(bucket.len)
+                    .ok_or_else(|| anyhow::anyhow!("bucket read batch slice overflow"))?;
+                anyhow::ensure!(
+                    end <= data.len(),
+                    "bucket read batch slice {}..{} exceeds batch length {}",
+                    bucket.start,
+                    end,
+                    data.len()
+                );
+                Ok(data[bucket.start..end].to_vec())
+            })
+            .collect()
     }
 
     #[cfg(not(unix))]
     fn read_bucket_batch(file: &File, batch: &BucketReadBatch) -> Result<Vec<Vec<u8>>> {
         let data = read_contiguous_exact_at(file, batch.offset as u64, batch.len)?;
-        let mut offset = 0usize;
         let mut payloads = Vec::with_capacity(batch.buckets.len());
         for bucket in &batch.buckets {
-            let end = offset
+            let end = bucket
+                .start
                 .checked_add(bucket.len)
                 .ok_or_else(|| anyhow::anyhow!("bucket read batch slice overflow"))?;
             anyhow::ensure!(
                 end <= data.len(),
                 "bucket read batch slice {}..{} exceeds batch length {}",
-                offset,
+                bucket.start,
                 end,
                 data.len()
             );
-            payloads.push(data[offset..end].to_vec());
-            offset = end;
+            payloads.push(data[bucket.start..end].to_vec());
         }
-        anyhow::ensure!(
-            offset == data.len(),
-            "bucket read batch consumed {} bytes but read {} bytes",
-            offset,
-            data.len()
-        );
         Ok(payloads)
     }
 
