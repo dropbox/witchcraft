@@ -144,7 +144,7 @@ pub fn bulk_search(
                 .iter()
                 .map(|&(_, idx, sub_idx)| (idx, sub_idx))
                 .collect();
-            witchcraft::reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
+            witchcraft::hybrid_reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
         } else {
             sem_idxs
         };

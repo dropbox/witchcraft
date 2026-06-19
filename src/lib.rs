@@ -465,23 +465,136 @@ pub fn fulltext_search(
     Ok(fts_matches)
 }
 
+const HYBRID_FULLTEXT_RRF_WEIGHT: f64 = 0.075;
+const HYBRID_SEMANTIC_RRF_WEIGHT: f64 = 1.0;
+
 pub fn reciprocal_rank_fusion(list1: &[DocPtr], list2: &[DocPtr], k: f64) -> Vec<DocPtr> {
-    let mut scores: HashMap<DocPtr, f64> = HashMap::new();
+    weighted_reciprocal_rank_fusion(list1, 1.0, list2, 1.0, k)
+}
 
-    for (rank, &doc_id) in list1.iter().enumerate() {
-        let score = 1.0 / (3.0 + k + rank as f64);
-        *scores.entry(doc_id).or_insert(0.0) += score;
+pub fn hybrid_reciprocal_rank_fusion(
+    fulltext: &[DocPtr],
+    semantic: &[DocPtr],
+    k: f64,
+) -> Vec<DocPtr> {
+    weighted_reciprocal_rank_fusion(
+        fulltext,
+        HYBRID_FULLTEXT_RRF_WEIGHT,
+        semantic,
+        HYBRID_SEMANTIC_RRF_WEIGHT,
+        k,
+    )
+}
+
+pub fn weighted_reciprocal_rank_fusion(
+    list1: &[DocPtr],
+    list1_weight: f64,
+    list2: &[DocPtr],
+    list2_weight: f64,
+    k: f64,
+) -> Vec<DocPtr> {
+    #[derive(Clone, Copy)]
+    struct FusedDoc {
+        score: f64,
+        best_ptr: DocPtr,
+        best_contribution: f64,
     }
 
-    for (rank, &doc_id) in list2.iter().enumerate() {
-        let score = 1.0 / (k + rank as f64);
-        *scores.entry(doc_id).or_insert(0.0) += score;
+    fn add_contribution(scores: &mut HashMap<u32, FusedDoc>, doc_ptr: DocPtr, contribution: f64) {
+        scores
+            .entry(doc_ptr.0)
+            .and_modify(|entry| {
+                entry.score += contribution;
+                if contribution > entry.best_contribution
+                    || (contribution == entry.best_contribution && doc_ptr < entry.best_ptr)
+                {
+                    entry.best_ptr = doc_ptr;
+                    entry.best_contribution = contribution;
+                }
+            })
+            .or_insert(FusedDoc {
+                score: contribution,
+                best_ptr: doc_ptr,
+                best_contribution: contribution,
+            });
     }
 
-    let mut results: Vec<(DocPtr, f64)> = scores.into_iter().collect();
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // Sort descending by score
-    let results: Vec<DocPtr> = results.iter().map(|&(idx, _)| idx).collect();
-    results
+    fn add_ranked_list(
+        scores: &mut HashMap<u32, FusedDoc>,
+        list: &[DocPtr],
+        weight: f64,
+        k: f64,
+    ) {
+        if weight == 0.0 {
+            return;
+        }
+        for (rank, &doc_id) in list.iter().enumerate() {
+            let score = weight / (k + rank as f64 + 1.0);
+            add_contribution(scores, doc_id, score);
+        }
+    }
+
+    let mut scores: HashMap<u32, FusedDoc> = HashMap::new();
+    add_ranked_list(&mut scores, list1, list1_weight, k);
+    add_ranked_list(&mut scores, list2, list2_weight, k);
+
+    let mut results: Vec<(u32, FusedDoc)> = scores.into_iter().collect();
+    results.sort_by(|a, b| {
+        b.1.score
+            .partial_cmp(&a.1.score)
+            .unwrap()
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    results.iter().map(|(_, fused)| fused.best_ptr).collect()
+}
+
+#[cfg(test)]
+mod reciprocal_rank_fusion_tests {
+    use super::*;
+
+    #[test]
+    fn reciprocal_rank_fusion_is_symmetric_between_rankers() {
+        let a = [(1, 0), (2, 0), (3, 0)];
+        let b = [(3, 0), (2, 0), (1, 0)];
+
+        assert_eq!(
+            reciprocal_rank_fusion(&a, &b, 60.0),
+            reciprocal_rank_fusion(&b, &a, 60.0)
+        );
+    }
+
+    #[test]
+    fn reciprocal_rank_fusion_promotes_documents_found_by_both_rankers() {
+        let fulltext = [(1, 0), (2, 0), (3, 0)];
+        let semantic = [(4, 0), (3, 0), (5, 0)];
+
+        assert_eq!(
+            reciprocal_rank_fusion(&fulltext, &semantic, 60.0)[0],
+            (3, 0)
+        );
+    }
+
+    #[test]
+    fn reciprocal_rank_fusion_merges_different_subdocs_for_the_same_document() {
+        let fulltext = [(7, 2), (1, 0), (2, 0)];
+        let semantic = [(3, 0), (7, 5), (4, 0)];
+
+        let results = reciprocal_rank_fusion(&fulltext, &semantic, 60.0);
+
+        assert_eq!(results[0].0, 7);
+        assert_eq!(results.iter().filter(|(rowid, _)| *rowid == 7).count(), 1);
+    }
+
+    #[test]
+    fn hybrid_reciprocal_rank_fusion_weights_semantic_above_fulltext() {
+        let fulltext = [(1, 0)];
+        let semantic = [(2, 0)];
+
+        assert_eq!(
+            hybrid_reciprocal_rank_fusion(&fulltext, &semantic, 60.0)[0],
+            (2, 0)
+        );
+    }
 }
 
 /// Per-generation centroid data loaded from the database.
@@ -1563,7 +1676,7 @@ pub fn search(
 
     let mut fused = if use_fulltext {
         let fts_idxs: Vec<DocPtr> = fts_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
-        reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
+        hybrid_reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
     } else {
         sem_idxs
     };
