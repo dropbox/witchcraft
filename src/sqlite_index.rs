@@ -105,7 +105,7 @@ impl EmbeddingCache for SqliteEmbeddingCache<'_> {
     }
 }
 
-/// DB-backed wrapper: loads generations from cache and fetches any unindexed
+/// DB-backed wrapper: loads generations and fetches buffered unindexed
 /// documents that already have cached embeddings.
 pub fn match_centroids(
     db: &DB,
@@ -118,7 +118,7 @@ pub fn match_centroids(
     match_centroids_from_cache(db, query_embeddings, threshold, top_k, sql_filter, None, &cache)
 }
 
-/// DB-backed wrapper that can demand-populate missing unindexed document
+/// DB-backed wrapper that can demand-populate missing buffered document
 /// embeddings through the supplied cache.
 pub fn match_centroids_with_cache(
     db: &DB,
@@ -154,10 +154,6 @@ pub(crate) fn match_centroids_from_cache(
     let buffered = index.buffered_rowid_records()?;
     let unindexed = if !buffered.is_empty() {
         let plan = document_rowid_plan_for_records(db, &buffered, cache, embedder)?;
-        let source = DocumentEmbeddingSource::new(cache, plan.hashes);
-        unindexed_embeddings_for_rowids(&plan.records, &source)?
-    } else if generation_files.is_empty() {
-        let plan = current_document_rowid_plan(db, cache, embedder)?;
         let source = DocumentEmbeddingSource::new(cache, plan.hashes);
         unindexed_embeddings_for_rowids(&plan.records, &source)?
     } else {
@@ -213,6 +209,11 @@ pub(crate) fn match_centroids_from_cache(
 
 fn index_for_db(db: &DB) -> FileBackedIndex {
     FileBackedIndex::new(db.path().clone())
+}
+
+pub fn semantic_index_needs_prepare(db: &DB) -> Result<bool> {
+    let index = index_for_db(db);
+    Ok(index.generation_files()?.is_empty() && index.buffered_rowid_records()?.is_empty())
 }
 
 struct DocumentRowidPlan {

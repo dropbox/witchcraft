@@ -682,6 +682,81 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_stale_index_prepare_does_not_full_scan_on_search() -> anyhow::Result<()> {
+        struct NoLookupCache;
+
+        impl EmbeddingCache for NoLookupCache {
+            fn get(&self, hash: &str) -> anyhow::Result<Option<crate::CachedEmbeddings>> {
+                anyhow::bail!("unexpected embedding cache lookup for {hash}")
+            }
+
+            fn get_for_document(
+                &self,
+                rowid: u64,
+                _hash: &str,
+            ) -> anyhow::Result<Option<crate::CachedEmbeddings>> {
+                anyhow::bail!("unexpected document embedding cache lookup for rowid {rowid}")
+            }
+
+            fn put(
+                &self,
+                _hash: &str,
+                _embeddings: &crate::CachedEmbeddings,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempdir()?;
+        let path = dir.path().join("stale.sqlite");
+        let mut db = DB::new(path.clone())?;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"stale-index-reset");
+        db.add_doc(None, &uuid, None, "{}", "stale index reset should not scan", None)?;
+
+        let data_file = "stale.sqlite.buckets.0.stale";
+        let header_bytes = u32::try_from(crate::file_index::GENERATION_DATA_HEADER_BYTES)?;
+        let mut sidecar = vec![];
+        sidecar.extend_from_slice(&crate::file_index::GENERATION_DATA_APP_ID.to_le_bytes());
+        sidecar.extend_from_slice(&(crate::file_index::GENERATION_DATA_VERSION - 1).to_le_bytes());
+        sidecar.extend_from_slice(&0u32.to_le_bytes());
+        sidecar.extend_from_slice(&0u32.to_le_bytes());
+        sidecar.extend_from_slice(&(crate::DEFAULT_EMBEDDING_DIM as u32).to_le_bytes());
+        sidecar.extend_from_slice(&crate::BUCKET_CENTER_FORMAT.to_le_bytes());
+        sidecar.extend_from_slice(&header_bytes.to_le_bytes());
+        sidecar.extend_from_slice(&header_bytes.to_le_bytes());
+        sidecar.extend_from_slice(&u64::from(header_bytes).to_le_bytes());
+        std::fs::write(dir.path().join(data_file), sidecar)?;
+        std::fs::write(
+            dir.path().join("stale.sqlite.index"),
+            format!(
+                "{}\t{}\n0\t1\t{data_file}\n",
+                crate::file_index::GENERATION_DATA_APP_ID,
+                crate::file_index::GENERATION_DATA_VERSION
+            ),
+        )?;
+
+        let query = Tensor::from_vec(
+            vec![0.0f32; crate::DEFAULT_EMBEDDING_DIM],
+            (1, crate::DEFAULT_EMBEDDING_DIM),
+            &Device::Cpu,
+        )?;
+        assert!(crate::semantic_index_needs_prepare(&db)?);
+        assert!(!dir.path().join(data_file).exists());
+
+        let results = crate::sqlite_index::match_centroids_from_cache(
+            &db,
+            &query,
+            0.0,
+            10,
+            None,
+            None,
+            &NoLookupCache,
+        )?;
+        assert!(results.is_empty());
+        Ok(())
+    }
+
     /// Regression test for scoring off-by-one: the last token vector was
     /// dropped because vmax_inplace was unreachable after the break.
     /// A single-document corpus exercises this: the one document is both

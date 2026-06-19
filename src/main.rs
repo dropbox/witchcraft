@@ -82,6 +82,8 @@ pub fn bulk_search(
     outputname: std::path::PathBuf,
     use_fulltext: bool,
 ) -> Result<()> {
+    prepare_semantic_search(db, embedder)?;
+
     let file = File::open(csvname)?;
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(b'\t')
@@ -190,6 +192,16 @@ pub fn bulk_search(
     Ok(())
 }
 
+fn prepare_semantic_search(db: &DB, embedder: Option<&witchcraft::Embedder>) -> Result<()> {
+    let Some(embedder) = embedder else {
+        return Ok(());
+    };
+    if witchcraft::semantic_index_needs_prepare(db)? {
+        witchcraft::index_chunks(db, Some(embedder), false)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Info));
 
@@ -224,7 +236,12 @@ fn main() -> Result<()> {
             None
         };
         let mut cache = witchcraft::EmbeddingsCache::new(1);
-        let db = DB::new_reader(db_name).unwrap();
+        let db = if embedder.is_some() {
+            DB::new_fast(db_name).unwrap()
+        } else {
+            DB::new_reader(db_name).unwrap()
+        };
+        prepare_semantic_search(&db, embedder.as_ref())?;
         let q = &args[2..].join(" ");
         let use_fulltext = args[1] == "hybrid" || args[1] == "fulltext";
         let results =
@@ -238,13 +255,17 @@ fn main() -> Result<()> {
     } else if args.len() >= 4
         && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv")
     {
-        let db = DB::new_reader(db_name).unwrap();
         let use_fulltext = args[1] == "hybridcsv" || args[1] == "fulltextcsv";
         let embedder = if args[1] != "fulltextcsv" {
             let device = witchcraft::make_device();
             Some(witchcraft::Embedder::new(&device, &assets).unwrap())
         } else {
             None
+        };
+        let db = if embedder.is_some() {
+            DB::new_fast(db_name).unwrap()
+        } else {
+            DB::new_reader(db_name).unwrap()
         };
         let csvname = &args[2];
         let outputname = &args[3];
