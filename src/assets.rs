@@ -12,7 +12,7 @@ pub struct Asset {
     #[cfg(not(feature = "embed-assets"))]
     path: &'static str,
     #[cfg(not(feature = "embed-assets"))]
-    cached: OnceCell<Result<Vec<u8>, ()>>,
+    cached: OnceCell<Vec<u8>>,
 }
 
 impl Asset {
@@ -37,15 +37,14 @@ impl Asset {
     #[cfg(not(feature = "embed-assets"))]
     pub fn bytes(&'static self, assets: &Path) -> Result<&'static [u8], ()> {
         self.cached
-            .get_or_init(|| match std::fs::read(assets.join(self.path)) {
+            .get_or_try_init(|| match std::fs::read(assets.join(self.path)) {
                 Ok(bytes) => Ok(bytes),
                 Err(e) => {
                     log::warn!("failed to read warp asset {}: {}", self.path, e);
                     Err(())
                 }
             })
-            .as_deref()
-            .map_err(|_| ())
+            .map(|bytes| bytes.as_slice())
     }
 }
 
