@@ -8,8 +8,8 @@ use crate::{
     cached_embeddings_for_rowid, clear_generations_cache, dim_from_model_id, docptrs_for_counts,
     document_cache_hash, hybrid_reciprocal_rank_fusion, index_buffered_embeddings_with_options,
     load_cached_embeddings, load_or_compute_cached_embeddings, match_centroids_raw,
-    reciprocal_rank_fusion, split_by_codepoints, CachedEmbeddings, DB, DocPtr, Embedder,
-    EmbeddingCache, EmbeddingsCache, IndexOptions, SqlStatementInternal,
+    split_by_codepoints, CachedEmbeddings, DB, DocPtr, Embedder, EmbeddingCache, EmbeddingsCache,
+    IndexOptions, SqlStatementInternal,
 };
 use anyhow::Result;
 use candle_core::{Device, Tensor};
@@ -978,7 +978,7 @@ fn search_rowids_inner(
     let sem_idxs: Vec<DocPtr> = sem_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
     let mut fused = if use_fulltext {
         let fts_idxs: Vec<DocPtr> = fts_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
-        reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
+        hybrid_reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
     } else {
         sem_idxs
     };
