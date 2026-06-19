@@ -716,4 +716,44 @@ mod tests {
         db.shutdown();
         Ok(())
     }
+
+    #[test]
+    fn fts5_query_splits_punctuation_and_uses_or_terms() {
+        let (query, normalized) =
+            super::super::fts5_query("what is the origin of COVID-19").unwrap();
+
+        assert_eq!(
+            query,
+            "\"what\" OR \"is\" OR \"the\" OR \"origin\" OR \"of\" OR \"COVID\" OR \"19\"*"
+        );
+        assert_eq!(normalized, "what is the origin of COVID 19");
+    }
+
+    #[test]
+    fn fulltext_search_matches_hyphenated_terms_without_requiring_every_word() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("warp.sqlite");
+        let mut db = DB::new(path)?;
+
+        let relevant = "The origin of COVID-19 was investigated in early pandemic research.";
+        let distractor = "This paragraph says what is the origin of an unrelated weather report.";
+        let relevant_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, relevant.as_bytes());
+        let distractor_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, distractor.as_bytes());
+        db.add_doc(&relevant_uuid, None, "relevant", relevant, None)?;
+        db.add_doc(&distractor_uuid, None, "distractor", distractor, None)?;
+
+        let relevant_rowid: u32 = db
+            .query("SELECT rowid FROM document WHERE metadata = 'relevant'")?
+            .query_row((), |row| row.get(0))?;
+        let results = crate::fulltext_search(&db, "what is the origin of COVID-19", 10, None)?;
+
+        assert!(
+            results.iter().any(|(_, rowid, _)| *rowid == relevant_rowid),
+            "expected relevant COVID-19 document in {results:?}"
+        );
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
 }

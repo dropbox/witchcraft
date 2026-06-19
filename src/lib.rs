@@ -368,6 +368,34 @@ fn merge_and_write_buckets(
     Ok(())
 }
 
+fn fts5_query(q: &str) -> Option<(String, String)> {
+    let terms: Vec<&str> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+
+    let last_is_space = q.chars().last().is_some_and(char::is_whitespace);
+    let mut query = String::new();
+    let mut normalized = String::new();
+    for (idx, term) in terms.iter().enumerate() {
+        if idx != 0 {
+            query.push_str(" OR ");
+            normalized.push(' ');
+        }
+        query.push('"');
+        query.push_str(term);
+        query.push('"');
+        if idx + 1 == terms.len() && !last_is_space {
+            query.push('*');
+        }
+        normalized.push_str(term);
+    }
+    Some((query, normalized))
+}
+
 pub fn fulltext_search(
     db: &DB,
     q: &str,
@@ -376,14 +404,7 @@ pub fn fulltext_search(
 ) -> Result<Vec<(f32, u32, u32)>> {
     let mut fts_matches = vec![];
 
-    let mut last_is_space = false;
-    for c in q.chars() {
-        last_is_space = c == ' ';
-    }
-    let q: String = q
-        .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect();
+    let fts_query = fts5_query(q);
 
     let (filter_sql, mut filter_params) = build_filter_sql_and_params(sql_filter)?;
     let filter_clause = if !filter_sql.is_empty() {
@@ -392,13 +413,7 @@ pub fn fulltext_search(
         String::new()
     };
 
-    let q_param = if last_is_space {
-        q.trim().to_string()
-    } else {
-        format!("{q}*")
-    };
-
-    let sql = if !q.is_empty() {
+    let sql = if fts_query.is_some() {
         format!(
             "SELECT document.rowid, document.body, document.lens,
             bm25(document_fts) AS score
@@ -423,8 +438,8 @@ pub fn fulltext_search(
 
     // Build complete params list: query param (if q.len() > 0), filter params, top_k
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if !q.is_empty() {
-        params.push(Box::new(q_param.clone()));
+    if let Some((query, _)) = &fts_query {
+        params.push(Box::new(query.clone()));
     }
     params.append(&mut filter_params);
     params.push(Box::new(top_k as i64));
@@ -441,7 +456,11 @@ pub fn fulltext_search(
     })?;
     for result in results {
         let (rowid, body, lens, _score) = result?;
-        let score2 = strsim::jaro_winkler(&q_param, &body) as f32;
+        let score_query = fts_query
+            .as_ref()
+            .map(|(_, normalized)| normalized.as_str())
+            .unwrap_or("");
+        let score2 = strsim::jaro_winkler(score_query, &body) as f32;
 
         let lens: Vec<usize> = lens
             .split(',')
@@ -453,7 +472,7 @@ pub fn fulltext_search(
         if !lens.is_empty() {
             let bodies = split_by_codepoints(&body, &lens);
             for (i, &b) in bodies.iter().enumerate() {
-                let score = strsim::jaro_winkler(&q_param, b);
+                let score = strsim::jaro_winkler(score_query, b);
                 if score > max {
                     max = score;
                     i_max = i;
