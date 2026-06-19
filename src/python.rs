@@ -1,8 +1,11 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+
+type JobResult = Result<(), String>;
 
 enum IndexJob {
     Add {
@@ -15,19 +18,23 @@ enum IndexJob {
     Remove {
         uuid: uuid::Uuid,
     },
-    Index,
-    Clear,
+    Index {
+        done: mpsc::Sender<JobResult>,
+    },
+    Clear {
+        done: mpsc::Sender<JobResult>,
+    },
     Shutdown,
 }
 
 struct Reader {
     db: crate::DB,
-    embedder: Arc<crate::Embedder>,
+    embedder: Arc<Mutex<crate::Embedder>>,
     cache: crate::EmbeddingsCache,
 }
 
 impl Reader {
-    fn new(db: crate::DB, embedder: Arc<crate::Embedder>) -> Self {
+    fn new(db: crate::DB, embedder: Arc<Mutex<crate::Embedder>>) -> Self {
         Self {
             db,
             embedder,
@@ -40,10 +47,14 @@ impl Reader {
         q: &str,
         threshold: f32,
         top_k: usize,
-    ) -> Vec<(f32, String, Vec<String>, u32, String)> {
+    ) -> Result<Vec<(f32, String, Vec<String>, u32, String)>, String> {
+        let embedder = self
+            .embedder
+            .lock()
+            .map_err(|_| "embedder lock poisoned".to_string())?;
         crate::search(
             &self.db,
-            &self.embedder,
+            &embedder,
             &mut self.cache,
             q,
             threshold,
@@ -51,12 +62,69 @@ impl Reader {
             true,
             None,
         )
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())
     }
 
-    fn score(&mut self, q: &str, sentences: &[String]) -> Vec<f32> {
-        crate::score_query_sentences(&self.embedder, &mut self.cache, &q.to_string(), sentences)
-            .unwrap_or_default()
+    fn score(&mut self, q: &str, sentences: &[String]) -> Result<Vec<f32>, String> {
+        let embedder = self
+            .embedder
+            .lock()
+            .map_err(|_| "embedder lock poisoned".to_string())?;
+        crate::score_query_sentences(&embedder, &mut self.cache, &q.to_string(), sentences)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn runtime_error(message: impl Into<String>) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(message.into())
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+fn run_job_safely<F>(job: F) -> JobResult
+where
+    F: FnOnce() -> JobResult,
+{
+    match catch_unwind(AssertUnwindSafe(job)) {
+        Ok(result) => result,
+        Err(payload) => Err(format!("indexer panicked: {}", panic_message(payload))),
+    }
+}
+
+fn run_index_job(
+    write_db: &mut crate::DB,
+    embedder: &Arc<Mutex<crate::Embedder>>,
+    device: &candle_core::Device,
+) -> JobResult {
+    {
+        let embedder = embedder
+            .lock()
+            .map_err(|_| "embedder lock poisoned".to_string())?;
+        loop {
+            match crate::embed_chunks(write_db, &embedder, Some(10)) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => return Err(format!("embed_chunks failed: {e}")),
+            }
+        }
+    }
+
+    crate::index_chunks(write_db, device).map_err(|e| format!("index_chunks failed: {e}"))
+}
+
+fn wait_for_job(done: mpsc::Receiver<JobResult>) -> PyResult<()> {
+    match done.recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(runtime_error(e)),
+        Err(_) => Err(runtime_error("indexer thread exited before completing job")),
     }
 }
 
@@ -83,7 +151,12 @@ impl Drop for Witchcraft {
     fn drop(&mut self) {
         let _ = self.tx.send(IndexJob::Shutdown);
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            if let Err(payload) = h.join() {
+                tracing::warn!(
+                    "witchcraft: indexer thread panicked: {}",
+                    panic_message(payload)
+                );
+            }
         }
     }
 }
@@ -101,10 +174,10 @@ impl Witchcraft {
 
         // Load the embedder once and share it between the reader and indexer thread.
         let device = crate::make_device();
-        let embedder = Arc::new(
+        let embedder = Arc::new(Mutex::new(
             crate::Embedder::new(&device, &assets_path)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
-        );
+        ));
 
         let reader_db = crate::DB::new_reader(db_path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -116,8 +189,9 @@ impl Witchcraft {
             while let Ok(job) = rx.recv() {
                 match job {
                     IndexJob::Shutdown => break,
-                    IndexJob::Clear => {
+                    IndexJob::Clear { done } => {
                         write_db.clear();
+                        let _ = done.send(Ok(()));
                     }
                     IndexJob::Add {
                         uuid,
@@ -135,20 +209,11 @@ impl Witchcraft {
                             tracing::warn!("witchcraft: remove_doc failed: {e}");
                         }
                     }
-                    IndexJob::Index => {
-                        loop {
-                            match crate::embed_chunks(&mut write_db, &thread_embedder, Some(10)) {
-                                Ok(0) => break,
-                                Err(e) => {
-                                    tracing::warn!("witchcraft: embed_chunks failed: {e}");
-                                    break;
-                                }
-                                Ok(_) => {}
-                            }
-                        }
-                        if let Err(e) = crate::index_chunks(&mut write_db, &device) {
-                            tracing::warn!("witchcraft: index_chunks failed: {e}");
-                        }
+                    IndexJob::Index { done } => {
+                        let result = run_job_safely(|| {
+                            run_index_job(&mut write_db, &thread_embedder, &device)
+                        });
+                        let _ = done.send(result);
                     }
                 }
             }
@@ -178,7 +243,10 @@ impl Witchcraft {
         threshold: f64,
         top_k: usize,
     ) -> PyResult<Vec<PyObject>> {
-        let results = self.reader.search(&q, threshold as f32, top_k);
+        let results = self
+            .reader
+            .search(&q, threshold as f32, top_k)
+            .map_err(runtime_error)?;
         results
             .into_iter()
             .map(|(score, metadata, bodies, idx, date)| {
@@ -204,7 +272,7 @@ impl Witchcraft {
     /// Returns:
     ///     List of similarity scores (one per sentence, 0–1).
     fn score(&mut self, q: String, sentences: Vec<String>) -> PyResult<Vec<f32>> {
-        Ok(self.reader.score(&q, &sentences))
+        self.reader.score(&q, &sentences).map_err(runtime_error)
     }
 
     /// Add or update a document in the index.
@@ -241,7 +309,7 @@ impl Witchcraft {
             })
             .is_err()
         {
-            tracing::warn!("witchcraft: add() dropped — indexer thread has exited");
+            return Err(runtime_error("indexer thread has exited"));
         }
         Ok(())
     }
@@ -251,31 +319,50 @@ impl Witchcraft {
         let uuid = uuid::Uuid::parse_str(&uuid)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         if self.tx.send(IndexJob::Remove { uuid }).is_err() {
-            tracing::warn!("witchcraft: remove() dropped — indexer thread has exited");
+            return Err(runtime_error("indexer thread has exited"));
         }
         Ok(())
     }
 
-    /// Trigger embedding and index-building for any pending documents.
-    fn index(&self) {
-        if self.tx.send(IndexJob::Index).is_err() {
-            tracing::warn!("witchcraft: index() dropped — indexer thread has exited");
-        }
+    /// Embed and index all pending documents, blocking until complete.
+    fn index(&self) -> PyResult<()> {
+        let (done_tx, done_rx) = mpsc::channel();
+        self.tx
+            .send(IndexJob::Index { done: done_tx })
+            .map_err(|_| runtime_error("indexer thread has exited"))?;
+        wait_for_job(done_rx)
     }
 
     /// Clear all documents from the index.
-    fn clear(&self) {
-        if self.tx.send(IndexJob::Clear).is_err() {
-            tracing::warn!("witchcraft: clear() dropped — indexer thread has exited");
-        }
+    fn clear(&self) -> PyResult<()> {
+        let (done_tx, done_rx) = mpsc::channel();
+        self.tx
+            .send(IndexJob::Clear { done: done_tx })
+            .map_err(|_| runtime_error("indexer thread has exited"))?;
+        wait_for_job(done_rx)
     }
 
     /// Shut down the background indexer and wait for it to finish.
-    fn shutdown(&mut self) {
-        let _ = self.tx.send(IndexJob::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+    fn shutdown(&mut self) -> PyResult<()> {
+        if self.handle.is_none() {
+            return Ok(());
         }
+
+        let send_result = self.tx.send(IndexJob::Shutdown);
+        if let Some(handle) = self.handle.take() {
+            match handle.join() {
+                Ok(()) => {
+                    send_result.map_err(|_| runtime_error("indexer thread has exited"))?;
+                }
+                Err(payload) => {
+                    return Err(runtime_error(format!(
+                        "indexer thread panicked: {}",
+                        panic_message(payload)
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 

@@ -1,14 +1,12 @@
 """
 Smoke tests for the witchcraft Python extension module.
 
-Run after building and installing the wheel:
-    make python-wheel
-    pip install target/wheels/witchcraft-*.whl
-    pytest tests/test_witchcraft.py
+Run with the repo-managed build and virtualenv:
+    make python-test
 
 Tests marked 'needs_assets' require model weights in assets/:
     make download
-    pytest tests/test_witchcraft.py
+    pytest python/test_witchcraft.py
 """
 
 import os
@@ -78,12 +76,8 @@ def test_search_returns_results():
                 body,
             )
         wc.index()
+        results = wc.search('group of birds called a flamboyance', threshold=0.3, top_k=5)
         wc.shutdown()
-
-        # Re-open for search (new instance, same DB)
-        wc2 = witchcraft.Witchcraft(os.path.join(d, 'test.sqlite'), ASSETS)
-        results = wc2.search('group of birds called a flamboyance', threshold=0.3, top_k=5)
-        wc2.shutdown()
 
     assert isinstance(results, list)
     assert len(results) >= 1

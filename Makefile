@@ -58,6 +58,12 @@ EXTRA_FEATURES :=
 comma := ,
 export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
 
+VENV_DIR := $(abspath env)
+PYTHON_BIN := $(VENV_DIR)/bin/python
+MATURIN := $(VENV_DIR)/bin/maturin
+PYTEST := $(VENV_DIR)/bin/pytest
+PYTHON_TEST_ARGS ?= python/test_witchcraft.py
+
 # === Prerequisites ===
 
 prereqs:
@@ -79,7 +85,10 @@ env/pyvenv.cfg: | prereqs
 	uv venv env
 
 env/bin/transformers: env/pyvenv.cfg requirements.txt | prereqs
-	(source env/*/activate && uv pip install -r requirements.txt)
+	uv pip install --python $(PYTHON_BIN) -r requirements.txt
+
+python-build-deps: env/pyvenv.cfg | prereqs
+	uv pip install --python $(PYTHON_BIN) maturin
 
 # === Assets / weights ===
 
@@ -87,13 +96,13 @@ assets:
 	mkdir -p assets
 
 assets/config.json assets/tokenizer.json xtr.safetensors: env/bin/transformers | assets
-	(source env/*/activate && python downloadweights.py)
+	$(PYTHON_BIN) downloadweights.py
 
 assets/xtr.gguf: xtr.safetensors | assets prereqs
 	cargo run -p quantize-tool xtr.safetensors assets/xtr.gguf
 
 assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml: | prereqs
-	python quantize-openvino.py
+	$(PYTHON_BIN) quantize-openvino.py
 
 download: prereqs assets assets/config.json assets/tokenizer.json assets/xtr.gguf
 
@@ -160,26 +169,28 @@ nfcorpus: prereqs datasets/nfcorpus.tsv
 	$(CLI_BIN) embed
 	$(CLI_BIN) index
 
-nfcorpus-score: prereqs testset/nfcorpus/questions.test.tsv testset/nfcorpus/questions.test.tsv testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
+nfcorpus-score: prereqs env/pyvenv.cfg testset/nfcorpus/questions.test.tsv testset/nfcorpus/questions.test.tsv testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
 	make warp-cli EXTRA_FEATURES=deterministic
 	echo ensuring presence of pytrec-eval...
-	uv pip install pytrec-eval 2>/dev/null
+	uv pip install --python $(PYTHON_BIN) pytrec-eval 2>/dev/null
 	echo running queries...
 	$(CLI_BIN) querycsv testset/nfcorpus/questions.test.tsv output.txt
 	echo scoring...
-	python score.py output.txt testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
+	$(PYTHON_BIN) score.py output.txt testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
 
 run: module
 	ln -sf target/release/warp-macos-universal.node warp.node
 	node index.cjs
 
-python-wheel: prereqs download
-	@command -v maturin >/dev/null 2>&1 || { echo "maturin not found — run: pip install maturin" >&2; exit 1; }
-	maturin build --release $(BUILD_TARGET) --features $(PYTHON_FEATURES)
+python-wheel: python-build-deps download
+	VIRTUAL_ENV=$(VENV_DIR) $(MATURIN) build --release $(BUILD_TARGET) --features $(PYTHON_FEATURES)
 
-python-dev: prereqs download
-	@command -v maturin >/dev/null 2>&1 || { echo "maturin not found — run: pip install maturin" >&2; exit 1; }
-	maturin develop --features $(PYTHON_FEATURES)
+python-dev: python-build-deps download
+	VIRTUAL_ENV=$(VENV_DIR) $(MATURIN) develop --features $(PYTHON_FEATURES)
+
+python-test: python-dev
+	uv pip install --python $(PYTHON_BIN) pytest
+	$(PYTEST) $(PYTHON_TEST_ARGS)
 
 distclean:
 	rm -rf target env html xtr-base-en openvino_model
@@ -197,4 +208,4 @@ distclean:
 	fi
 	rm -rf .make-stamps .stamp* stamp-* *.stamp */.stamp* */*.stamp */stamp-*
 
-.PHONY: prereqs download ovdownload build buildemb warp-cli pickbrain pickbrain-install module macintel winintel win test bench nfcorpus nfcorpus-score run python-wheel python-dev distclean
+.PHONY: prereqs download ovdownload build buildemb warp-cli pickbrain pickbrain-install module macintel winintel win test bench nfcorpus nfcorpus-score run python-build-deps python-wheel python-dev python-test distclean

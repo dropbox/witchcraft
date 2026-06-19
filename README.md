@@ -111,20 +111,13 @@ Platform-specific recommended features (these are what `make` uses automatically
 
 ## Using as a Python module ##
 
-Requires [maturin](https://github.com/PyO3/maturin):
-
-```
-pip install maturin
-```
-
 Build a wheel for your current platform (auto-selects the right backend features):
 
 ```
 make python-wheel
-pip install target/wheels/witchcraft-*.whl
 ```
 
-Or, inside a virtualenv, install directly for development:
+Or install directly into the repo-managed virtualenv for development:
 
 ```
 make python-dev
@@ -134,15 +127,14 @@ The Makefile picks the correct feature set automatically (`metal` on Apple Silic
 `fbgemm,hybrid-dequant` on Intel, `cuda` on Linux with a GPU). The wheel works on
 Python 3.8+, including 3.14+.
 
-To run the Python test suite after installing the wheel:
+To build/install the extension and run the Python test suite:
 
 ```
-pip install pytest
-pytest tests/test_witchcraft.py
+make python-test
 ```
 
-Tests that exercise the embedder (search, score, add, etc.) are skipped unless
-model assets are present. Run `make download` first to enable them.
+Override `PYTHON_TEST_ARGS` to pass custom pytest arguments, for example
+`make python-test PYTHON_TEST_ARGS="-q tests/test_witchcraft.py"`.
 
 Then in Python:
 
@@ -157,7 +149,7 @@ wc.add('550e8400-e29b-41d4-a716-446655440000',
        '{"source": "dropbox"}',
        'The document text goes here')
 
-# Trigger embedding + index build
+# Build pending embeddings and index data; blocks until complete
 wc.index()
 
 # Hybrid semantic + BM25 search
