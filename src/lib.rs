@@ -1219,6 +1219,85 @@ fn bucket_data_header_from_file(file: &File, sidecar_len: usize) -> Result<Bucke
     bucket_data_header_from_prefix(&prefix, sidecar_len)
 }
 
+fn validate_residual_radius_levels(levels: &[f32], residual_quant_bits: u8) -> Result<()> {
+    packops::validate_residual_quant_bits(residual_quant_bits)?;
+    anyhow::ensure!(
+        residual_quant_bits != 0,
+        "Lloyd-Max radius levels require polar residual quantization"
+    );
+    let expected = 1usize << usize::from(residual_quant_bits);
+    anyhow::ensure!(
+        levels.len() == expected,
+        "Lloyd-Max radius level count {} does not match expected {}",
+        levels.len(),
+        expected
+    );
+    let mut previous = f32::NEG_INFINITY;
+    for &level in levels {
+        anyhow::ensure!(level.is_finite(), "Lloyd-Max radius level is not finite");
+        anyhow::ensure!(
+            level >= 0.0,
+            "Lloyd-Max radius level {level} must be non-negative"
+        );
+        anyhow::ensure!(
+            level >= previous,
+            "Lloyd-Max radius levels must be sorted"
+        );
+        previous = level;
+    }
+    Ok(())
+}
+
+fn residual_radius_levels_byte_len(residual_quant_bits: u8) -> Result<usize> {
+    packops::validate_residual_quant_bits(residual_quant_bits)?;
+    if residual_quant_bits == 0 {
+        return Ok(0);
+    }
+    Ok((1usize << usize::from(residual_quant_bits)) * std::mem::size_of::<f32>())
+}
+
+fn residual_radius_levels_to_bytes(
+    levels: Option<&[f32]>,
+    residual_quant_bits: u8,
+) -> Result<Vec<u8>> {
+    let Some(levels) = levels else {
+        return Ok(vec![]);
+    };
+    validate_residual_radius_levels(levels, residual_quant_bits)?;
+    let mut bytes = Vec::with_capacity(residual_radius_levels_byte_len(residual_quant_bits)?);
+    for &level in levels {
+        bytes.write_all(&level.to_le_bytes())?;
+    }
+    Ok(bytes)
+}
+
+fn bucket_data_residual_radius_levels_from_file(
+    file: &File,
+    header: &BucketDataHeader,
+) -> Result<Option<Vec<f32>>> {
+    let levels_len = header
+        .meta_offset
+        .checked_sub(BUCKET_DATA_HEADER_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar radius level range is invalid"))?;
+    if levels_len == 0 {
+        return Ok(None);
+    }
+    let expected_len = residual_radius_levels_byte_len(header.residual_quant_bits)?;
+    anyhow::ensure!(
+        levels_len == expected_len,
+        "bucket sidecar Lloyd-Max radius block has {levels_len} bytes, expected {expected_len}"
+    );
+    let mut bytes = vec![0; levels_len];
+    let mut buffers = [bytes.as_mut_slice()];
+    readv_exact_at(file, u64::try_from(BUCKET_DATA_HEADER_BYTES)?, &mut buffers)?;
+    let levels: Vec<f32> = bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    validate_residual_radius_levels(&levels, header.residual_quant_bits)?;
+    Ok(Some(levels))
+}
+
 fn bucket_data_bucket_meta_from_file(
     file: &File,
     header: &BucketDataHeader,
@@ -1449,6 +1528,7 @@ fn merge_and_write_buckets_to_path(
     rowid_records: &[RowidRecord],
     final_path: &Path,
     residual_quant_bits: u8,
+    residual_radius_levels: Option<&[f32]>,
 ) -> Result<()> {
     let mut tmp_path = final_path.as_os_str().to_os_string();
     tmp_path.push(format!(
@@ -1537,7 +1617,11 @@ fn merge_and_write_buckets_to_path(
     let meta_block_len = centroid_count
         .checked_mul(BUCKET_SCALAR_META_BYTES)
         .ok_or_else(|| anyhow::anyhow!("bucket metadata block length overflow"))?;
-    let meta_offset = BUCKET_DATA_HEADER_BYTES;
+    let residual_radius_level_block =
+        residual_radius_levels_to_bytes(residual_radius_levels, residual_quant_bits)?;
+    let meta_offset = BUCKET_DATA_HEADER_BYTES
+        .checked_add(residual_radius_level_block.len())
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar metadata offset overflow"))?;
     let centers_offset = meta_offset
         .checked_add(meta_block_len)
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar center block offset overflow"))?;
@@ -1573,6 +1657,7 @@ fn merge_and_write_buckets_to_path(
         payload_start.try_into()?,
         rowids_offset.try_into()?,
     )?;
+    bucket_data_writer.write_all(&residual_radius_level_block)?;
     for meta in &mut bucket_meta {
         if meta.size == 0 {
             meta.data_offset = payload_start;
@@ -1814,6 +1899,7 @@ pub struct GenerationCentroids {
     dim: usize,
     residual_quant_bits: u8,
     residual_bytes: usize,
+    residual_dequant_table: packops::ResidualDequantTable,
     bucket_indices: Vec<usize>,
     sizes: Vec<usize>,
     data_offsets: Vec<usize>,
@@ -2209,6 +2295,12 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
         let file = File::open(path)?;
         let sidecar_len: usize = file.metadata()?.len().try_into()?;
         let header = bucket_data_header_from_file(&file, sidecar_len)?;
+        let residual_radius_levels =
+            bucket_data_residual_radius_levels_from_file(&file, &header)?;
+        let residual_dequant_table = packops::make_residual_dequant_table_with_radius_levels(
+            header.residual_quant_bits,
+            residual_radius_levels.as_deref(),
+        )?;
         let (metas, center_block) = bucket_data_bucket_meta_from_file(&file, &header)?;
         let coarse_tree = bucket_data_coarse_tree_from_file(&file, &header, &metas, device)?;
         let residual_bytes =
@@ -2259,6 +2351,7 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
             dim: header.embedding_dim,
             residual_quant_bits: header.residual_quant_bits,
             residual_bytes,
+            residual_dequant_table,
             bucket_indices,
             sizes,
             data_offsets,
@@ -2303,8 +2396,6 @@ pub fn match_centroids_raw(
     let mut count = 0;
     let mut missing = vec![0.0f32; m];
     let mut io_counters = MatchIoCounters::default();
-
-    let table = packops::make_residual_dequant_table()?;
 
     for gen in generations.iter() {
         if gen.sizes.is_empty() {
@@ -2407,7 +2498,7 @@ pub fn match_centroids_raw(
             let residuals = packops::residuals_from_bytes(
                 residual_bytes,
                 gen.dim,
-                &table,
+                &gen.residual_dequant_table,
                 gen.residual_quant_bits,
                 &Device::Cpu,
             )?;
@@ -3127,6 +3218,72 @@ fn assign_with_index_kmeans(data: &Tensor, routing: &IndexKMeansNode) -> Result<
     Ok(assignments)
 }
 
+#[cfg(feature = "polar-quant")]
+fn learn_residual_radius_levels(
+    embeddings: &[Tensor],
+    index_kmeans: &IndexKMeans,
+    residual_centers_cpu: &Tensor,
+    residual_quant_bits: u8,
+) -> Result<Option<Vec<f32>>> {
+    packops::validate_residual_quant_bits(residual_quant_bits)?;
+    if residual_quant_bits == 0 || embeddings.is_empty() {
+        return Ok(None);
+    }
+
+    let data_cpu = Tensor::cat(embeddings, 0)?;
+    let cluster_assignments = assign_with_index_kmeans(&data_cpu, &index_kmeans.routing)?;
+    let (rows, dim) = data_cpu.dims2()?;
+    let (center_count, center_dim) = residual_centers_cpu.dims2()?;
+    anyhow::ensure!(
+        dim == center_dim,
+        "residual training data dimension {dim} does not match center dimension {center_dim}"
+    );
+    anyhow::ensure!(
+        dim % 2 == 0,
+        "polar residual radius training requires an even embedding dimension"
+    );
+    let data = data_cpu.flatten_all()?.to_vec1::<f32>()?;
+    let centers = residual_centers_cpu.flatten_all()?.to_vec1::<f32>()?;
+    let mut radii = Vec::with_capacity(rows * (dim / 2));
+
+    for (row, &bucket) in cluster_assignments.iter().enumerate() {
+        let bucket: usize = bucket.try_into()?;
+        anyhow::ensure!(
+            bucket < center_count,
+            "assigned bucket {bucket} is outside centroid count {center_count}"
+        );
+        let row_offset = row * dim;
+        let center_offset = bucket * dim;
+        for dim_idx in (0..dim).step_by(2) {
+            let x = data[row_offset + dim_idx] - centers[center_offset + dim_idx];
+            let y = data[row_offset + dim_idx + 1] - centers[center_offset + dim_idx + 1];
+            radii.push(x.mul_add(x, y * y).sqrt());
+        }
+    }
+
+    // We tried learning angle levels too, with residual radius^2 as the weight.
+    // It converged to nearly uniform bins and regressed nfcorpus at 2 and 3 bits,
+    // so keep angle quantization analytic and only learn the residual radii.
+    let levels = packops::lloyd_max_radius_levels(&radii, residual_quant_bits)?;
+    info!(
+        "Lloyd-Max polar radius levels bits={} samples={} levels={:?}",
+        residual_quant_bits,
+        radii.len(),
+        levels
+    );
+    Ok(Some(levels))
+}
+
+#[cfg(not(feature = "polar-quant"))]
+fn learn_residual_radius_levels(
+    _embeddings: &[Tensor],
+    _index_kmeans: &IndexKMeans,
+    _residual_centers_cpu: &Tensor,
+    _residual_quant_bits: u8,
+) -> Result<Option<Vec<f32>>> {
+    Ok(None)
+}
+
 fn write_bucket_batch(
     embeddings: Vec<Tensor>,
     indices: Vec<DocPtr>,
@@ -3134,6 +3291,7 @@ fn write_bucket_batch(
     residual_centers_cpu: &Tensor,
     residual_bytes: usize,
     residual_quant_bits: u8,
+    residual_radius_levels: Option<&[f32]>,
 ) -> Result<(tempfile::NamedTempFile, u128, u128)> {
     let now = std::time::Instant::now();
     let data_cpu = Tensor::cat(&embeddings, 0)?;
@@ -3182,7 +3340,11 @@ fn write_bucket_batch(
 
         let center = residual_centers_cpu.get(bucket as usize)?;
         let residual = (&data_cpu.get(sample)? - &center)?;
-        let residual_quantized = packops::residual_to_temp_bytes(&residual, residual_quant_bits)?;
+        let residual_quantized = packops::residual_to_temp_bytes_with_radius_levels(
+            &residual,
+            residual_quant_bits,
+            residual_radius_levels,
+        )?;
         residuals_bytes.extend(&residual_quantized);
     }
 
@@ -3294,7 +3456,7 @@ fn write_buckets_for_rowids(
     index_kmeans: &IndexKMeans,
     expected_count: u64,
     residual_quant_bits: u8,
-) -> Result<(Vec<tempfile::NamedTempFile>, CenterSidecarData)> {
+) -> Result<(Vec<tempfile::NamedTempFile>, CenterSidecarData, Option<Vec<f32>>)> {
     let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
     let mut writes_total = 0;
@@ -3315,6 +3477,8 @@ fn write_buckets_for_rowids(
     let residual_centers_cpu = &center_sidecar.residual_centers_cpu;
     let bar = progress::new_with_label(expected_count, "indexing");
     let mut records = active_rowid_records(records);
+    let mut residual_radius_levels = None;
+    let mut attempted_radius_training = false;
     while !done {
         match records.next() {
             Some(record) => {
@@ -3349,6 +3513,15 @@ fn write_buckets_for_rowids(
                     docptrs.len()
                 );
                 if batch > 0 && batch + m > INDEX_BATCH_SIZE {
+                    if !attempted_radius_training {
+                        residual_radius_levels = learn_residual_radius_levels(
+                            &all_embeddings,
+                            index_kmeans,
+                            residual_centers_cpu,
+                            residual_quant_bits,
+                        )?;
+                        attempted_radius_training = true;
+                    }
                     let (tmpfile, mmuls_ms, writes_ms) = write_bucket_batch(
                         std::mem::take(&mut all_embeddings),
                         std::mem::take(&mut document_indices),
@@ -3356,6 +3529,7 @@ fn write_buckets_for_rowids(
                         residual_centers_cpu,
                         residual_bytes,
                         residual_quant_bits,
+                        residual_radius_levels.as_deref(),
                     )?;
                     tmpfiles.push(tmpfile);
                     mmuls_total += mmuls_ms;
@@ -3378,6 +3552,15 @@ fn write_buckets_for_rowids(
                 continue;
             }
             let flushed = batch;
+            if !attempted_radius_training {
+                residual_radius_levels = learn_residual_radius_levels(
+                    &all_embeddings,
+                    index_kmeans,
+                    residual_centers_cpu,
+                    residual_quant_bits,
+                )?;
+                attempted_radius_training = true;
+            }
             let (tmpfile, mmuls_ms, writes_ms) = write_bucket_batch(
                 std::mem::take(&mut all_embeddings),
                 std::mem::take(&mut document_indices),
@@ -3385,6 +3568,7 @@ fn write_buckets_for_rowids(
                 residual_centers_cpu,
                 residual_bytes,
                 residual_quant_bits,
+                residual_radius_levels.as_deref(),
             )?;
             tmpfiles.push(tmpfile);
             mmuls_total += mmuls_ms;
@@ -3398,7 +3582,7 @@ fn write_buckets_for_rowids(
     debug!("mmuls took {} ms.", mmuls_total);
     debug!("writes took {} ms.", writes_total);
 
-    Ok((tmpfiles, center_sidecar))
+    Ok((tmpfiles, center_sidecar, residual_radius_levels))
 }
 
 fn build_index_generation(
@@ -3429,7 +3613,7 @@ fn build_index_generation(
     let data_path = index.path_for(&data_file);
     let residual_quant_bits = options.residual_quant_bits();
 
-    let (tmpfiles, center_sidecar) = write_buckets_for_rowids(
+    let (tmpfiles, center_sidecar, residual_radius_levels) = write_buckets_for_rowids(
         records,
         cache,
         &centers,
@@ -3442,6 +3626,7 @@ fn build_index_generation(
         records,
         &data_path,
         residual_quant_bits,
+        residual_radius_levels.as_deref(),
     ) {
         let _ = std::fs::remove_file(&data_path);
         return Err(err);
