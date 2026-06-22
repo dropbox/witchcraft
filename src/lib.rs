@@ -560,12 +560,9 @@ fn kmeans_inner(
                 emb = &owned;
             }
             let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                for (d, e) in dst.iter_mut().zip(emb) {
-                    *d = e / norm;
-                }
-            } else {
-                dst.copy_from_slice(emb);
+            assert!(norm > 0.0);
+            for (d, e) in dst.iter_mut().zip(emb) {
+                *d = e / norm;
             }
         }
 
