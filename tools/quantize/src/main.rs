@@ -10,7 +10,9 @@ fn run_quantize_safetensors(in_file: PathBuf, out_path: PathBuf) -> Result<()> {
     let qtensors = tensors
         .into_iter()
         .map(|(name, tensor)| {
-            let qdtype = if tensor.rank() == 2 {
+            let qdtype = if name.starts_with("token_gate") {
+                GgmlDType::F32
+            } else if tensor.rank() == 2 {
                 let dim1 = tensor.dim(1)?;
                 if dim1 % GgmlDType::Q4K.block_size() == 0 {
                     GgmlDType::Q4K

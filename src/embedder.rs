@@ -7,6 +7,21 @@ use tokenizers::Tokenizer;
 fn normalize_l2(v: &Tensor) -> Result<Tensor> {
     Ok(v.broadcast_div(&v.sqr()?.sum_keepdim(2)?.sqrt()?)?)
 }
+
+fn model_forward_with_gate(
+    model: &t5_encoder::T5EncoderModel,
+    input: &Tensor,
+) -> Result<(Tensor, Option<Tensor>)> {
+    #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+    {
+        Ok(model.forward_with_gate(input)?)
+    }
+    #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
+    {
+        Ok((model.forward(input)?, None))
+    }
+}
+
 pub struct Embedder {
     tokenizer: Tokenizer,
     model: t5_encoder::T5EncoderModel,
@@ -20,6 +35,22 @@ impl Embedder {
     }
 
     pub fn embed(&self, text: &str) -> Result<(Tensor, Vec<(usize, usize)>)> {
+        let (embeddings, offsets, _) = self.embed_inner(text, false)?;
+        Ok((embeddings, offsets))
+    }
+
+    pub fn embed_with_gate_scores(
+        &self,
+        text: &str,
+    ) -> Result<(Tensor, Vec<(usize, usize)>, Option<Vec<f32>>)> {
+        self.embed_inner(text, true)
+    }
+
+    fn embed_inner(
+        &self,
+        text: &str,
+        collect_gate_scores: bool,
+    ) -> Result<(Tensor, Vec<(usize, usize)>, Option<Vec<f32>>)> {
         let now = std::time::Instant::now();
         let model = &self.model;
         let device = model.device();
@@ -33,12 +64,22 @@ impl Embedder {
 
         let n_tokens = ids.len();
         let mut accum: Vec<Option<Tensor>> = vec![None; n_tokens];
+        let mut gate_scores: Option<Vec<f32>> = None;
+        let mut gate_counts: Option<Vec<u32>> = None;
 
         let mut start = 0;
         loop {
             let end = (start + max_len).min(n_tokens);
             let input = Tensor::new(&ids[start..end], device)?.unsqueeze(0)?;
-            let chunk = model.forward(&input)?.squeeze(0)?.to_device(&Device::Cpu)?;
+            let (chunk, gates) = if collect_gate_scores {
+                model_forward_with_gate(model, &input)?
+            } else {
+                (model.forward(&input)?, None)
+            };
+            let chunk = chunk.squeeze(0)?.to_device(&Device::Cpu)?;
+            let gates = gates
+                .map(|g| g.squeeze(0)?.to_device(&Device::Cpu)?.to_vec1::<f32>())
+                .transpose()?;
 
             let (m, _n) = chunk.dims2()?;
             for i in 0..m {
@@ -52,6 +93,18 @@ impl Embedder {
                     Some(prev) => {
                         let sum = (prev + &emb)?;
                         accum[global_idx] = Some(sum);
+                    }
+                }
+                if let Some(gates) = gates.as_ref() {
+                    if gate_scores.is_none() {
+                        gate_scores = Some(vec![0.0; n_tokens]);
+                        gate_counts = Some(vec![0; n_tokens]);
+                    }
+                    if let (Some(scores), Some(counts)) =
+                        (gate_scores.as_mut(), gate_counts.as_mut())
+                    {
+                        scores[global_idx] += gates[i];
+                        counts[global_idx] += 1;
                     }
                 }
             }
@@ -79,11 +132,18 @@ impl Embedder {
         const MIN_NORM: f32 = 1.0;
         let mut filtered_embs = Vec::with_capacity(token_embs.len());
         let mut filtered_offsets = Vec::with_capacity(offsets.len());
-        for (emb, offset) in token_embs.into_iter().zip(offsets.into_iter()) {
+        let mut filtered_scores = gate_scores.as_ref().map(|_| Vec::with_capacity(token_embs.len()));
+        for (idx, (emb, offset)) in token_embs.into_iter().zip(offsets.into_iter()).enumerate() {
             let norm = emb.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
             if norm >= MIN_NORM {
                 filtered_embs.push(emb);
                 filtered_offsets.push(offset);
+                if let Some(out) = filtered_scores.as_mut() {
+                    let scores = gate_scores.as_ref().expect("gate scores missing");
+                    let counts = gate_counts.as_ref().expect("gate counts missing");
+                    let count = counts[idx].max(1) as f32;
+                    out.push(scores[idx] / count);
+                }
             }
         }
         if filtered_embs.is_empty() {
@@ -98,7 +158,7 @@ impl Embedder {
             filtered_embs.len(),
             n_tokens,
         );
-        Ok((normalized, filtered_offsets))
+        Ok((normalized, filtered_offsets, filtered_scores))
     }
 
     /*

@@ -58,6 +58,8 @@ def main():
     for k, v in ckpt.items():
         if any(k.startswith(p) for p in SKIP_PREFIXES):
             continue
+        if v.ndim == 0:
+            continue
         if v.dtype == torch.bfloat16:
             tensors[k] = v.to(torch.float32).contiguous()
         else:
@@ -77,6 +79,9 @@ def main():
     projection_mlp = None
     if "linear.0.weight" in tensors:
         projection_mlp = int(tensors["linear.0.weight"].shape[0])
+        projection_dim = int(tensors["linear.2.weight"].shape[0])
+    else:
+        projection_dim = int(tensors["linear.weight"].shape[0])
 
     # Load HF config for values we can't infer from shapes
     hf_cfg = load_hf_config(ckpt_dir, args.model)
@@ -123,9 +128,12 @@ def main():
         "local_attention": local_attention,
         "global_attn_every_n_layers": global_attn_every_n,
         "hidden_activation": hidden_activation,
+        "projection_dim": projection_dim,
     }
     if projection_mlp is not None:
         config["projection_mlp"] = projection_mlp
+    if "token_gate.weight" in tensors and "token_gate_norm.weight" in tensors:
+        config["token_gate"] = True
 
     (out_dir / "modernbert-config.json").write_text(json.dumps(config, indent=2))
 

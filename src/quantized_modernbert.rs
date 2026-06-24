@@ -46,6 +46,8 @@ struct Config {
     global_attn_every_n_layers: usize,
     #[serde(default = "default_activation")]
     hidden_activation: String,
+    #[serde(default)]
+    token_gate: bool,
 }
 
 fn default_activation() -> String {
@@ -119,6 +121,32 @@ impl candle_core::Module for LayerNormNoBias {
         let normed = centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let normed = normed.to_dtype(dtype)?;
         normed.broadcast_mul(&self.weight)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LayerNormWithBias {
+    weight: Tensor,
+    bias: Tensor,
+    eps: f64,
+}
+
+impl LayerNormWithBias {
+    fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get(size, "weight")?.dequantize(vb.device())?;
+        let bias = vb.get(size, "bias")?.dequantize(vb.device())?;
+        Ok(Self { weight, bias, eps })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let dtype = xs.dtype();
+        let xs_f32 = xs.to_dtype(DType::F32)?;
+        let mean = xs_f32.mean_keepdim(D::Minus1)?;
+        let centered = xs_f32.broadcast_sub(&mean)?;
+        let variance = centered.sqr()?.mean_keepdim(D::Minus1)?;
+        let normed = centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let normed = normed.to_dtype(dtype)?;
+        normed.broadcast_mul(&self.weight)?.broadcast_add(&self.bias)
     }
 }
 
@@ -742,9 +770,33 @@ impl Projection {
 }
 
 #[derive(Debug, Clone)]
+struct TokenGate {
+    norm: LayerNormWithBias,
+    linear: QMatMul,
+    bias: Tensor,
+}
+
+impl TokenGate {
+    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        let norm = LayerNormWithBias::load(cfg.hidden_size, cfg.norm_eps, vb.pp("token_gate_norm"))?;
+        let linear = new_qmm(cfg.hidden_size, 1, vb.pp("token_gate"))?;
+        let bias = vb.pp("token_gate").get(1, "bias")?.dequantize(vb.device())?;
+        Ok(Self { norm, linear, bias })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.linear
+            .forward(&self.norm.forward(xs)?)?
+            .broadcast_add(&self.bias)?
+            .squeeze(D::Minus1)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct T5EncoderModel {
     encoder: Encoder,
     projection: Projection,
+    token_gate: Option<TokenGate>,
     device: Device,
 }
 
@@ -760,6 +812,24 @@ impl T5EncoderModel {
             profile.print();
         }
         Ok(output)
+    }
+
+    pub fn forward_with_gate(&self, input_ids: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
+        let seq_len = input_ids.dim(D::Minus1)?;
+        let mut profile = profile_take(seq_len).then(|| ForwardProfile::new(seq_len));
+        let encoder_output = self.encoder.forward(input_ids, profile.as_mut())?;
+        let gate = self
+            .token_gate
+            .as_ref()
+            .map(|gate| gate.forward(&encoder_output))
+            .transpose()?;
+        let started = Instant::now();
+        let output = self.projection.forward(&encoder_output)?;
+        if let Some(mut profile) = profile {
+            profile.projection = started.elapsed();
+            profile.print();
+        }
+        Ok((output, gate))
     }
 
     pub fn device(&self) -> &Device {
@@ -831,11 +901,17 @@ impl T5ModelBuilder {
             Projection::Linear(w, bias)
         };
 
+        let token_gate = if self.config.token_gate {
+            Some(TokenGate::load(vb.clone(), &self.config)?)
+        } else {
+            None
+        };
         let encoder = Encoder::load(vb, &self.config, device)
             .map_err(|e| Error::other(format!("failed to load encoder: {e}")))?;
         Ok(T5EncoderModel {
             encoder,
             projection,
+            token_gate,
             device: device.clone(),
         })
     }
