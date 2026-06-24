@@ -81,7 +81,7 @@ impl Embedder {
         let mut filtered_offsets = Vec::with_capacity(offsets.len());
         for (emb, offset) in token_embs.into_iter().zip(offsets.into_iter()) {
             let norm = emb.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
-            if norm >= MIN_NORM {
+            if norm >= MIN_NORM && offset.0 != offset.1 {
                 filtered_embs.push(emb);
                 filtered_offsets.push(offset);
             }

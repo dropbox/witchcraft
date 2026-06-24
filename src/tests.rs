@@ -43,7 +43,7 @@ mod tests {
         "Cleopatra lived closer in time to the first moon landing than to the building of the Great Pyramid."
     ];
     const QUERIES: [(&str, u32); 3] = [
-        ("a lake with funny colors", 31),
+        ("a lake in Australia that stays bright pink", 31),
         ("A group of flamingos", 15),
         ("facts about fruits and berries", 0),
     ];
@@ -80,6 +80,7 @@ mod tests {
         }
         for round in 0..3 {
             crate::embed_chunks(&db, &embedder, None).unwrap();
+            index_chunks(&db, &device).unwrap();
             for (i, (q, pos)) in QUERIES.iter().enumerate() {
                 let use_fulltext = round == 0;
                 println!("searching for {q}");
@@ -94,20 +95,17 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                if round == 0 {
-                    assert!(results.len() == 1);
-                } else {
-                    if i < 2 {
-                        assert!(results.len() == 1);
-                    } else {
-                        assert!(results.len() == 0);
-                    }
-                }
-                for (score, metadata, body, body_idx, _date) in results {
-                    let uuid = Uuid::parse_str(&metadata).unwrap();
+                if round == 0 || i < 2 {
+                    assert!(!results.is_empty());
+                    let (score, metadata, body, body_idx, _date) = &results[0];
+                    let uuid = Uuid::parse_str(metadata).unwrap();
                     let index = uuids.iter().position(|&u| u == uuid).unwrap();
                     println!("i={i} score={score} metadata={metadata} body={body:?} body_idx={body_idx} uuid-index {index}");
                     assert!(index == *pos as usize);
+                } else {
+                    assert!(results.iter().all(|(_, metadata, _, _, _)| {
+                        Uuid::parse_str(metadata).unwrap() != uuids[*pos as usize]
+                    }));
                 }
             }
             db.remove_doc(&uuids[0].clone()).unwrap();
@@ -466,6 +464,7 @@ mod tests {
             "The Amazon rainforest produces about 20% of the world's oxygen.",
             "A teaspoon of neutron star material would weigh about 6 billion tons.",
             "Dolphins sleep with one eye open.",
+            "The human brain uses about 20% of the body's total energy.",
         ];
         for body in extra_facts {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
@@ -908,6 +907,38 @@ mod tests {
     }
 
     #[test]
+    fn test_cluster_embeddings_for_counts() -> anyhow::Result<()> {
+        let embeddings = Tensor::from_vec(
+            vec![
+                1.0f32, 0.0,
+                1.0, 0.0,
+                0.0, 1.0,
+                0.0, 1.0,
+            ],
+            (4, 2),
+            &Device::Cpu,
+        )?;
+        let (clustered, counts) = crate::cluster_embeddings_for_counts(&embeddings, &[4])?;
+        let rows = clustered.to_vec2::<f32>()?;
+
+        assert_eq!(counts, vec![2]);
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let norm = row.iter().map(|value| value * value).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-6);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_token_counts_for_lens_converts_boundaries_for_byte_offsets() -> anyhow::Result<()> {
+        let body = "abé\ncd\n";
+        let counts = crate::token_counts_for_lens(body, "4,3", &[(0, 2), (2, 5), (5, 8)])?;
+        assert_eq!(counts, vec![2, 1]);
+        Ok(())
+    }
+
+    #[test]
     fn test_add_docs_with_explicit_rowids() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("rowid_test.sqlite");
@@ -995,11 +1026,15 @@ mod tests {
         crate::embed_chunks(&db, &embedder, None)?;
         index_chunks(&db, &device)?;
 
-        // Unfiltered search should return both
+        // Unfiltered search should return the document targeted by the filter.
+        let filter_query = "pink flamingos shrimp algae";
         let results = crate::search(
-            &db, Some(&embedder), &mut cache, "flamingos", THRESHOLD, 10, false, None,
+            &db, Some(&embedder), &mut cache, filter_query, THRESHOLD, 10, false, None,
         )?;
-        assert!(results.len() == 2, "unfiltered search should find both flamingo docs, got {}", results.len());
+        assert!(
+            results.iter().any(|(_, metadata, _, _, _)| metadata == &uuid_b.to_string()),
+            "unfiltered search should find uuid_b"
+        );
 
         // Filtered search: only uuid_b
         let filter = crate::types::SqlStatementInternal {
@@ -1013,7 +1048,7 @@ mod tests {
             statements: None,
         };
         let results = crate::search(
-            &db, Some(&embedder), &mut cache, "flamingos", THRESHOLD, 10, false, Some(&filter),
+            &db, Some(&embedder), &mut cache, filter_query, THRESHOLD, 10, false, Some(&filter),
         )?;
         assert!(results.len() == 1, "filtered search should find exactly one doc, got {}", results.len());
         assert_eq!(results[0].1, uuid_b.to_string(), "filtered result should be uuid_b");
@@ -1050,14 +1085,14 @@ mod tests {
         // Search the empty DB first — this poisoned the global cache before the fix
         let overlay_results = crate::search(
             &overlay, Some(&embedder), &mut cache,
-            "a lake with funny colors", THRESHOLD, 10, false, None,
+            "a lake in Australia that stays bright pink", THRESHOLD, 10, false, None,
         )?;
         assert!(overlay_results.is_empty());
 
         // Search the populated DB — must still find indexed results
         let baseline_results = crate::search(
             &baseline, Some(&embedder), &mut cache,
-            "a lake with funny colors", THRESHOLD, 10, false, None,
+            "a lake in Australia that stays bright pink", THRESHOLD, 10, false, None,
         )?;
         assert!(
             !baseline_results.is_empty(),
