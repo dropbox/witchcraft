@@ -129,7 +129,6 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const DEFAULT_EMBEDDING_DIM: usize = 128;
-const EMBEDDING_MODEL_VARIANT: &str = "chunkkmeans-v1";
 #[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
 const DOCUMENT_CACHE_HASH_CHARS: usize = 32;
 const BUCKET_DATA_APP_ID: u32 = file_index::GENERATION_DATA_APP_ID;
@@ -162,7 +161,6 @@ pub type DocPtr = (u32, u32);
 #[derive(Clone, Copy, Debug)]
 pub struct IndexOptions {
     residual_quant_bits: u8,
-    force_flush: bool,
 }
 
 impl IndexOptions {
@@ -170,17 +168,11 @@ impl IndexOptions {
         packops::validate_residual_quant_bits(residual_quant_bits)?;
         Ok(Self {
             residual_quant_bits,
-            force_flush: false,
         })
     }
 
     pub fn residual_quant_bits(&self) -> u8 {
         self.residual_quant_bits
-    }
-
-    pub fn force_flush(mut self) -> Self {
-        self.force_flush = true;
-        self
     }
 }
 
@@ -188,7 +180,6 @@ impl Default for IndexOptions {
     fn default() -> Self {
         Self {
             residual_quant_bits: packops::DEFAULT_RESIDUAL_QUANT_BITS,
-            force_flush: false,
         }
     }
 }
@@ -234,9 +225,8 @@ fn model_id_prefix() -> &'static str {
 
 fn model_id_for_dim(dim: usize) -> String {
     let prefix = model_id_prefix();
-    let prefix = format!("{prefix}-{EMBEDDING_MODEL_VARIANT}");
     if dim == DEFAULT_EMBEDDING_DIM {
-        prefix
+        prefix.to_string()
     } else {
         format!("{prefix}-d{dim}")
     }
@@ -2811,32 +2801,7 @@ fn sample_embeddings_for_rowids(
     Ok((matrix, total_embeddings))
 }
 
-fn char_offsets_to_byte_offsets(body: &str, char_offsets: &[usize]) -> Result<Vec<usize>> {
-    let mut result = Vec::with_capacity(char_offsets.len());
-    let mut target_idx = 0usize;
-    let mut chars_seen = 0usize;
-
-    for (byte_idx, _) in body.char_indices() {
-        while target_idx < char_offsets.len() && char_offsets[target_idx] == chars_seen {
-            result.push(byte_idx);
-            target_idx += 1;
-        }
-        chars_seen += 1;
-    }
-
-    while target_idx < char_offsets.len() {
-        anyhow::ensure!(
-            char_offsets[target_idx] == chars_seen,
-            "document chunk lens exceed body length"
-        );
-        result.push(body.len());
-        target_idx += 1;
-    }
-
-    Ok(result)
-}
-
-fn token_counts_for_lens(body: &str, lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u32>> {
+fn token_counts_for_lens(lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u32>> {
     let mut lengths: Vec<usize> = lens
         .split(',')
         .filter_map(|s| s.parse::<usize>().ok())
@@ -2845,16 +2810,6 @@ fn token_counts_for_lens(body: &str, lens: &str, offsets: &[(usize, usize)]) -> 
 
     for i in 1..lengths.len() {
         lengths[i] += lengths[i - 1];
-    }
-
-    let body_char_len = body.chars().count();
-    anyhow::ensure!(
-        lengths.last().copied().unwrap_or(0) <= body_char_len,
-        "document chunk lens exceed body length"
-    );
-    let max_offset = offsets.iter().map(|(_, end)| *end).max().unwrap_or(0);
-    if body.len() != body_char_len && max_offset > body_char_len {
-        lengths = char_offsets_to_byte_offsets(body, &lengths)?;
     }
 
     let mut i = 0;
@@ -2902,62 +2857,6 @@ fn token_counts_for_lens(body: &str, lens: &str, offsets: &[(usize, usize)]) -> 
         "token counts do not cover all offsets"
     );
     Ok(counts)
-}
-
-const TOKEN_CLUSTER_KMEANS_ITERS: usize = 5;
-
-pub(crate) fn cluster_embeddings_for_counts(
-    embeddings: &Tensor,
-    counts: &[u32],
-) -> Result<(Tensor, Vec<u32>)> {
-    let (rows, cols) = embeddings.dims2()?;
-    anyhow::ensure!(
-        rows == counts.iter().map(|&count| count as usize).sum::<usize>(),
-        "token counts do not match embedding rows"
-    );
-
-    let rows_data = embeddings.to_vec2::<f32>()?;
-    let mut clustered_rows = Vec::new();
-    let mut clustered_counts = Vec::with_capacity(counts.len());
-    let mut offset = 0usize;
-    for &count in counts {
-        let count = count as usize;
-        if count == 0 {
-            clustered_counts.push(0);
-            continue;
-        }
-
-        let k = (count as f64).sqrt().ceil() as usize;
-        if k == count {
-            clustered_rows.extend_from_slice(&rows_data[offset..offset + count]);
-            clustered_counts.push(k as u32);
-            offset += count;
-            continue;
-        }
-
-        let chunk = Tensor::from_vec(
-            rows_data[offset..offset + count]
-                .iter()
-                .flatten()
-                .copied()
-                .collect::<Vec<_>>(),
-            (count, cols),
-            &Device::Cpu,
-        )?;
-        let centers = kmeans_inner(&chunk, k, TOKEN_CLUSTER_KMEANS_ITERS, None)?;
-        clustered_rows.extend(centers.to_vec2::<f32>()?);
-        clustered_counts.push(k as u32);
-        offset += count;
-    }
-
-    let clustered_count = clustered_rows.len();
-    let clustered = Tensor::from_vec(
-        clustered_rows.into_iter().flatten().collect::<Vec<_>>(),
-        (clustered_count, cols),
-        &Device::Cpu,
-    )?;
-    debug!("chunk token kmeans: {rows} -> {clustered_count} document vectors");
-    Ok((clustered, clustered_counts))
 }
 
 #[cfg(debug_assertions)]
@@ -3008,7 +2907,7 @@ pub(crate) fn compute_cached_embeddings(
     let now = std::time::Instant::now();
     let (embeddings, offsets) = embedder.embed(body)?;
     let embeddings = embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
-    let (rows, _cols) = embeddings.dims2()?;
+    let (rows, cols) = embeddings.dims2()?;
     let dt = now.elapsed().as_secs_f64();
     debug!(
         "embedder took {} ms ({} rows/s).",
@@ -3016,9 +2915,7 @@ pub(crate) fn compute_cached_embeddings(
         ((rows as f64) / dt).round()
     );
 
-    let counts = token_counts_for_lens(body, lens, &offsets)?;
-    let (embeddings, counts) = cluster_embeddings_for_counts(&embeddings, &counts)?;
-    let (rows, cols) = embeddings.dims2()?;
+    let counts = token_counts_for_lens(lens, &offsets)?;
     debug!(
         "got embedding for chunk {:?} {:?}",
         embeddings.dims2()?,
@@ -3781,6 +3678,13 @@ fn build_index_generation(
     }))
 }
 
+pub(crate) fn index_buffered_embeddings(
+    index: &FileBackedIndex,
+    cache: &dyn EmbeddingCache,
+) -> Result<()> {
+    index_buffered_embeddings_with_options(index, cache, IndexOptions::default())
+}
+
 pub(crate) fn index_buffered_embeddings_with_options(
     index: &FileBackedIndex,
     cache: &dyn EmbeddingCache,
@@ -3799,7 +3703,7 @@ pub(crate) fn index_buffered_embeddings_with_options(
         .sum();
     info!("standalone index has {} buffered embeddings ({} indexed)", x, indexed);
 
-    if x < L0_CAPACITY && !options.force_flush {
+    if x < L0_CAPACITY {
         debug!("buffering {} embeddings (< {} threshold)", x, L0_CAPACITY);
         return Ok(());
     }
@@ -3884,9 +3788,8 @@ pub fn score_query_sentences(
         Some(existing) => existing,
         None => {
             let (qe, _offsets) = embedder.embed(q)?;
-            let qe = qe.get(0)?;
-            cache.put(q, &qe);
-            qe
+
+            qe.get(0)?
         }
     };
     let mut sizes = vec![];

@@ -1,6 +1,6 @@
 use crate::{
-    match_centroids_raw, CachedEmbeddings, Embedder, EmbeddingCache, EmbeddingsCache,
-    FileBackedIndex, IndexOptions,
+    index_buffered_embeddings, match_centroids_raw, CachedEmbeddings, Embedder, EmbeddingCache,
+    EmbeddingsCache, FileBackedIndex,
 };
 #[cfg(feature = "capi-embed-cache")]
 use crate::FileEmbeddingCache;
@@ -539,11 +539,7 @@ pub unsafe extern "C" fn witchcraft_index(
             .lock()
             .map_err(|_| anyhow!("witchcraft handle lock poisoned"))?;
         let embeddings = CallbackEmbeddingSource::new(embedding_callback, user_data);
-        crate::index_buffered_embeddings_with_options(
-            &state.index,
-            &embeddings,
-            IndexOptions::default().force_flush(),
-        )
+        index_buffered_embeddings(&state.index, &embeddings)
     }));
 
     match result {
