@@ -96,6 +96,7 @@ pub fn bulk_search(
     let mut metadata_query = db.query("SELECT metadata FROM document WHERE rowid = ?1")?;
     let mut histogram = histogram::Histogram::new(10000);
     let mut embedder_histogram = histogram::Histogram::new(10000);
+    witchcraft::reset_bucket_io_counters();
 
     for result in rdr.deserialize() {
         let record: (String, String) = result?;
@@ -189,6 +190,7 @@ pub fn bulk_search(
         println!("p95 embedder latency = {} ms", embedder_histogram.p95());
     }
     println!("p95 total search latency = {} ms", histogram.p95());
+    witchcraft::log_bucket_io_counters();
     Ok(())
 }
 
@@ -240,6 +242,7 @@ fn main() -> Result<()> {
         validate_semantic_search(&db, embedder.as_ref())?;
         let q = &args[2..].join(" ");
         let use_fulltext = args[1] == "hybrid" || args[1] == "fulltext";
+        witchcraft::reset_bucket_io_counters();
         let results =
             witchcraft::search(&db, embedder.as_ref(), &mut cache, q, 0.7, 10, use_fulltext, None).unwrap();
         for (score, _metadata, bodies, sub_idx, _date) in results {
@@ -248,6 +251,7 @@ fn main() -> Result<()> {
             println!("{score}: {body} @ {sub_idx}");
             println!("=============================================");
         }
+        witchcraft::log_bucket_io_counters();
     } else if args.len() >= 4
         && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv")
     {

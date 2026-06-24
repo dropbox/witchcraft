@@ -1877,6 +1877,7 @@ struct IndexKMeansNode {
 
 #[derive(Default)]
 struct MatchIoCounters {
+    queries: usize,
     candidate_buckets: usize,
     selected_buckets: usize,
     selected_slots: usize,
@@ -1889,6 +1890,50 @@ impl MatchIoCounters {
         self.read.buckets += read.buckets;
         self.read.bytes += read.bytes;
     }
+}
+
+thread_local! {
+    static BUCKET_IO_COUNTERS: std::cell::RefCell<MatchIoCounters> =
+        std::cell::RefCell::new(MatchIoCounters::default());
+}
+
+fn record_bucket_io_counters(counters: MatchIoCounters) {
+    BUCKET_IO_COUNTERS.with(|cell| {
+        let mut total = cell.borrow_mut();
+        total.queries += counters.queries;
+        total.candidate_buckets += counters.candidate_buckets;
+        total.selected_buckets += counters.selected_buckets;
+        total.selected_slots += counters.selected_slots;
+        total.read.batches += counters.read.batches;
+        total.read.buckets += counters.read.buckets;
+        total.read.bytes += counters.read.bytes;
+    });
+}
+
+pub fn reset_bucket_io_counters() {
+    BUCKET_IO_COUNTERS.with(|cell| {
+        let _ = cell.replace(MatchIoCounters::default());
+    });
+}
+
+pub fn log_bucket_io_counters() {
+    BUCKET_IO_COUNTERS.with(|cell| {
+        let counters = cell.replace(MatchIoCounters::default());
+        if counters.queries == 0 {
+            return;
+        }
+        let q = counters.queries as f64;
+        info!(
+            "bucket io counters: queries={} avg_candidates={:.1} avg_selected_buckets={:.1} avg_selected_slots={:.1} avg_read_batches={:.1} avg_read_buckets={:.1} avg_read_mb={:.2}",
+            counters.queries,
+            counters.candidate_buckets as f64 / q,
+            counters.selected_buckets as f64 / q,
+            counters.selected_slots as f64 / q,
+            counters.read.batches as f64 / q,
+            counters.read.buckets as f64 / q,
+            counters.read.bytes as f64 / q / (1024.0 * 1024.0),
+        );
+    });
 }
 
 /// Per-generation centroid data loaded from sidecar files.
@@ -2392,7 +2437,10 @@ pub fn match_centroids_raw(
     let mut all = vec![];
     let mut count = 0;
     let mut missing = vec![0.0f32; m];
-    let mut io_counters = MatchIoCounters::default();
+    let mut io_counters = MatchIoCounters {
+        queries: 1,
+        ..MatchIoCounters::default()
+    };
 
     for gen in generations.iter() {
         if gen.sizes.is_empty() {
@@ -2515,6 +2563,7 @@ pub fn match_centroids_raw(
     }
 
     if count == 0 && unindexed.is_empty() {
+        record_bucket_io_counters(io_counters);
         return Ok(vec![]);
     }
 
@@ -2585,6 +2634,7 @@ pub fn match_centroids_raw(
     }
 
     if count == 0 {
+        record_bucket_io_counters(io_counters);
         return Ok(vec![]);
     }
 
@@ -2665,20 +2715,12 @@ pub fn match_centroids_raw(
     scored_results.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     scored_results.truncate(top_k);
 
-    info!(
-        "bucket io counters: candidates={} selected={} slots={} read_batches={} read_buckets={} read_bytes={}",
-        io_counters.candidate_buckets,
-        io_counters.selected_buckets,
-        io_counters.selected_slots,
-        io_counters.read.batches,
-        io_counters.read.buckets,
-        io_counters.read.bytes,
-    );
     debug!(
         "match_centroids_raw: {} embeddings in {} ms.",
         count,
         total_start.elapsed().as_millis()
     );
+    record_bucket_io_counters(io_counters);
     Ok(scored_results)
 }
 
