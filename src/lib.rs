@@ -225,26 +225,11 @@ fn model_id_prefix() -> &'static str {
 
 fn model_id_for_dim(dim: usize) -> String {
     let prefix = model_id_prefix();
-    let prefix = if document_token_conv_stride2() {
-        format!("{prefix}-conv2")
-    } else {
-        prefix.to_string()
-    };
     if dim == DEFAULT_EMBEDDING_DIM {
-        prefix
+        prefix.to_string()
     } else {
         format!("{prefix}-d{dim}")
     }
-}
-
-fn document_token_conv_stride2() -> bool {
-    std::env::var("WARP_DOC_TOKEN_CONV_STRIDE2")
-        .ok()
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !matches!(value.as_str(), "" | "0" | "false" | "no" | "off")
-        })
-        .unwrap_or(false)
 }
 
 pub fn default_embedding_cache_dir() -> PathBuf {
@@ -2914,67 +2899,6 @@ fn stretch_rows(a: &Tensor) -> Result<Tensor> {
     Ok(Tensor::stack(&scaled_rows, 0)?)
 }
 
-fn gaussian_stride2_document_embeddings(
-    embeddings: &Tensor,
-    counts: &[u32],
-) -> Result<(Tensor, Vec<u32>)> {
-    let (rows, cols) = embeddings.dims2()?;
-    anyhow::ensure!(
-        counts.iter().map(|c| *c as usize).sum::<usize>() == rows,
-        "document chunk counts do not match embedding rows"
-    );
-
-    let rows_vec = embeddings.to_vec2::<f32>()?;
-    let mut downsampled_rows = Vec::with_capacity((rows + 1) / 2);
-    let mut downsampled_counts = Vec::with_capacity(counts.len());
-    let mut offset = 0usize;
-
-    for &count in counts {
-        let count = count as usize;
-        let mut kept = 0u32;
-        for local_idx in (0..count).step_by(2) {
-            let row_idx = offset + local_idx;
-            let mut out = vec![0.0f32; cols];
-            for (delta, weight) in [(-1isize, 0.25f32), (0, 0.5), (1, 0.25)] {
-                let neighbor_local_idx = local_idx as isize + delta;
-                if !(0..count as isize).contains(&neighbor_local_idx) {
-                    continue;
-                }
-                let neighbor_idx = offset + neighbor_local_idx as usize;
-                for (dst, src) in out.iter_mut().zip(rows_vec[neighbor_idx].iter()) {
-                    *dst += weight * *src;
-                }
-            }
-
-            let norm = out.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 1e-12 {
-                let inv_norm = 1.0 / norm;
-                for value in &mut out {
-                    *value *= inv_norm;
-                }
-                downsampled_rows.push(out);
-            } else {
-                downsampled_rows.push(rows_vec[row_idx].clone());
-            }
-            kept += 1;
-        }
-        downsampled_counts.push(kept);
-        offset += count;
-    }
-
-    let downsampled_count = downsampled_rows.len();
-    let mut flat = Vec::with_capacity(downsampled_count * cols);
-    for row in downsampled_rows {
-        flat.extend(row);
-    }
-    let downsampled = Tensor::from_vec(flat, (downsampled_count, cols), embeddings.device())?;
-    debug!(
-        "document token gaussian stride-2 downsampled {downsampled_count}/{rows} tokens ({:.1}%)",
-        100.0 * (downsampled_count as f64) / (rows as f64)
-    );
-    Ok((downsampled, downsampled_counts))
-}
-
 pub(crate) fn compute_cached_embeddings(
     embedder: &Embedder,
     body: &str,
@@ -2982,22 +2906,16 @@ pub(crate) fn compute_cached_embeddings(
 ) -> Result<CachedEmbeddings> {
     let now = std::time::Instant::now();
     let (embeddings, offsets) = embedder.embed(body)?;
-    let mut embeddings = embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
+    let embeddings = embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
+    let (rows, cols) = embeddings.dims2()?;
     let dt = now.elapsed().as_secs_f64();
-    let (original_rows, _original_cols) = embeddings.dims2()?;
     debug!(
         "embedder took {} ms ({} rows/s).",
         now.elapsed().as_millis(),
-        ((original_rows as f64) / dt).round()
+        ((rows as f64) / dt).round()
     );
 
-    let mut counts = token_counts_for_lens(lens, &offsets)?;
-    if document_token_conv_stride2() {
-        let downsampled = gaussian_stride2_document_embeddings(&embeddings, &counts)?;
-        embeddings = downsampled.0;
-        counts = downsampled.1;
-    }
-    let (rows, cols) = embeddings.dims2()?;
+    let counts = token_counts_for_lens(lens, &offsets)?;
     debug!(
         "got embedding for chunk {:?} {:?}",
         embeddings.dims2()?,
