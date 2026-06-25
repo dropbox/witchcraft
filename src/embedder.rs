@@ -27,6 +27,13 @@ pub struct Embedder {
     model: t5_encoder::T5EncoderModel,
 }
 
+pub struct EmbeddingOutput {
+    pub embeddings: Tensor,
+    pub offsets: Vec<(usize, usize)>,
+    pub gate_scores: Option<Vec<f32>>,
+    pub tokens: Vec<String>,
+}
+
 impl Embedder {
     pub fn new(device: &Device, assets: &std::path::Path) -> Result<Self> {
         let (builder, tokenizer) = t5_encoder::T5ModelBuilder::load(assets)?;
@@ -35,14 +42,19 @@ impl Embedder {
     }
 
     pub fn embed(&self, text: &str) -> Result<(Tensor, Vec<(usize, usize)>)> {
-        let (embeddings, offsets, _) = self.embed_inner(text, false)?;
-        Ok((embeddings, offsets))
+        let output = self.embed_inner(text, false)?;
+        Ok((output.embeddings, output.offsets))
     }
 
     pub fn embed_with_gate_scores(
         &self,
         text: &str,
     ) -> Result<(Tensor, Vec<(usize, usize)>, Option<Vec<f32>>)> {
+        let output = self.embed_inner(text, true)?;
+        Ok((output.embeddings, output.offsets, output.gate_scores))
+    }
+
+    pub fn embed_with_gate_scores_and_tokens(&self, text: &str) -> Result<EmbeddingOutput> {
         self.embed_inner(text, true)
     }
 
@@ -50,7 +62,7 @@ impl Embedder {
         &self,
         text: &str,
         collect_gate_scores: bool,
-    ) -> Result<(Tensor, Vec<(usize, usize)>, Option<Vec<f32>>)> {
+    ) -> Result<EmbeddingOutput> {
         let now = std::time::Instant::now();
         let model = &self.model;
         let device = model.device();
@@ -61,6 +73,7 @@ impl Embedder {
         let encoding = self.tokenizer.encode(text, true).unwrap();
         let ids = encoding.get_ids();
         let offsets = encoding.get_offsets().to_vec();
+        let tokens = encoding.get_tokens().to_vec();
 
         let n_tokens = ids.len();
         let mut accum: Vec<Option<Tensor>> = vec![None; n_tokens];
@@ -132,12 +145,14 @@ impl Embedder {
         const MIN_NORM: f32 = 1.0;
         let mut filtered_embs = Vec::with_capacity(token_embs.len());
         let mut filtered_offsets = Vec::with_capacity(offsets.len());
+        let mut filtered_tokens = Vec::with_capacity(tokens.len());
         let mut filtered_scores = gate_scores.as_ref().map(|_| Vec::with_capacity(token_embs.len()));
         for (idx, (emb, offset)) in token_embs.into_iter().zip(offsets.into_iter()).enumerate() {
             let norm = emb.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
             if norm >= MIN_NORM {
                 filtered_embs.push(emb);
                 filtered_offsets.push(offset);
+                filtered_tokens.push(tokens[idx].clone());
                 if let Some(out) = filtered_scores.as_mut() {
                     let scores = gate_scores.as_ref().expect("gate scores missing");
                     let counts = gate_counts.as_ref().expect("gate counts missing");
@@ -158,7 +173,12 @@ impl Embedder {
             filtered_embs.len(),
             n_tokens,
         );
-        Ok((normalized, filtered_offsets, filtered_scores))
+        Ok(EmbeddingOutput {
+            embeddings: normalized,
+            offsets: filtered_offsets,
+            gate_scores: filtered_scores,
+            tokens: filtered_tokens,
+        })
     }
 
     /*

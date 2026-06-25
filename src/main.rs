@@ -40,6 +40,122 @@ struct CorpusMetaData {
     key: String,
 }
 
+#[derive(Clone)]
+struct SaliencySpan {
+    start: usize,
+    end: usize,
+    score: f32,
+    token: String,
+}
+
+fn normalized_saliency(score: f32, min_score: f32, max_score: f32) -> f32 {
+    let range = max_score - min_score;
+    if range.abs() < 1e-6 {
+        0.5
+    } else {
+        ((score - min_score) / range).clamp(0.0, 1.0)
+    }
+}
+
+fn saliency_bg(norm: f32) -> (u8, u8, u8) {
+    let norm = norm.clamp(0.0, 1.0);
+    let r = 32.0 + 223.0 * norm;
+    let g = 48.0 + 152.0 * norm;
+    let b = 72.0 * (1.0 - norm);
+    (r.round() as u8, g.round() as u8, b.round() as u8)
+}
+
+fn colorize_saliency_text(text: &str, spans: &[SaliencySpan]) -> String {
+    if spans.is_empty() {
+        return text.to_string();
+    }
+
+    let min_score = spans
+        .iter()
+        .map(|span| span.score)
+        .fold(f32::INFINITY, f32::min);
+    let max_score = spans
+        .iter()
+        .map(|span| span.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut spans = spans.to_vec();
+    spans.sort_unstable_by(|a, b| (a.start, a.end).cmp(&(b.start, b.end)));
+
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for span in spans {
+        if span.start < cursor || span.start >= span.end || span.end > text.len() {
+            continue;
+        }
+        if !text.is_char_boundary(span.start) || !text.is_char_boundary(span.end) {
+            continue;
+        }
+        out.push_str(&text[cursor..span.start]);
+        let norm = normalized_saliency(span.score, min_score, max_score);
+        let (r, g, b) = saliency_bg(norm);
+        let fg = if norm > 0.58 { "0;0;0" } else { "255;255;255" };
+        out.push_str(&format!(
+            "\x1b[48;2;{r};{g};{b}m\x1b[38;2;{fg}m{}\x1b[0m",
+            &text[span.start..span.end]
+        ));
+        cursor = span.end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn print_saliency(embedder: &witchcraft::Embedder, text: &str) -> Result<()> {
+    let output = embedder.embed_with_gate_scores_and_tokens(text)?;
+    let gate_scores = output.gate_scores.ok_or_else(|| {
+        anyhow::anyhow!("encoder assets do not expose token gate scores")
+    })?;
+    let spans: Vec<SaliencySpan> = output.offsets
+        .into_iter()
+        .zip(output.tokens.into_iter())
+        .zip(gate_scores.into_iter())
+        .filter_map(|(((start, end), token), score)| {
+            (start < end).then_some(SaliencySpan { start, end, score, token })
+        })
+        .collect();
+    if spans.is_empty() {
+        anyhow::bail!("no visible token spans to display");
+    }
+
+    let min_score = spans
+        .iter()
+        .map(|span| span.score)
+        .fold(f32::INFINITY, f32::min);
+    let max_score = spans
+        .iter()
+        .map(|span| span.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+
+    println!(
+        "gate saliency range: min={min_score:.4} max={max_score:.4} (colors are normalized per input)"
+    );
+    println!("{}", colorize_saliency_text(text, &spans));
+    println!();
+    println!("{:>3} {:>10} {:>8} {:>16} text", "#", "gate", "norm", "token");
+    for (idx, span) in spans.iter().enumerate() {
+        if span.end > text.len()
+            || !text.is_char_boundary(span.start)
+            || !text.is_char_boundary(span.end)
+        {
+            continue;
+        }
+        let text_span = text[span.start..span.end].replace('\n', "\\n");
+        let norm = normalized_saliency(span.score, min_score, max_score);
+        println!(
+            "{idx:>3} {:>10.4} {:>7.1}% {:>16?} {:?}",
+            span.score,
+            100.0 * norm,
+            span.token,
+            text_span
+        );
+    }
+    Ok(())
+}
+
 fn split_doc(body: String) -> Vec<String> {
     let max_characters = 300;
     let splitter = TextSplitter::new(max_characters);
@@ -230,6 +346,11 @@ fn main() -> Result<()> {
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_reader(db_name).unwrap();
         witchcraft::index_chunks(&db, Some(&embedder), true).unwrap();
+    } else if args.len() >= 3 && &args[1] == "saliency" {
+        let device = witchcraft::make_device();
+        let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
+        let text = args[2..].join(" ");
+        print_saliency(&embedder, &text)?;
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid" || args[1] == "fulltext") {
         let embedder = if args[1] != "fulltext" {
             let device = witchcraft::make_device();
@@ -286,7 +407,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | saliency <text> | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

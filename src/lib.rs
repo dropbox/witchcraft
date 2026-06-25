@@ -248,7 +248,7 @@ fn document_token_keep_fraction() -> Option<f64> {
 fn document_token_pruning_suffix() -> Option<String> {
     document_token_keep_fraction().map(|fraction| {
         let basis_points = (fraction * 10_000.0).round() as u32;
-        format!("gatef{basis_points:04}")
+        format!("gatebpef{basis_points:04}")
     })
 }
 
@@ -2880,7 +2880,10 @@ fn token_counts_for_lens(lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u
 }
 
 fn prune_document_embeddings_by_gate_fraction(
+    text: &str,
     embeddings: &Tensor,
+    offsets: &[(usize, usize)],
+    tokens: &[String],
     counts: &[u32],
     gate_scores: &[f32],
     keep_fraction: f64,
@@ -2890,6 +2893,16 @@ fn prune_document_embeddings_by_gate_fraction(
         rows == gate_scores.len(),
         "gate score count {} does not match embedding rows {rows}",
         gate_scores.len()
+    );
+    anyhow::ensure!(
+        rows == offsets.len(),
+        "offset count {} does not match embedding rows {rows}",
+        offsets.len()
+    );
+    anyhow::ensure!(
+        rows == tokens.len(),
+        "token count {} does not match embedding rows {rows}",
+        tokens.len()
     );
     anyhow::ensure!(
         counts.iter().map(|c| *c as usize).sum::<usize>() == rows,
@@ -2910,9 +2923,11 @@ fn prune_document_embeddings_by_gate_fraction(
     for idx in ranked {
         selected[idx] = true;
     }
+    expand_selection_to_wordpiece_groups(text, offsets, tokens, counts, &mut selected);
+    let expanded_keep = selected.iter().filter(|selected| **selected).count();
 
     let rows_vec = embeddings.to_vec2::<f32>()?;
-    let mut pruned_rows = Vec::with_capacity(keep);
+    let mut pruned_rows = Vec::with_capacity(expanded_keep);
     let mut pruned_counts = Vec::with_capacity(counts.len());
     let mut offset = 0usize;
 
@@ -2932,8 +2947,8 @@ fn prune_document_embeddings_by_gate_fraction(
 
     let pruned_count = pruned_rows.len();
     anyhow::ensure!(
-        pruned_count == keep,
-        "selected {keep} gated document tokens but retained {pruned_count}"
+        pruned_count == expanded_keep,
+        "selected {expanded_keep} grouped document tokens but retained {pruned_count}"
     );
     let mut flat = Vec::with_capacity(pruned_count * cols);
     for row in pruned_rows {
@@ -2941,10 +2956,76 @@ fn prune_document_embeddings_by_gate_fraction(
     }
     let pruned = Tensor::from_vec(flat, (pruned_count, cols), embeddings.device())?;
     debug!(
-        "document token gate pruning kept {pruned_count}/{rows} tokens ({:.1}%)",
+        "document token gate pruning seeded {keep}/{rows} tokens and kept {pruned_count}/{rows} after wordpiece expansion ({:.1}%)",
         100.0 * (pruned_count as f64) / (rows as f64)
     );
     Ok((pruned, pruned_counts))
+}
+
+fn expand_selection_to_wordpiece_groups(
+    text: &str,
+    offsets: &[(usize, usize)],
+    tokens: &[String],
+    counts: &[u32],
+    selected: &mut [bool],
+) {
+    let mut chunk_offset = 0usize;
+    for &count in counts {
+        let count = count as usize;
+        let chunk_end = chunk_offset + count;
+        let mut group_start = chunk_offset;
+        for row_idx in chunk_offset..chunk_end {
+            if row_idx > group_start
+                && starts_wordpiece_group(
+                    text,
+                    tokens[row_idx].as_str(),
+                    offsets[row_idx - 1],
+                    offsets[row_idx],
+                )
+            {
+                expand_group_if_selected(selected, group_start, row_idx);
+                group_start = row_idx;
+            }
+        }
+        expand_group_if_selected(selected, group_start, chunk_end);
+        chunk_offset = chunk_end;
+    }
+}
+
+fn starts_wordpiece_group(
+    text: &str,
+    token: &str,
+    previous: (usize, usize),
+    current: (usize, usize),
+) -> bool {
+    if token.starts_with('Ġ') || token.starts_with('▁') || token.starts_with('[') {
+        return true;
+    }
+    if current.0 >= current.1 {
+        return true;
+    }
+    if previous.0 >= previous.1 || current.0 < previous.1 {
+        return true;
+    }
+    if current.0 == previous.0 && current.1 == previous.1 {
+        return false;
+    }
+    if current.0 != previous.1 {
+        return true;
+    }
+    text.get(current.0..current.1)
+        .and_then(|span| span.chars().next())
+        .map(char::is_whitespace)
+        .unwrap_or(true)
+}
+
+fn expand_group_if_selected(selected: &mut [bool], start: usize, end: usize) {
+    if start >= end || !selected[start..end].iter().any(|selected| *selected) {
+        return;
+    }
+    for selected in &mut selected[start..end] {
+        *selected = true;
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -2994,11 +3075,12 @@ pub(crate) fn compute_cached_embeddings(
 ) -> Result<CachedEmbeddings> {
     let now = std::time::Instant::now();
     let keep_fraction = document_token_keep_fraction();
-    let (embeddings, offsets, gate_scores) = if keep_fraction.is_some() {
-        embedder.embed_with_gate_scores(body)?
+    let (embeddings, offsets, gate_scores, tokens) = if keep_fraction.is_some() {
+        let output = embedder.embed_with_gate_scores_and_tokens(body)?;
+        (output.embeddings, output.offsets, output.gate_scores, output.tokens)
     } else {
         let (embeddings, offsets) = embedder.embed(body)?;
-        (embeddings, offsets, None)
+        (embeddings, offsets, None, Vec::new())
     };
     let mut embeddings = embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
     let mut counts = token_counts_for_lens(lens, &offsets)?;
@@ -3009,7 +3091,10 @@ pub(crate) fn compute_cached_embeddings(
             )
         })?;
         let pruned = prune_document_embeddings_by_gate_fraction(
+            body,
             &embeddings,
+            &offsets,
+            &tokens,
             &counts,
             gate_scores,
             keep_fraction,
