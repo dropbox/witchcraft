@@ -65,7 +65,9 @@ mod db;
 pub use db::DB;
 
 mod embedding_cache;
-pub use embedding_cache::{CachedEmbeddings, EmbeddingCache, FileEmbeddingCache};
+pub use embedding_cache::{
+    CachedEmbeddingMetadata, CachedEmbeddings, EmbeddingCache, FileEmbeddingCache,
+};
 
 mod embedder;
 pub use embedder::Embedder;
@@ -225,16 +227,10 @@ fn model_id_prefix() -> &'static str {
 
 fn model_id_for_dim(dim: usize) -> String {
     let prefix = model_id_prefix();
-    let suffix = document_token_pruning_suffix();
-    let model = if let Some(suffix) = suffix {
-        format!("{prefix}-{suffix}")
-    } else {
-        prefix.to_string()
-    };
     if dim == DEFAULT_EMBEDDING_DIM {
-        model
+        prefix.to_string()
     } else {
-        format!("{model}-d{dim}")
+        format!("{prefix}-d{dim}")
     }
 }
 
@@ -243,13 +239,6 @@ fn document_token_keep_fraction() -> Option<f64> {
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
-}
-
-fn document_token_pruning_suffix() -> Option<String> {
-    document_token_keep_fraction().map(|fraction| {
-        let basis_points = (fraction * 10_000.0).round() as u32;
-        format!("gatebpef{basis_points:04}")
-    })
 }
 
 pub fn default_embedding_cache_dir() -> PathBuf {
@@ -268,7 +257,17 @@ fn dim_from_model_id(model: &str) -> usize {
 }
 
 fn cached_embeddings_match_current_encoder(embeddings: &CachedEmbeddings) -> bool {
-    embeddings.model == model_id_for_dim(dim_from_model_id(&embeddings.model))
+    if embeddings.model != model_id_for_dim(dim_from_model_id(&embeddings.model)) {
+        return false;
+    }
+    if document_token_keep_fraction().is_some() {
+        return embeddings
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.gate_scores.as_ref())
+            .is_some();
+    }
+    true
 }
 
 #[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
@@ -2775,8 +2774,9 @@ fn cached_embeddings_for_rowid(
     cache: &dyn EmbeddingCache,
     rowid: u64,
 ) -> Result<CachedEmbeddings> {
-    load_cached_embeddings(cache, rowid, "")?
-        .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))
+    let cached = load_cached_embeddings(cache, rowid, "")?
+        .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))?;
+    cached_embeddings_for_index(cached)
 }
 
 fn sample_embeddings_for_rowids(
@@ -2880,7 +2880,6 @@ fn token_counts_for_lens(lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u
 }
 
 fn prune_document_embeddings_by_gate_fraction(
-    text: &str,
     embeddings: &Tensor,
     offsets: &[(usize, usize)],
     tokens: &[String],
@@ -2923,7 +2922,7 @@ fn prune_document_embeddings_by_gate_fraction(
     for idx in ranked {
         selected[idx] = true;
     }
-    expand_selection_to_wordpiece_groups(text, offsets, tokens, counts, &mut selected);
+    expand_selection_to_wordpiece_groups(offsets, tokens, counts, &mut selected);
     let expanded_keep = selected.iter().filter(|selected| **selected).count();
 
     let rows_vec = embeddings.to_vec2::<f32>()?;
@@ -2963,7 +2962,6 @@ fn prune_document_embeddings_by_gate_fraction(
 }
 
 fn expand_selection_to_wordpiece_groups(
-    text: &str,
     offsets: &[(usize, usize)],
     tokens: &[String],
     counts: &[u32],
@@ -2977,7 +2975,6 @@ fn expand_selection_to_wordpiece_groups(
         for row_idx in chunk_offset..chunk_end {
             if row_idx > group_start
                 && starts_wordpiece_group(
-                    text,
                     tokens[row_idx].as_str(),
                     offsets[row_idx - 1],
                     offsets[row_idx],
@@ -2993,7 +2990,6 @@ fn expand_selection_to_wordpiece_groups(
 }
 
 fn starts_wordpiece_group(
-    text: &str,
     token: &str,
     previous: (usize, usize),
     current: (usize, usize),
@@ -3013,10 +3009,7 @@ fn starts_wordpiece_group(
     if current.0 != previous.1 {
         return true;
     }
-    text.get(current.0..current.1)
-        .and_then(|span| span.chars().next())
-        .map(char::is_whitespace)
-        .unwrap_or(true)
+    token.chars().next().map(char::is_whitespace).unwrap_or(true)
 }
 
 fn expand_group_if_selected(selected: &mut [bool], start: usize, end: usize) {
@@ -3026,6 +3019,51 @@ fn expand_group_if_selected(selected: &mut [bool], start: usize, end: usize) {
     for selected in &mut selected[start..end] {
         *selected = true;
     }
+}
+
+pub(crate) fn cached_embeddings_for_index(
+    cached: CachedEmbeddings,
+) -> Result<CachedEmbeddings> {
+    let Some(keep_fraction) = document_token_keep_fraction() else {
+        return Ok(cached);
+    };
+    let metadata = cached.metadata.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "WARP_DOC_TOKEN_KEEP_FRACTION requires cached token metadata; re-run embedding with gate-capable assets"
+        )
+    })?;
+    let gate_scores = metadata.gate_scores.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "WARP_DOC_TOKEN_KEEP_FRACTION requires token_gate tensors in ModernBERT assets"
+        )
+    })?;
+    let dim = dim_from_model_id(&cached.model);
+    let embeddings = Tensor::embeddings_from_packed(&cached.embeddings, dim, &Device::Cpu)?;
+    let counts: Vec<u32> = cached
+        .counts
+        .split(',')
+        .filter_map(|count| count.parse::<u32>().ok())
+        .collect();
+    let (pruned, pruned_counts) = prune_document_embeddings_by_gate_fraction(
+        &embeddings,
+        &metadata.offsets,
+        &metadata.tokens,
+        &counts,
+        gate_scores,
+        keep_fraction,
+    )?;
+    let (rows, cols) = pruned.dims2()?;
+    Ok(CachedEmbeddings {
+        model: model_id_for_dim(cols),
+        counts: pruned_counts
+            .iter()
+            .map(|count| count.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        embedding_count: rows,
+        embeddings: pruned.embeddings_to_packed()?,
+        metadata: None,
+    })
 }
 
 #[cfg(debug_assertions)]
@@ -3074,34 +3112,9 @@ pub(crate) fn compute_cached_embeddings(
     lens: &str,
 ) -> Result<CachedEmbeddings> {
     let now = std::time::Instant::now();
-    let keep_fraction = document_token_keep_fraction();
-    let (embeddings, offsets, gate_scores, tokens) = if keep_fraction.is_some() {
-        let output = embedder.embed_with_gate_scores_and_tokens(body)?;
-        (output.embeddings, output.offsets, output.gate_scores, output.tokens)
-    } else {
-        let (embeddings, offsets) = embedder.embed(body)?;
-        (embeddings, offsets, None, Vec::new())
-    };
-    let mut embeddings = embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
-    let mut counts = token_counts_for_lens(lens, &offsets)?;
-    if let Some(keep_fraction) = keep_fraction {
-        let gate_scores = gate_scores.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "WARP_DOC_TOKEN_KEEP_FRACTION requires token_gate tensors in ModernBERT assets"
-            )
-        })?;
-        let pruned = prune_document_embeddings_by_gate_fraction(
-            body,
-            &embeddings,
-            &offsets,
-            &tokens,
-            &counts,
-            gate_scores,
-            keep_fraction,
-        )?;
-        embeddings = pruned.0;
-        counts = pruned.1;
-    }
+    let output = embedder.embed_with_gate_scores_and_tokens(body)?;
+    let embeddings = output.embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
+    let counts = token_counts_for_lens(lens, &output.offsets)?;
     let (rows, cols) = embeddings.dims2()?;
     let dt = now.elapsed().as_secs_f64();
     debug!(
@@ -3145,6 +3158,11 @@ pub(crate) fn compute_cached_embeddings(
             .join(","),
         embedding_count: rows,
         embeddings: bytes,
+        metadata: Some(CachedEmbeddingMetadata {
+            offsets: output.offsets,
+            tokens: output.tokens,
+            gate_scores: output.gate_scores,
+        }),
     })
 }
 
@@ -3690,6 +3708,8 @@ fn write_buckets_for_rowids(
     expected_count: u64,
     residual_quant_bits: u8,
 ) -> Result<(Vec<tempfile::NamedTempFile>, CenterSidecarData, Option<Vec<f32>>)> {
+    log::info!("write_buckets_for_rowids");
+    let bar = progress::new_with_label(expected_count, "indexing");
     let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
     let mut writes_total = 0;
@@ -3708,7 +3728,6 @@ fn write_buckets_for_rowids(
         assigned_bucket_indices_for_rowids(records, cache, index_kmeans, expected_count)?;
     let center_sidecar = prepare_center_sidecar_data(&centers_cpu, bucket_indices)?;
     let residual_centers_cpu = &center_sidecar.residual_centers_cpu;
-    let bar = progress::new_with_label(expected_count, "indexing");
     let mut records = active_rowid_records(records);
     let mut residual_radius_levels = None;
     let mut attempted_radius_training = false;
@@ -3825,11 +3844,13 @@ fn build_index_generation(
     records: &[RowidRecord],
     options: IndexOptions,
 ) -> Result<Option<FileIndexGeneration>> {
+    info!("get rowid_records_embedding_count");
     let active_embeddings = rowid_records_embedding_count(records);
     if active_embeddings == 0 {
         return Ok(None);
     }
 
+    info!("get sample_embeddings_for_rowids");
     let (matrix, total_embeddings) = sample_embeddings_for_rowids(records, cache)?;
     if total_embeddings == 0 {
         return Ok(None);
@@ -3898,7 +3919,7 @@ pub(crate) fn index_buffered_embeddings_with_options(
     info!("standalone index has {} buffered embeddings ({} indexed)", x, indexed);
 
     if x < L0_CAPACITY {
-        debug!("buffering {} embeddings (< {} threshold)", x, L0_CAPACITY);
+        info!("buffering {} embeddings (< {} threshold)", x, L0_CAPACITY);
         return Ok(());
     }
 
@@ -3921,8 +3942,10 @@ pub(crate) fn index_buffered_embeddings_with_options(
     let mut inputs = vec![buffer];
     let mut stale_generations = vec![];
     let mut kept_generations = vec![];
+    info!("scan generations...");
     for generation in generations {
         if generation.level <= target_level {
+            info!("push...");
             inputs.push(index.generation_rowid_records(&generation)?);
             stale_generations.push(generation);
         } else {
@@ -3934,12 +3957,14 @@ pub(crate) fn index_buffered_embeddings_with_options(
     if kept_generations.is_empty() {
         merged.retain(|record| record.rows > 0);
     }
+    info!("build/keep generations...");
     if let Some(generation) =
         build_index_generation(index, cache, target_level, &merged, options)?
     {
         kept_generations.push(generation);
     }
     kept_generations.sort_by_key(|generation| generation.level);
+    info!("writing manifests...");
     index.write_manifest(&kept_generations)?;
     let _ = std::fs::remove_file(index.rowid_buffer_path());
     index.remove_generation_files(&stale_generations);

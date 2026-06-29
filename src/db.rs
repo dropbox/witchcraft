@@ -104,10 +104,15 @@ impl DB {
 
     fn remove_bucket_data_sidecars(db_fn: &Path) {
         let parent = Self::db_parent(db_fn);
+        let base = db_fn
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "warp.sqlite".into());
         let prefix = Self::bucket_data_prefix(db_fn);
         let rowids_prefix = Self::rowids_prefix(db_fn);
         let rowids_buffer = Self::rowids_buffer_file(db_fn);
         let manifest = Self::index_manifest_file(db_fn);
+        let pruning_prefix = format!("{base}.gatebpef");
         let old_prefix = Self::old_residuals_prefix(db_fn);
         let Ok(entries) = std::fs::read_dir(parent) else {
             return;
@@ -119,11 +124,20 @@ impl DB {
                 || name.starts_with(&rowids_prefix)
                 || name == rowids_buffer
                 || name == manifest
+                || Self::is_pruning_index_sidecar(&name, &pruning_prefix)
                 || name.starts_with(&old_prefix)
             {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
+    }
+
+    fn is_pruning_index_sidecar(name: &str, pruning_prefix: &str) -> bool {
+        name.starts_with(pruning_prefix)
+            && (name.contains(".buckets.")
+                || name.contains(".rowids.")
+                || name.ends_with(".index")
+                || name.contains(".residuals."))
     }
 
     fn old_residuals_prefix(db_fn: &Path) -> String {
@@ -194,7 +208,8 @@ impl DB {
                  model TEXT NOT NULL,
                  embeddings BLOB NOT NULL,
                  counts TEXT NOT NULL,
-                 embedding_count INTEGER NOT NULL);
+                 embedding_count INTEGER NOT NULL,
+                 metadata TEXT);
 
              CREATE TRIGGER document_after_delete AFTER DELETE ON document
              BEGIN
@@ -294,7 +309,8 @@ impl DB {
                  model TEXT NOT NULL,
                  embeddings BLOB NOT NULL,
                  counts TEXT NOT NULL,
-                 embedding_count INTEGER NOT NULL DEFAULT 0);
+                 embedding_count INTEGER NOT NULL DEFAULT 0,
+                 metadata TEXT);
 
              CREATE TRIGGER IF NOT EXISTS document_after_delete AFTER DELETE ON document
              BEGIN
@@ -315,6 +331,12 @@ impl DB {
             connection.execute_batch(
                 "ALTER TABLE chunk
                  ADD COLUMN embedding_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !Self::has_column(connection, "chunk", "metadata")? {
+            connection.execute_batch(
+                "ALTER TABLE chunk
+                 ADD COLUMN metadata TEXT;",
             )?;
         }
         Self::backfill_chunk_embedding_counts(connection)?;
@@ -414,6 +436,7 @@ impl DB {
     /// Open without integrity check — for CLI batch operations where startup
     /// latency on large databases is prohibitive.
     pub fn new_fast(db_fn: PathBuf) -> SQLResult<Self> {
+        log::info!("new fast!");
         Self::open_internal(db_fn, true)
     }
 
@@ -704,12 +727,22 @@ mod tests {
         let rowids_buffer = PathBuf::from(format!("{base}.rowids.buffer"));
         let manifest = PathBuf::from(format!("{base}.index"));
         let old_sidecar = PathBuf::from(format!("{base}.residuals.1.test"));
+        let pruning_sidecar = PathBuf::from(format!("{base}.gatebpef2500.buckets.1.test"));
+        let pruning_rowids = PathBuf::from(format!("{base}.gatebpef2500.rowids.1.test"));
+        let pruning_buffer = PathBuf::from(format!("{base}.gatebpef2500.rowids.buffer"));
+        let pruning_manifest = PathBuf::from(format!("{base}.gatebpef2500.index"));
+        let pruning_residuals = PathBuf::from(format!("{base}.gatebpef2500.residuals.1.test"));
 
         std::fs::write(&sidecar, b"bucket").unwrap();
         std::fs::write(&rowids, b"rowids").unwrap();
         std::fs::write(&rowids_buffer, b"buffer").unwrap();
         std::fs::write(&manifest, b"manifest").unwrap();
         std::fs::write(&old_sidecar, b"residual").unwrap();
+        std::fs::write(&pruning_sidecar, b"bucket").unwrap();
+        std::fs::write(&pruning_rowids, b"rowids").unwrap();
+        std::fs::write(&pruning_buffer, b"buffer").unwrap();
+        std::fs::write(&pruning_manifest, b"manifest").unwrap();
+        std::fs::write(&pruning_residuals, b"residual").unwrap();
         DB::remove_bucket_data_sidecars(&db_path);
 
         assert!(!sidecar.exists());
@@ -717,5 +750,10 @@ mod tests {
         assert!(!rowids_buffer.exists());
         assert!(!manifest.exists());
         assert!(!old_sidecar.exists());
+        assert!(!pruning_sidecar.exists());
+        assert!(!pruning_rowids.exists());
+        assert!(!pruning_buffer.exists());
+        assert!(!pruning_manifest.exists());
+        assert!(!pruning_residuals.exists());
     }
 }

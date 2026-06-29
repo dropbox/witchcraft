@@ -2,9 +2,9 @@ use crate::file_index::{sort_dedup_rowid_records, FileBackedIndex, RowidRecord};
 use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
-    clear_generations_cache, document_cache_hash, hybrid_reciprocal_rank_fusion,
-    index_buffered_embeddings_with_options, load_cached_embeddings, load_or_compute_cached_embeddings,
-    match_centroids_raw,
+    cached_embeddings_for_index, clear_generations_cache, document_cache_hash,
+    hybrid_reciprocal_rank_fusion, index_buffered_embeddings_with_options, load_cached_embeddings,
+    load_or_compute_cached_embeddings, match_centroids_raw,
     split_by_codepoints, CachedEmbeddings, DB, DocPtr, Embedder, EmbeddingCache, EmbeddingsCache,
     IndexOptions, SqlStatementInternal,
 };
@@ -27,7 +27,7 @@ impl<'a> SqliteEmbeddingCache<'a> {
 impl EmbeddingCache for SqliteEmbeddingCache<'_> {
     fn get(&self, hash: &str) -> Result<Option<CachedEmbeddings>> {
         let mut query = self.db.query(
-            "SELECT model, counts, embedding_count, embeddings
+            "SELECT model, counts, embedding_count, embeddings, metadata
              FROM chunk
              WHERE hash = ?1",
         )?;
@@ -44,6 +44,7 @@ impl EmbeddingCache for SqliteEmbeddingCache<'_> {
                         )
                     })?,
                     embeddings: row.get(3)?,
+                    metadata: cached_metadata_from_sql(row.get(4)?, 4)?,
                 })
             })
             .optional()?;
@@ -57,7 +58,7 @@ impl EmbeddingCache for SqliteEmbeddingCache<'_> {
 
         let rowid: i64 = rowid.try_into()?;
         let mut query = self.db.query(
-            "SELECT chunk.model, chunk.counts, chunk.embedding_count, chunk.embeddings
+            "SELECT chunk.model, chunk.counts, chunk.embedding_count, chunk.embeddings, chunk.metadata
              FROM document, chunk
              WHERE document.hash = chunk.hash
              AND document.rowid = ?1",
@@ -75,6 +76,7 @@ impl EmbeddingCache for SqliteEmbeddingCache<'_> {
                         )
                     })?,
                     embeddings: row.get(3)?,
+                    metadata: cached_metadata_from_sql(row.get(4)?, 4)?,
                 })
             })
             .optional()?;
@@ -82,14 +84,20 @@ impl EmbeddingCache for SqliteEmbeddingCache<'_> {
     }
 
     fn put(&self, hash: &str, embeddings: &CachedEmbeddings) -> Result<()> {
+        let metadata = embeddings
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let mut statement = self.db.query(
-            "INSERT INTO chunk(hash, model, embeddings, counts, embedding_count)
-             VALUES(?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO chunk(hash, model, embeddings, counts, embedding_count, metadata)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(hash) DO UPDATE SET
                  model = excluded.model,
                  embeddings = excluded.embeddings,
                  counts = excluded.counts,
-                 embedding_count = excluded.embedding_count",
+                 embedding_count = excluded.embedding_count,
+                 metadata = excluded.metadata",
         )?;
         statement.execute((
             hash,
@@ -97,13 +105,30 @@ impl EmbeddingCache for SqliteEmbeddingCache<'_> {
             &embeddings.embeddings,
             &embeddings.counts,
             i64::try_from(embeddings.embedding_count)?,
+            metadata,
         ))?;
         Ok(())
     }
 }
 
-/// DB-backed wrapper: loads generations and fetches buffered unindexed
-/// documents that already have cached embeddings.
+fn cached_metadata_from_sql(
+    value: Option<String>,
+    column: usize,
+) -> rusqlite::Result<Option<crate::CachedEmbeddingMetadata>> {
+    value
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })
+        })
+        .transpose()
+}
+
+/// DB-backed wrapper: searches only a query-ready semantic index.
 pub fn match_centroids(
     db: &DB,
     query_embeddings: &Tensor,
@@ -115,8 +140,7 @@ pub fn match_centroids(
     match_centroids_from_cache(db, query_embeddings, threshold, top_k, sql_filter, None, &cache)
 }
 
-/// DB-backed wrapper that can demand-populate missing buffered document
-/// embeddings through the supplied cache.
+/// Cache-backed wrapper for callers with an external embedding cache.
 pub fn match_centroids_with_cache(
     db: &DB,
     query_embeddings: &Tensor,
@@ -276,10 +300,11 @@ fn current_document_rowid_plan(
         else {
             continue;
         };
+        let indexed_embeddings = cached_embeddings_for_index(embeddings)?;
         plan.hashes.insert(rowid_u64, hash);
         plan.records.push(RowidRecord {
             rowid: rowid_u64,
-            rows: embeddings.embedding_count.try_into()?,
+            rows: indexed_embeddings.embedding_count.try_into()?,
         });
     }
     Ok(plan)
@@ -656,6 +681,7 @@ pub fn index_chunks_with_cache_and_options(
     let current = current_document_rowid_plan(db, cache, embedder)?;
     let unmaterialized = unmaterialized_embedding_count(&index, &current.records)?;
     let mut pending = pending_rowid_records(&index, &current.records)?;
+    log::info!("get queued_tombstones");
     let (queued_tombstones, queued_tombstone_rowids) = queued_document_tombstones(db)?;
     pending.extend(queued_tombstones);
     let pending = sort_dedup_rowid_records(pending);
@@ -664,6 +690,7 @@ pub fn index_chunks_with_cache_and_options(
         return Ok(());
     }
 
+    log::info!("get pending");
     for record in &pending {
         index.append_rowid_record(record.rowid, record.rows)?;
     }

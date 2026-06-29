@@ -649,6 +649,7 @@ mod tests {
                 counts: "not,a,count".to_string(),
                 embedding_count: 7,
                 embeddings: vec![],
+                metadata: None,
             },
         )?;
         cache.put(
@@ -658,6 +659,7 @@ mod tests {
                 counts: "".to_string(),
                 embedding_count: 11,
                 embeddings: vec![],
+                metadata: None,
             },
         )?;
 
