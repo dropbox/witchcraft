@@ -226,7 +226,7 @@ fn main() -> Result<()> {
     } else if args.len() == 2 && &args[1] == "reindex" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
-        let db = DB::new_fast(db_name).unwrap();
+        let db = DB::new_reader(db_name).unwrap();
         witchcraft::index_chunks(&db, Some(&embedder), true).unwrap();
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid" || args[1] == "fulltext") {
         let embedder = if args[1] != "fulltext" {
