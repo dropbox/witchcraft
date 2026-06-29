@@ -82,7 +82,7 @@ pub fn bulk_search(
     outputname: std::path::PathBuf,
     use_fulltext: bool,
 ) -> Result<()> {
-    prepare_semantic_search(db, embedder)?;
+    validate_semantic_search(db, embedder)?;
 
     let file = File::open(csvname)?;
     let mut rdr = csv::ReaderBuilder::new()
@@ -192,12 +192,12 @@ pub fn bulk_search(
     Ok(())
 }
 
-fn prepare_semantic_search(db: &DB, embedder: Option<&witchcraft::Embedder>) -> Result<()> {
-    let Some(embedder) = embedder else {
+fn validate_semantic_search(db: &DB, embedder: Option<&witchcraft::Embedder>) -> Result<()> {
+    if embedder.is_none() {
         return Ok(());
-    };
-    if witchcraft::semantic_index_needs_prepare(db)? {
-        witchcraft::index_chunks(db, Some(embedder), false)?;
+    }
+    if let Some(reason) = witchcraft::semantic_index_unavailable_reason(db)? {
+        anyhow::bail!("semantic index is not ready: {reason}; run warp-cli index or warp-cli reindex");
     }
     Ok(())
 }
@@ -236,12 +236,8 @@ fn main() -> Result<()> {
             None
         };
         let mut cache = witchcraft::EmbeddingsCache::new(1);
-        let db = if embedder.is_some() {
-            DB::new_fast(db_name).unwrap()
-        } else {
-            DB::new_reader(db_name).unwrap()
-        };
-        prepare_semantic_search(&db, embedder.as_ref())?;
+        let db = DB::new_reader(db_name).unwrap();
+        validate_semantic_search(&db, embedder.as_ref())?;
         let q = &args[2..].join(" ");
         let use_fulltext = args[1] == "hybrid" || args[1] == "fulltext";
         let results =
@@ -262,11 +258,7 @@ fn main() -> Result<()> {
         } else {
             None
         };
-        let db = if embedder.is_some() {
-            DB::new_fast(db_name).unwrap()
-        } else {
-            DB::new_reader(db_name).unwrap()
-        };
+        let db = DB::new_reader(db_name).unwrap();
         let csvname = &args[2];
         let outputname = &args[3];
         bulk_search(

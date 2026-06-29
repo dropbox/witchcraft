@@ -156,6 +156,67 @@ impl FileBackedIndex {
         Ok(generations)
     }
 
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn unavailable_reason(&self) -> Result<Option<String>> {
+        let text = match std::fs::read_to_string(&self.manifest_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let mut lines = text.lines();
+        let header = match lines.next() {
+            Some(header) => header,
+            None => {
+                return Ok(Some(format!(
+                    "empty file index manifest {}",
+                    self.manifest_path.display()
+                )))
+            }
+        };
+        if let Some(reason) = file_index_manifest_stale_reason(header) {
+            return Ok(Some(format!(
+                "file index manifest {} is stale ({reason})",
+                self.manifest_path.display()
+            )));
+        }
+
+        let mut generations = vec![];
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut parts = line.split('\t');
+            let level = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing level in file index manifest"))?
+                .parse::<u32>()?;
+            let num_embeddings = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing embedding count in file index manifest"))?
+                .parse::<usize>()?;
+            let data_file = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing generation file in file index manifest"))?
+                .to_string();
+            anyhow::ensure!(
+                parts.next().is_none(),
+                "extra fields in file index manifest"
+            );
+            generations.push(FileIndexGeneration {
+                level,
+                num_embeddings,
+                data_file,
+            });
+        }
+        generations.sort_by_key(|generation| generation.level);
+        if let Some(reason) = self.index_sidecars_stale_reason(&generations)? {
+            return Ok(Some(format!(
+                "file-backed index sidecars are stale ({reason})"
+            )));
+        }
+        Ok(None)
+    }
+
     pub(crate) fn write_manifest(&self, generations: &[FileIndexGeneration]) -> Result<()> {
         std::fs::create_dir_all(&self.parent)?;
         let tmp = unique_tmp_path(&self.manifest_path, "manifest");

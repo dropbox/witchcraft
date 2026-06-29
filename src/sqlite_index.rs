@@ -1,19 +1,16 @@
-use crate::file_index::{
-    active_rowid_records, sort_dedup_rowid_records, FileBackedIndex, RowidRecord,
-};
-use crate::packops::TensorPackOps;
+use crate::file_index::{sort_dedup_rowid_records, FileBackedIndex, RowidRecord};
 use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
-    cached_embeddings_for_rowid, clear_generations_cache, dim_from_model_id, docptrs_for_counts,
-    document_cache_hash, hybrid_reciprocal_rank_fusion, index_buffered_embeddings_with_options,
-    load_cached_embeddings, load_or_compute_cached_embeddings, match_centroids_raw,
+    clear_generations_cache, document_cache_hash, hybrid_reciprocal_rank_fusion,
+    index_buffered_embeddings_with_options, load_cached_embeddings, load_or_compute_cached_embeddings,
+    match_centroids_raw,
     split_by_codepoints, CachedEmbeddings, DB, DocPtr, Embedder, EmbeddingCache, EmbeddingsCache,
     IndexOptions, SqlStatementInternal,
 };
 use anyhow::Result;
-use candle_core::{Device, Tensor};
-use log::{debug, info, warn};
+use candle_core::Tensor;
+use log::{debug, info};
 use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 
@@ -146,22 +143,23 @@ pub(crate) fn match_centroids_from_cache(
     threshold: f32,
     top_k: usize,
     sql_filter: Option<&crate::SqlStatementInternal>,
-    embedder: Option<&Embedder>,
-    cache: &dyn EmbeddingCache,
+    _embedder: Option<&Embedder>,
+    _cache: &dyn EmbeddingCache,
 ) -> Result<Vec<(f32, u32, u32)>> {
     let index = index_for_db(db);
+    if let Some(reason) = semantic_index_unavailable_reason(db)? {
+        anyhow::bail!(
+            "semantic index is not ready: {reason}; run warp-cli index or warp-cli reindex"
+        );
+    }
     let generation_files = index.generation_files()?;
-    let buffered = index.buffered_rowid_records()?;
-    let unindexed = if !buffered.is_empty() {
-        let plan = document_rowid_plan_for_records(db, &buffered, cache, embedder)?;
-        let source = DocumentEmbeddingSource::new(cache, plan.hashes);
-        unindexed_embeddings_for_rowids(&plan.records, &source)?
-    } else {
-        vec![]
-    };
 
     let scored_results = match_centroids_raw(
-        &generation_files, query_embeddings, &unindexed, threshold, top_k,
+        &generation_files,
+        query_embeddings,
+        &[],
+        threshold,
+        top_k,
     )?;
 
     match sql_filter {
@@ -211,9 +209,28 @@ fn index_for_db(db: &DB) -> FileBackedIndex {
     FileBackedIndex::new(db.path().clone())
 }
 
-pub fn semantic_index_needs_prepare(db: &DB) -> Result<bool> {
+pub fn semantic_index_unavailable_reason(db: &DB) -> Result<Option<String>> {
     let index = index_for_db(db);
-    Ok(index.generation_files()?.is_empty() && index.buffered_rowid_records()?.is_empty())
+    if let Some(reason) = index.unavailable_reason()? {
+        return Ok(Some(reason));
+    }
+    if !index.buffered_rowid_records()?.is_empty() {
+        return Ok(Some(
+            "semantic index has buffered unindexed rowids".to_string(),
+        ));
+    }
+    if !index.generation_files()?.is_empty() {
+        return Ok(None);
+    }
+    let has_documents = db.query("SELECT 1 FROM document WHERE length(body) > 0 LIMIT 1")?
+        .query_row((), |_| Ok(()))
+        .optional()?
+        .is_some();
+    if has_documents {
+        Ok(Some("semantic index is missing".to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 struct DocumentRowidPlan {
@@ -264,51 +281,6 @@ fn current_document_rowid_plan(
             rowid: rowid_u64,
             rows: embeddings.embedding_count.try_into()?,
         });
-    }
-    Ok(plan)
-}
-
-fn document_rowid_plan_for_records(
-    db: &DB,
-    records: &[RowidRecord],
-    cache: &dyn EmbeddingCache,
-    embedder: Option<&Embedder>,
-) -> Result<DocumentRowidPlan> {
-    let mut query = db.query(
-        "SELECT hash, body, lens FROM document
-         WHERE rowid = ?1 AND length(body) > 0",
-    )?;
-
-    let mut plan = DocumentRowidPlan::new();
-    for record in active_rowid_records(records) {
-        let rowid: i64 = record.rowid.try_into()?;
-        let row = query
-            .query_row((rowid,), |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .optional()?;
-        let Some((hash, body, lens)) = row else {
-            continue;
-        };
-        let hash = hash.unwrap_or_else(|| document_cache_hash(&body, &lens));
-        let Some(embeddings) =
-            cached_embeddings_for_document(cache, embedder, record.rowid, &hash, &body, &lens)?
-        else {
-            continue;
-        };
-        anyhow::ensure!(
-            embeddings.embedding_count == record.rows as usize,
-            "rowid {} catalog says {} vectors but embedding blob has {}",
-            record.rowid,
-            record.rows,
-            embeddings.embedding_count
-        );
-        plan.hashes.insert(record.rowid, hash);
-        plan.records.push(record);
     }
     Ok(plan)
 }
@@ -525,39 +497,6 @@ fn unmaterialized_embedding_count(
     Ok(count)
 }
 
-fn unindexed_embeddings_for_rowids(
-    records: &[RowidRecord],
-    cache: &dyn EmbeddingCache,
-) -> Result<Vec<(Vec<DocPtr>, Tensor)>> {
-    let mut unindexed = vec![];
-    for record in active_rowid_records(records) {
-        let cached = cached_embeddings_for_rowid(cache, record.rowid)?;
-        anyhow::ensure!(
-            cached.embedding_count == record.rows as usize,
-            "rowid {} catalog says {} vectors but embedding blob has {}",
-            record.rowid,
-            record.rows,
-            cached.embedding_count
-        );
-        let embeddings = Tensor::embeddings_from_packed(
-            &cached.embeddings,
-            dim_from_model_id(&cached.model),
-            &Device::Cpu,
-        )?;
-        let id: u32 = record.rowid.try_into()?;
-        let indices = docptrs_for_counts(id, &cached.counts);
-        anyhow::ensure!(
-            indices.len() == cached.embedding_count,
-            "rowid {} has {} embedding rows but {} document indices",
-            record.rowid,
-            cached.embedding_count,
-            indices.len()
-        );
-        unindexed.push((indices, embeddings));
-    }
-    Ok(unindexed)
-}
-
 pub fn embed_chunks_with_cache(
     db: &DB,
     embedder: &Embedder,
@@ -772,7 +711,7 @@ pub fn search(
                 }
             };
             let embedding_cache = SqliteEmbeddingCache::new(db);
-            match match_centroids_with_cache(
+            match_centroids_with_cache(
                 db,
                 &qe,
                 threshold,
@@ -780,13 +719,7 @@ pub fn search(
                 sql_filter,
                 embedder,
                 &embedding_cache,
-            ) {
-                Ok(result) => result,
-                Err(v) => {
-                    warn!("match_centroids failed {v}");
-                    vec![]
-                }
-            }
+            )?
         } else {
             vec![]
         }

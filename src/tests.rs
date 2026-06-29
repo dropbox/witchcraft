@@ -683,31 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stale_index_prepare_does_not_full_scan_on_search() -> anyhow::Result<()> {
-        struct NoLookupCache;
-
-        impl EmbeddingCache for NoLookupCache {
-            fn get(&self, hash: &str) -> anyhow::Result<Option<crate::CachedEmbeddings>> {
-                anyhow::bail!("unexpected embedding cache lookup for {hash}")
-            }
-
-            fn get_for_document(
-                &self,
-                rowid: u64,
-                _hash: &str,
-            ) -> anyhow::Result<Option<crate::CachedEmbeddings>> {
-                anyhow::bail!("unexpected document embedding cache lookup for rowid {rowid}")
-            }
-
-            fn put(
-                &self,
-                _hash: &str,
-                _embeddings: &crate::CachedEmbeddings,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
-
+    fn test_semantic_index_readiness_reports_stale_and_missing_indexes() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("stale.sqlite");
         let mut db = DB::new(path.clone())?;
@@ -736,24 +712,23 @@ mod tests {
             ),
         )?;
 
+        let reason = crate::semantic_index_unavailable_reason(&db)?.unwrap();
+        assert!(reason.contains("stale"));
+        assert!(dir.path().join(data_file).exists());
         let query = Tensor::from_vec(
             vec![0.0f32; crate::DEFAULT_EMBEDDING_DIM],
             (1, crate::DEFAULT_EMBEDDING_DIM),
             &Device::Cpu,
         )?;
-        assert!(crate::semantic_index_needs_prepare(&db)?);
-        assert!(!dir.path().join(data_file).exists());
+        let err = crate::match_centroids(&db, &query, 0.0, 10, None).unwrap_err();
+        assert!(err.to_string().contains("not ready"));
 
-        let results = crate::sqlite_index::match_centroids_from_cache(
-            &db,
-            &query,
-            0.0,
-            10,
-            None,
-            None,
-            &NoLookupCache,
-        )?;
-        assert!(results.is_empty());
+        let missing_path = dir.path().join("missing.sqlite");
+        let mut missing_db = DB::new(missing_path)?;
+        let missing_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"missing-index");
+        missing_db.add_doc(None, &missing_uuid, None, "{}", "missing semantic index", None)?;
+        let reason = crate::semantic_index_unavailable_reason(&missing_db)?.unwrap();
+        assert!(reason.contains("missing"));
         Ok(())
     }
 
