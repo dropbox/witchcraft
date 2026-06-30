@@ -156,6 +156,14 @@ const INDEX_BATCH_SIZE: usize = 0x10000;
 const INDEX_TARGET_BUCKET_VECTORS: usize = INDEX_BATCH_SIZE / INDEX_KMEANS_BRANCHING;
 const BUCKET_READ_COALESCE_GAP_BYTES: usize = 16 * 1024;
 
+#[cfg(any(test, feature = "deterministic"))]
+fn kmeans_seed() -> u64 {
+    std::env::var("WARP_KMEANS_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(42)
+}
+
 /// A document pointer combining document ID and sub-chunk index
 /// Allows precise location of results within subdivided documents
 pub type DocPtr = (u32, u32);
@@ -533,7 +541,7 @@ fn kmeans_inner(
     let device = data.device();
 
     #[cfg(any(test, feature = "deterministic"))]
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(kmeans_seed());
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let centroid_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
@@ -2444,8 +2452,16 @@ pub fn match_centroids_raw(
     let generations = load_generations(generation_files, device)?;
     let total_start = std::time::Instant::now();
 
-    let k = 32;
-    let t_prime = 40000;
+    let k = std::env::var("WARP_QUERY_BUCKETS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(128);
+    let t_prime = std::env::var("WARP_QUERY_T_PRIME")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(80_000);
     let device = query_embeddings.device();
     let (m, query_dim) = query_embeddings.dims2()?;
 
@@ -2785,7 +2801,7 @@ fn sample_embeddings_for_rowids(
 ) -> Result<(Tensor, usize)> {
     let mut total_embeddings = 0;
     #[cfg(any(test, feature = "deterministic"))]
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(kmeans_seed());
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
