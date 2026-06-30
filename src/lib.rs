@@ -110,7 +110,8 @@ mod sqlite_index;
 #[cfg(feature = "sqlite")]
 pub use sqlite_index::{
     count_unindexed_cached_embeddings, count_unindexed_embeddings,
-    count_unindexed_embeddings_with_cache, embed_chunks, embed_chunks_with_cache, fulltext_search,
+    count_unindexed_embeddings_with_cache, embed_chunks, embed_chunks_with_cache,
+    exact_match_centroids_bulk, fulltext_search,
     index_chunks, index_chunks_with_cache, index_chunks_with_cache_and_options,
     index_chunks_with_options, match_centroids, match_centroids_with_cache, search,
     search_cached_rowids_with_cache, search_rowids, semantic_index_unavailable_reason,
@@ -257,7 +258,7 @@ pub fn default_embedding_cache() -> FileEmbeddingCache {
     FileEmbeddingCache::new(default_embedding_cache_dir())
 }
 
-fn dim_from_model_id(model: &str) -> usize {
+pub(crate) fn dim_from_model_id(model: &str) -> usize {
     model
         .rsplit_once("-d")
         .and_then(|(_, dim)| dim.parse::<usize>().ok())

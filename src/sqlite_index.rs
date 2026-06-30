@@ -1,15 +1,16 @@
 use crate::file_index::{sort_dedup_rowid_records, FileBackedIndex, RowidRecord};
+use crate::packops::TensorPackOps;
 use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
     cached_embeddings_for_index, clear_generations_cache, document_cache_hash,
-    hybrid_reciprocal_rank_fusion, index_buffered_embeddings_with_options, load_cached_embeddings,
-    load_or_compute_cached_embeddings, match_centroids_raw,
+    dim_from_model_id, hybrid_reciprocal_rank_fusion, index_buffered_embeddings_with_options,
+    load_cached_embeddings, load_or_compute_cached_embeddings, match_centroids_raw,
     split_by_codepoints, CachedEmbeddings, DB, DocPtr, Embedder, EmbeddingCache, EmbeddingsCache,
     IndexOptions, SqlStatementInternal,
 };
 use anyhow::Result;
-use candle_core::Tensor;
+use candle_core::{Device, Tensor};
 use log::{debug, info};
 use rusqlite::OptionalExtension;
 use std::collections::HashMap;
@@ -138,6 +139,104 @@ pub fn match_centroids(
 ) -> Result<Vec<(f32, u32, u32)>> {
     let cache = SqliteEmbeddingCache::new(db);
     match_centroids_from_cache(db, query_embeddings, threshold, top_k, sql_filter, None, &cache)
+}
+
+fn docptrs_for_cached_counts(rowid: u32, counts: &str) -> Vec<DocPtr> {
+    let mut ptrs = Vec::new();
+    for (sub_idx, count) in counts
+        .split(',')
+        .filter_map(|count| count.parse::<u32>().ok())
+        .enumerate()
+    {
+        for _ in 0..count {
+            ptrs.push((rowid, sub_idx as u32));
+        }
+    }
+    ptrs
+}
+
+fn flush_exact_batch(
+    query_embeddings: &[Tensor],
+    ptrs: &mut Vec<DocPtr>,
+    tensors: &mut Vec<Tensor>,
+    rows: &mut usize,
+    top_k: usize,
+    out: &mut [Vec<(f32, u32, u32)>],
+) -> Result<()> {
+    if *rows == 0 {
+        return Ok(());
+    }
+    let matrix = Tensor::cat(tensors, 0)?;
+    let ptrs = std::mem::take(ptrs);
+    for (query_idx, query) in query_embeddings.iter().enumerate() {
+        let unindexed = vec![(ptrs.clone(), matrix.clone())];
+        let mut batch = match_centroids_raw(&[], query, &unindexed, f32::NEG_INFINITY, top_k)?;
+        out[query_idx].append(&mut batch);
+        out[query_idx].sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        out[query_idx].truncate(top_k);
+    }
+    tensors.clear();
+    *rows = 0;
+    Ok(())
+}
+
+pub fn exact_match_centroids_bulk(
+    db: &DB,
+    query_embeddings: &[Tensor],
+    top_k: usize,
+) -> Result<Vec<Vec<(f32, u32, u32)>>> {
+    const EXACT_BATCH_ROWS: usize = 200_000;
+
+    let cache = SqliteEmbeddingCache::new(db);
+    let mut query = db.query(
+        "SELECT rowid, hash FROM document
+         WHERE length(body) > 0
+         ORDER BY rowid",
+    )?;
+    let documents = query.query_map((), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+
+    let mut ptrs = Vec::new();
+    let mut tensors = Vec::new();
+    let mut rows = 0usize;
+    let mut out = vec![Vec::new(); query_embeddings.len()];
+
+    for document in documents {
+        let (rowid, hash) = document?;
+        let rowid_u64: u64 = rowid.try_into()?;
+        let rowid_u32: u32 = rowid.try_into()?;
+        let Some(cached) = cache.get_for_document(rowid_u64, hash.as_deref().unwrap_or(""))? else {
+            continue;
+        };
+        let cached = cached_embeddings_for_index(cached)?;
+        if cached.embedding_count == 0 {
+            continue;
+        }
+        let docptrs = docptrs_for_cached_counts(rowid_u32, &cached.counts);
+        anyhow::ensure!(
+            docptrs.len() == cached.embedding_count,
+            "rowid {rowid} has {} docptrs but {} embeddings",
+            docptrs.len(),
+            cached.embedding_count
+        );
+        let embeddings = Tensor::embeddings_from_packed(
+            &cached.embeddings,
+            dim_from_model_id(&cached.model),
+            &Device::Cpu,
+        )?;
+        rows += cached.embedding_count;
+        ptrs.extend(docptrs);
+        tensors.push(embeddings);
+        if rows >= EXACT_BATCH_ROWS {
+            flush_exact_batch(query_embeddings, &mut ptrs, &mut tensors, &mut rows, top_k, &mut out)?;
+        }
+    }
+    flush_exact_batch(query_embeddings, &mut ptrs, &mut tensors, &mut rows, top_k, &mut out)?;
+    Ok(out)
 }
 
 /// Cache-backed wrapper for callers with an external embedding cache.

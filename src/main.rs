@@ -310,6 +310,52 @@ pub fn bulk_search(
     Ok(())
 }
 
+pub fn bulk_exact_search(
+    db: &DB,
+    embedder: &witchcraft::Embedder,
+    csvname: std::path::PathBuf,
+    outputname: std::path::PathBuf,
+) -> Result<()> {
+    let file = File::open(csvname)?;
+    let mut rdr = csv::ReaderBuilder::new()
+        .delimiter(b'\t')
+        .has_headers(false)
+        .from_reader(file);
+
+    let mut records = Vec::new();
+    let mut queries = Vec::new();
+    let mut embedder_histogram = histogram::Histogram::new(10000);
+    for result in rdr.deserialize() {
+        let record: (String, String) = result?;
+        let now = std::time::Instant::now();
+        let (qe, _offsets) = embedder.embed(&record.1)?;
+        let qe = qe.get(0)?;
+        embedder_histogram.record(now.elapsed().as_millis() as u32);
+        records.push(record);
+        queries.push(qe);
+    }
+
+    let now = std::time::Instant::now();
+    let results = witchcraft::exact_match_centroids_bulk(db, &queries, 100)?;
+    println!("exact search took {} ms.", now.elapsed().as_millis());
+
+    let file = File::create(outputname).unwrap();
+    let mut writer = BufWriter::new(file);
+    let mut metadata_query = db.query("SELECT metadata FROM document WHERE rowid = ?1")?;
+    for ((key, _question), matches) in records.iter().zip(results.iter()) {
+        write!(writer, "{}\t", key).unwrap();
+        for (_score, idx, _sub_idx) in matches {
+            let metadata = metadata_query.query_row((*idx,), |row| row.get::<_, String>(0))?;
+            let data: CorpusMetaData = serde_json::from_str(&metadata)?;
+            write!(writer, "{},", data.key).unwrap();
+        }
+        writeln!(writer).unwrap();
+    }
+    writer.flush().unwrap();
+    println!("p95 embedder latency = {} ms", embedder_histogram.p95());
+    Ok(())
+}
+
 fn validate_semantic_search(db: &DB, embedder: Option<&witchcraft::Embedder>) -> Result<()> {
     if embedder.is_none() {
         return Ok(());
@@ -374,7 +420,7 @@ fn main() -> Result<()> {
         }
         witchcraft::log_bucket_io_counters();
     } else if args.len() >= 4
-        && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv")
+        && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv" || args[1] == "exactcsv")
     {
         let use_fulltext = args[1] == "hybridcsv" || args[1] == "fulltextcsv";
         let embedder = if args[1] != "fulltextcsv" {
@@ -386,13 +432,17 @@ fn main() -> Result<()> {
         let db = DB::new_reader(db_name).unwrap();
         let csvname = &args[2];
         let outputname = &args[3];
-        bulk_search(
-            &db,
-            embedder.as_ref(),
-            csvname.into(),
-            outputname.into(),
-            use_fulltext,
-        )?;
+        if args[1] == "exactcsv" {
+            bulk_exact_search(&db, embedder.as_ref().unwrap(), csvname.into(), outputname.into())?;
+        } else {
+            bulk_search(
+                &db,
+                embedder.as_ref(),
+                csvname.into(),
+                outputname.into(),
+                use_fulltext,
+            )?;
+        }
     } else if args.len() >= 4 && &args[1] == "score" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
@@ -407,7 +457,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | saliency <text> | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | saliency <text> | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }
