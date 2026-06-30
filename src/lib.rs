@@ -2847,9 +2847,18 @@ fn cached_embeddings_for_rowid(
     cache: &dyn EmbeddingCache,
     rowid: u64,
 ) -> Result<CachedEmbeddings> {
+    let (cached, _) = cached_embeddings_for_rowid_with_original_count(cache, rowid)?;
+    Ok(cached)
+}
+
+fn cached_embeddings_for_rowid_with_original_count(
+    cache: &dyn EmbeddingCache,
+    rowid: u64,
+) -> Result<(CachedEmbeddings, usize)> {
     let cached = load_cached_embeddings(cache, rowid, "")?
         .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))?;
-    cached_embeddings_for_index(cached)
+    let original_count = cached.embedding_count;
+    Ok((cached_embeddings_for_index(cached)?, original_count))
 }
 
 fn sample_embeddings_for_rowids(
@@ -2857,6 +2866,7 @@ fn sample_embeddings_for_rowids(
     cache: &dyn EmbeddingCache,
 ) -> Result<(Tensor, Option<Vec<f32>>, usize)> {
     let mut total_embeddings = 0;
+    let mut total_original_embeddings = 0usize;
     #[cfg(any(test, feature = "deterministic"))]
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     #[cfg(not(any(test, feature = "deterministic")))]
@@ -2866,7 +2876,9 @@ fn sample_embeddings_for_rowids(
     let mut saw_salience = false;
 
     for record in active_rowid_records(records) {
-        let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
+        let (embeddings, original_embedding_count) =
+            cached_embeddings_for_rowid_with_original_count(cache, record.rowid)?;
+        total_original_embeddings += original_embedding_count;
         let gate_scores = embeddings
             .metadata
             .as_ref()
@@ -2901,6 +2913,23 @@ fn sample_embeddings_for_rowids(
         total_embeddings += m;
     }
 
+    if let Some(requested_keep_fraction) = document_token_keep_fraction() {
+        if total_original_embeddings > 0 {
+            let actual_keep_fraction = total_embeddings as f64 / total_original_embeddings as f64;
+            let actual_sparsity = 1.0 - actual_keep_fraction;
+            let expansion = actual_keep_fraction / requested_keep_fraction;
+            info!(
+                "document token pruning requested keep {:.1}% but retained {}/{} tokens ({:.1}% keep, {:.1}% sparse) after wordpiece expansion; expansion factor {:.3}x",
+                100.0 * requested_keep_fraction,
+                total_embeddings,
+                total_original_embeddings,
+                100.0 * actual_keep_fraction,
+                100.0 * actual_sparsity,
+                expansion
+            );
+        }
+    }
+
     if all_embeddings.is_empty() {
         return Ok((
             Tensor::zeros(&[0, DEFAULT_EMBEDDING_DIM], DType::F32, &Device::Cpu)?,
@@ -2909,7 +2938,8 @@ fn sample_embeddings_for_rowids(
         ));
     }
     let matrix = Tensor::stack(&all_embeddings, 0)?;
-    let weights = all_weights.filter(|weights| saw_salience && weights.len() == all_embeddings.len());
+    let weights =
+        all_weights.filter(|weights| saw_salience && weights.len() == all_embeddings.len());
     Ok((matrix, weights, total_embeddings))
 }
 
