@@ -1,5 +1,6 @@
 use log::{debug, info, warn};
 use once_cell::sync::Lazy;
+use rand::RngExt;
 #[cfg(any(test, feature = "deterministic"))]
 use rand::SeedableRng;
 #[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
@@ -163,6 +164,49 @@ fn kmeans_seed() -> u64 {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(42)
+}
+
+fn kmeans_salience_enabled() -> bool {
+    std::env::var("WARP_KMEANS_SALIENCE")
+        .ok()
+        .is_some_and(|value| value != "0")
+}
+
+fn gate_score_to_kmeans_weight(score: f32) -> f32 {
+    if !score.is_finite() {
+        return 1.0;
+    }
+    (1.0 / (1.0 + (-score).exp())).max(1e-3)
+}
+
+fn weighted_center_indices<R: RngExt + ?Sized>(
+    weights: &[f32],
+    k: usize,
+    rng: &mut R,
+) -> Option<Vec<u32>> {
+    if weights.is_empty() || k == 0 {
+        return Some(vec![]);
+    }
+    if k > weights.len() {
+        return None;
+    }
+
+    let mut keyed = Vec::with_capacity(weights.len());
+    for (idx, &weight) in weights.iter().enumerate() {
+        let weight = weight.max(0.0);
+        if !weight.is_finite() || weight == 0.0 {
+            continue;
+        }
+        let u: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
+        keyed.push((u.ln() / weight as f64, idx));
+    }
+    if keyed.len() < k {
+        return None;
+    }
+
+    keyed.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    keyed.truncate(k);
+    Some(keyed.into_iter().map(|(_, idx)| idx as u32).collect())
 }
 
 /// A document pointer combining document ID and sub-chunk index
@@ -512,18 +556,30 @@ fn matmul_top2_batched(
 
 fn kmeans_inner(
     data: &Tensor,
+    weights: Option<&[f32]>,
     k: usize,
     max_iter: usize,
     bar: Option<&progress::Bar>,
 ) -> Result<Tensor> {
     let (m, n) = data.dims2()?;
     debug!("kmeans k={} m={} n={}...", k, m, n);
+    if let Some(weights) = weights {
+        anyhow::ensure!(
+            weights.len() == m,
+            "kmeans received {} salience weights for {m} rows",
+            weights.len()
+        );
+    }
     if k == 1 {
         let data_flat = data.flatten_all()?.to_vec1::<f32>()?;
         let mut center = vec![0f32; n];
-        for row in data_flat.chunks_exact(n) {
+        for (row_idx, row) in data_flat.chunks_exact(n).enumerate() {
+            let weight = weights
+                .map(|weights| weights[row_idx])
+                .filter(|weight| weight.is_finite() && *weight > 0.0)
+                .unwrap_or(1.0);
             for (dst, value) in center.iter_mut().zip(row) {
-                *dst += value;
+                *dst += value * weight;
             }
         }
         let norm: f32 = center.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -545,8 +601,15 @@ fn kmeans_inner(
     let mut rng = rand::rngs::StdRng::seed_from_u64(kmeans_seed());
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
-    let centroid_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
-    let centroid_idx: Vec<u32> = centroid_idx.iter().map(|&i| i as u32).collect();
+    let weighted_centroid_idx =
+        weights.and_then(|weights| weighted_center_indices(weights, k, &mut rng));
+    let centroid_idx: Vec<u32> = weighted_centroid_idx.clone().unwrap_or_else(|| {
+        rand::seq::index::sample(&mut rng, m, k)
+            .into_vec()
+            .iter()
+            .map(|&i| i as u32)
+            .collect()
+    });
 
     let centroid_idx_tensor = Tensor::from_slice(centroid_idx.as_slice(), (k,), device)?;
     //let centroid_idx_tensor = centroid_idx_tensor.to_device(device)?;
@@ -563,14 +626,18 @@ fn kmeans_inner(
         // Single O(m × n) pass: accumulate per-cluster sums directly into a
         // flat Vec<f32>, avoiding O(k × m) scans and k separate tensor ops.
         let mut sums = vec![0f32; k * n];
-        let mut counts = vec![0u32; k];
+        let mut weight_sums = vec![0f32; k];
         for (j, &c) in assignments.iter().enumerate() {
             let c = c as usize;
-            counts[c] += 1;
+            let weight = weights
+                .map(|weights| weights[j])
+                .filter(|weight| weight.is_finite() && *weight > 0.0)
+                .unwrap_or(1.0);
+            weight_sums[c] += weight;
             let src = &data_flat[j * n..(j + 1) * n];
             let dst = &mut sums[c * n..(c + 1) * n];
             for (d, s) in dst.iter_mut().zip(src) {
-                *d += s;
+                *d += s * weight;
             }
         }
 
@@ -580,10 +647,14 @@ fn kmeans_inner(
             let src = &sums[i * n..(i + 1) * n];
             let dst = &mut centers_flat[i * n..(i + 1) * n];
             let (emb, owned);
-            if counts[i] > 0 {
+            if weight_sums[i] > 0.0 {
                 emb = src;
             } else {
-                let idx = rand::seq::index::sample(&mut rng, m, 1).into_vec()[0];
+                let idx = weighted_centroid_idx
+                    .as_ref()
+                    .and_then(|indices| indices.get(i % indices.len()))
+                    .map(|idx| *idx as usize)
+                    .unwrap_or_else(|| rand::seq::index::sample(&mut rng, m, 1).into_vec()[0]);
                 owned = data_flat[idx * n..(idx + 1) * n].to_vec();
                 emb = &owned;
             }
@@ -605,7 +676,7 @@ fn kmeans_inner(
 fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
     let total = if k == 1 { 1 } else { max_iter * k };
     let bar = progress::new_with_label(total as u64, "kmeans");
-    let centers = kmeans_inner(data, k, max_iter, Some(&bar))?;
+    let centers = kmeans_inner(data, None, k, max_iter, Some(&bar))?;
     bar.finish();
     Ok(centers)
 }
@@ -2799,16 +2870,22 @@ fn cached_embeddings_for_rowid(
 fn sample_embeddings_for_rowids(
     records: &[RowidRecord],
     cache: &dyn EmbeddingCache,
-) -> Result<(Tensor, usize)> {
+) -> Result<(Tensor, Option<Vec<f32>>, usize)> {
     let mut total_embeddings = 0;
     #[cfg(any(test, feature = "deterministic"))]
     let mut rng = rand::rngs::StdRng::seed_from_u64(kmeans_seed());
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
+    let mut all_weights = kmeans_salience_enabled().then(Vec::new);
+    let mut saw_salience = false;
 
     for record in active_rowid_records(records) {
         let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
+        let gate_scores = embeddings
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.gate_scores.as_ref());
         anyhow::ensure!(
             embeddings.embedding_count == record.rows as usize,
             "rowid {} catalog says {} vectors but embedding blob has {}",
@@ -2827,15 +2904,28 @@ fn sample_embeddings_for_rowids(
         for i in subset_idx {
             let row = t.get(i)?;
             all_embeddings.push(row);
+            if let Some(weights) = all_weights.as_mut() {
+                let weight = gate_scores
+                    .filter(|scores| scores.len() == m)
+                    .map(|scores| gate_score_to_kmeans_weight(scores[i]))
+                    .unwrap_or(1.0);
+                saw_salience |= gate_scores.is_some_and(|scores| scores.len() == m);
+                weights.push(weight);
+            }
         }
         total_embeddings += m;
     }
 
     if all_embeddings.is_empty() {
-        return Ok((Tensor::zeros(&[0, DEFAULT_EMBEDDING_DIM], DType::F32, &Device::Cpu)?, 0));
+        return Ok((
+            Tensor::zeros(&[0, DEFAULT_EMBEDDING_DIM], DType::F32, &Device::Cpu)?,
+            None,
+            0,
+        ));
     }
     let matrix = Tensor::stack(&all_embeddings, 0)?;
-    Ok((matrix, total_embeddings))
+    let weights = all_weights.filter(|weights| saw_salience && weights.len() == all_embeddings.len());
+    Ok((matrix, weights, total_embeddings))
 }
 
 fn token_counts_for_lens(lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u32>> {
@@ -2896,6 +2986,14 @@ fn token_counts_for_lens(lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u
     Ok(counts)
 }
 
+struct PrunedDocumentEmbeddings {
+    embeddings: Tensor,
+    counts: Vec<u32>,
+    offsets: Vec<(usize, usize)>,
+    tokens: Vec<String>,
+    gate_scores: Vec<f32>,
+}
+
 fn prune_document_embeddings_by_gate_fraction(
     embeddings: &Tensor,
     offsets: &[(usize, usize)],
@@ -2903,7 +3001,7 @@ fn prune_document_embeddings_by_gate_fraction(
     counts: &[u32],
     gate_scores: &[f32],
     keep_fraction: f64,
-) -> Result<(Tensor, Vec<u32>)> {
+) -> Result<PrunedDocumentEmbeddings> {
     let (rows, cols) = embeddings.dims2()?;
     anyhow::ensure!(
         rows == gate_scores.len(),
@@ -2945,6 +3043,9 @@ fn prune_document_embeddings_by_gate_fraction(
     let rows_vec = embeddings.to_vec2::<f32>()?;
     let mut pruned_rows = Vec::with_capacity(expanded_keep);
     let mut pruned_counts = Vec::with_capacity(counts.len());
+    let mut pruned_offsets = Vec::with_capacity(expanded_keep);
+    let mut pruned_tokens = Vec::with_capacity(expanded_keep);
+    let mut pruned_gate_scores = Vec::with_capacity(expanded_keep);
     let mut offset = 0usize;
 
     for &count in counts {
@@ -2954,6 +3055,9 @@ fn prune_document_embeddings_by_gate_fraction(
             let row_idx = offset + local_idx;
             if selected[row_idx] {
                 pruned_rows.push(rows_vec[row_idx].clone());
+                pruned_offsets.push(offsets[row_idx]);
+                pruned_tokens.push(tokens[row_idx].clone());
+                pruned_gate_scores.push(gate_scores[row_idx]);
                 kept += 1;
             }
         }
@@ -2975,7 +3079,13 @@ fn prune_document_embeddings_by_gate_fraction(
         "document token gate pruning seeded {keep}/{rows} tokens and kept {pruned_count}/{rows} after wordpiece expansion ({:.1}%)",
         100.0 * (pruned_count as f64) / (rows as f64)
     );
-    Ok((pruned, pruned_counts))
+    Ok(PrunedDocumentEmbeddings {
+        embeddings: pruned,
+        counts: pruned_counts,
+        offsets: pruned_offsets,
+        tokens: pruned_tokens,
+        gate_scores: pruned_gate_scores,
+    })
 }
 
 fn expand_selection_to_wordpiece_groups(
@@ -3061,7 +3171,7 @@ pub(crate) fn cached_embeddings_for_index(
         .split(',')
         .filter_map(|count| count.parse::<u32>().ok())
         .collect();
-    let (pruned, pruned_counts) = prune_document_embeddings_by_gate_fraction(
+    let pruned = prune_document_embeddings_by_gate_fraction(
         &embeddings,
         &metadata.offsets,
         &metadata.tokens,
@@ -3069,17 +3179,22 @@ pub(crate) fn cached_embeddings_for_index(
         gate_scores,
         keep_fraction,
     )?;
-    let (rows, cols) = pruned.dims2()?;
+    let (rows, cols) = pruned.embeddings.dims2()?;
     Ok(CachedEmbeddings {
         model: model_id_for_dim(cols),
-        counts: pruned_counts
+        counts: pruned
+            .counts
             .iter()
             .map(|count| count.to_string())
             .collect::<Vec<_>>()
             .join(","),
         embedding_count: rows,
-        embeddings: pruned.embeddings_to_packed()?,
-        metadata: None,
+        embeddings: pruned.embeddings.embeddings_to_packed()?,
+        metadata: Some(CachedEmbeddingMetadata {
+            offsets: pruned.offsets,
+            tokens: pruned.tokens,
+            gate_scores: Some(pruned.gate_scores),
+        }),
     })
 }
 
@@ -3211,13 +3326,35 @@ fn sample_centers(data: &Tensor, k: usize) -> Result<Tensor> {
     Ok(data.index_select(&index_tensor, 0)?)
 }
 
-fn allocate_child_kmeans_targets(counts: &[usize], target_k: usize) -> Vec<usize> {
+fn allocate_child_kmeans_targets(
+    counts: &[usize],
+    masses: Option<&[f32]>,
+    target_k: usize,
+) -> Vec<usize> {
     let total: usize = counts.iter().sum();
     if total == 0 || target_k == 0 {
         return vec![0; counts.len()];
     }
 
     let target_k = target_k.min(total);
+    let use_masses = masses.filter(|masses| {
+        masses.len() == counts.len()
+            && masses
+                .iter()
+                .zip(counts)
+                .any(|(&mass, &count)| count > 0 && mass.is_finite() && mass > 0.0)
+    });
+    let total_basis = use_masses
+        .map(|masses| {
+            masses
+                .iter()
+                .zip(counts)
+                .filter(|&(_, &count)| count > 0)
+                .map(|(&mass, _)| mass.max(0.0) as f64)
+                .sum::<f64>()
+        })
+        .filter(|total| *total > 0.0)
+        .unwrap_or(total as f64);
     let mut child_ks = vec![0usize; counts.len()];
     let mut remainders = Vec::new();
     let mut assigned = 0usize;
@@ -3226,7 +3363,10 @@ fn allocate_child_kmeans_targets(counts: &[usize], target_k: usize) -> Vec<usize
         if count == 0 {
             continue;
         }
-        let exact = (count as f64 / total as f64) * target_k as f64;
+        let basis = use_masses
+            .map(|masses| masses[idx].max(0.0) as f64)
+            .unwrap_or(count as f64);
+        let exact = (basis / total_basis) * target_k as f64;
         let base = (exact.floor() as usize).max(1).min(count);
         child_ks[idx] = base;
         assigned += base;
@@ -3283,6 +3423,7 @@ fn select_tensor_rows(data: &Tensor, rows: &[u32]) -> Result<Tensor> {
 
 fn hierarchical_kmeans_for_index(
     data: &Tensor,
+    weights: Option<&[f32]>,
     target_k: usize,
     max_iter: usize,
     bar: Option<&progress::Bar>,
@@ -3293,7 +3434,7 @@ fn hierarchical_kmeans_for_index(
     anyhow::ensure!(target_k > 0, "cannot build index kmeans with zero centers");
 
     if target_k <= INDEX_KMEANS_BRANCHING || m <= INDEX_KMEANS_BRANCHING {
-        let centers = kmeans_inner(data, target_k, max_iter, None)?;
+        let centers = kmeans_inner(data, weights, target_k, max_iter, None)?;
         let packed_centers = fast_ops::PackedRight::new(&centers)?;
         let leaf_offset = *next_leaf_offset;
         *next_leaf_offset += target_k;
@@ -3311,17 +3452,28 @@ fn hierarchical_kmeans_for_index(
     }
 
     let branch_k = INDEX_KMEANS_BRANCHING.min(target_k).min(m);
-    let coarse = kmeans_inner(data, branch_k, max_iter, None)?;
+    let coarse = kmeans_inner(data, weights, branch_k, max_iter, None)?;
     let packed = fast_ops::PackedRight::new(&coarse)?;
     let assignments = matmul_argmax_batched(data, &packed, KMEANS_MATMUL_BATCH)?
         .to_device(&Device::Cpu)?
         .to_vec1::<u32>()?;
 
     let mut row_groups = vec![Vec::<u32>::new(); branch_k];
+    let mut weight_groups = weights.map(|_| vec![Vec::<f32>::new(); branch_k]);
     for (row, &child) in assignments.iter().enumerate() {
-        row_groups[child as usize].push(row as u32);
+        let child = child as usize;
+        row_groups[child].push(row as u32);
+        if let (Some(weights), Some(weight_groups)) = (weights, weight_groups.as_mut()) {
+            weight_groups[child].push(weights[row]);
+        }
     }
     let counts: Vec<usize> = row_groups.iter().map(Vec::len).collect();
+    let masses: Option<Vec<f32>> = weight_groups.as_ref().map(|groups| {
+        groups
+            .iter()
+            .map(|group| group.iter().copied().sum::<f32>())
+            .collect()
+    });
     let active_children = counts.iter().filter(|&&count| count > 0).count();
     if active_children <= 1 {
         let centers = sample_centers(data, target_k)?;
@@ -3341,7 +3493,7 @@ fn hierarchical_kmeans_for_index(
         });
     }
 
-    let child_targets = allocate_child_kmeans_targets(&counts, target_k);
+    let child_targets = allocate_child_kmeans_targets(&counts, masses.as_deref(), target_k);
     let mut routing_centers = Vec::new();
     let mut child_nodes = Vec::new();
     let mut child_centers = Vec::new();
@@ -3353,8 +3505,12 @@ fn hierarchical_kmeans_for_index(
         }
 
         let child_data = select_tensor_rows(data, &row_groups[child_idx])?;
+        let child_weights = weight_groups
+            .as_ref()
+            .map(|groups| groups[child_idx].as_slice());
         let child = hierarchical_kmeans_for_index(
             &child_data,
+            child_weights,
             child_target,
             max_iter,
             bar,
@@ -3377,7 +3533,11 @@ fn hierarchical_kmeans_for_index(
     })
 }
 
-fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<IndexKMeans> {
+fn run_kmeans_for_index(
+    matrix: &Tensor,
+    weights: Option<&[f32]>,
+    total_embeddings: usize,
+) -> Result<IndexKMeans> {
     let now = std::time::Instant::now();
     let sqrt_k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
     let size_k = total_embeddings.div_ceil(INDEX_TARGET_BUCKET_VECTORS);
@@ -3395,6 +3555,7 @@ fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Inde
     let mut next_leaf_offset = 0;
     let centers = hierarchical_kmeans_for_index(
         matrix,
+        weights,
         k,
         INDEX_KMEANS_ITERATIONS,
         Some(&bar),
@@ -3868,7 +4029,7 @@ fn build_index_generation(
     }
 
     info!("get sample_embeddings_for_rowids");
-    let (matrix, total_embeddings) = sample_embeddings_for_rowids(records, cache)?;
+    let (matrix, weights, total_embeddings) = sample_embeddings_for_rowids(records, cache)?;
     if total_embeddings == 0 {
         return Ok(None);
     }
@@ -3877,7 +4038,7 @@ fn build_index_generation(
         "building standalone L{} with {} embeddings",
         level, total_embeddings
     );
-    let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
+    let centers = run_kmeans_for_index(&matrix, weights.as_deref(), total_embeddings)?;
     drop(matrix);
 
     let data_file = index.generation_file_name(level);
