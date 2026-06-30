@@ -159,13 +159,6 @@ const INDEX_TARGET_BUCKET_VECTORS: usize = INDEX_BATCH_SIZE / INDEX_KMEANS_BRANC
 const BUCKET_READ_COALESCE_GAP_BYTES: usize = 16 * 1024;
 
 #[cfg(any(test, feature = "deterministic"))]
-fn kmeans_seed() -> u64 {
-    std::env::var("WARP_KMEANS_SEED")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(42)
-}
-
 fn kmeans_salience_enabled() -> bool {
     std::env::var("WARP_KMEANS_SALIENCE")
         .ok()
