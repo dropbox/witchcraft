@@ -598,7 +598,7 @@ fn kmeans_inner(
     let device = data.device();
 
     #[cfg(any(test, feature = "deterministic"))]
-    let mut rng = rand::rngs::StdRng::seed_from_u64(kmeans_seed());
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let weighted_centroid_idx =
@@ -2524,16 +2524,8 @@ pub fn match_centroids_raw(
     let generations = load_generations(generation_files, device)?;
     let total_start = std::time::Instant::now();
 
-    let k = std::env::var("WARP_QUERY_BUCKETS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(128);
-    let t_prime = std::env::var("WARP_QUERY_T_PRIME")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(80_000);
+    let k = 32;
+    let t_prime = 40000;
     let device = query_embeddings.device();
     let (m, query_dim) = query_embeddings.dims2()?;
 
@@ -2873,7 +2865,7 @@ fn sample_embeddings_for_rowids(
 ) -> Result<(Tensor, Option<Vec<f32>>, usize)> {
     let mut total_embeddings = 0;
     #[cfg(any(test, feature = "deterministic"))]
-    let mut rng = rand::rngs::StdRng::seed_from_u64(kmeans_seed());
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
