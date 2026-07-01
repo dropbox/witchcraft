@@ -123,17 +123,12 @@ modernbert-assets: | assets
 	@test -f assets/modernbert-tokenizer.json || (echo "missing assets/modernbert-tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
 	@test -f assets/modernbert.safetensors || (echo "missing assets/modernbert.safetensors; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
 
-modernbert-quantized-assets: | assets
+assets/modernbert.gguf: assets/modernbert.safetensors | assets prereqs
+	cargo run -p quantize --release -- assets/modernbert.safetensors assets/modernbert.gguf
+
+modernbert-quantized-assets: assets/modernbert.gguf | assets
 	@test -f assets/modernbert-config.json || (echo "missing assets/modernbert-config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
 	@test -f assets/modernbert-tokenizer.json || (echo "missing assets/modernbert-tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
-	@if [ ! -f assets/modernbert.gguf ]; then \
-		if [ -f assets/modernbert.safetensors ]; then \
-			cargo run -p quantize --release -- assets/modernbert.safetensors assets/modernbert.gguf; \
-		else \
-			echo "missing assets/modernbert.gguf; run scripts/export_modernbert.py <checkpoint> assets, then make ENCODER=modernbert-quantized" >&2; \
-			exit 1; \
-		fi; \
-	fi
 
 assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml: | prereqs
 	$(PYTHON_BIN) quantize-openvino.py
