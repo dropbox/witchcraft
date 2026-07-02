@@ -600,6 +600,7 @@ pub unsafe extern "C" fn witchcraft_search(
         let scored = match_centroids_raw(
             &generation_files,
             &qe.to_device(device)?,
+            None,
             &[],
             threshold,
             top_k,

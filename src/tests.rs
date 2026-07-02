@@ -277,7 +277,7 @@ mod tests {
         )?;
         let unindexed = vec![(vec![(1, 0), (1, 1)], embeddings)];
 
-        let results = crate::match_centroids_raw(&[], &query, &unindexed, 0.0, 10)?;
+        let results = crate::match_centroids_raw(&[], &query, None, &unindexed, 0.0, 10)?;
 
         assert!(results[0].0 > 0.94);
         assert_eq!(results[0].1, 1);

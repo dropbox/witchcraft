@@ -4,10 +4,11 @@ use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
     cached_embeddings_for_index, clear_generations_cache, document_cache_hash,
-    dim_from_model_id, hybrid_reciprocal_rank_fusion, index_buffered_embeddings_with_options,
-    load_cached_embeddings, load_or_compute_cached_embeddings, match_centroids_raw,
-    split_by_codepoints, CachedEmbeddings, DB, DocPtr, Embedder, EmbeddingCache, EmbeddingsCache,
-    IndexOptions, SqlStatementInternal,
+    dim_from_model_id, embed_query_for_search, hybrid_reciprocal_rank_fusion,
+    index_buffered_embeddings_with_options, load_cached_embeddings, load_or_compute_cached_embeddings,
+    match_centroids_raw, query_token_salience_enabled, split_by_codepoints, CachedEmbeddings, DB,
+    DocPtr, Embedder, EmbeddingCache, EmbeddingsCache, IndexOptions, QueryEmbeddings,
+    SqlStatementInternal,
 };
 use anyhow::Result;
 use candle_core::{Device, Tensor};
@@ -137,8 +138,28 @@ pub fn match_centroids(
     top_k: usize,
     sql_filter: Option<&crate::SqlStatementInternal>,
 ) -> Result<Vec<(f32, u32, u32)>> {
+    match_centroids_with_query_weights(db, query_embeddings, None, threshold, top_k, sql_filter)
+}
+
+pub fn match_centroids_with_query_weights(
+    db: &DB,
+    query_embeddings: &Tensor,
+    query_weights: Option<&[f32]>,
+    threshold: f32,
+    top_k: usize,
+    sql_filter: Option<&crate::SqlStatementInternal>,
+) -> Result<Vec<(f32, u32, u32)>> {
     let cache = SqliteEmbeddingCache::new(db);
-    match_centroids_from_cache(db, query_embeddings, threshold, top_k, sql_filter, None, &cache)
+    match_centroids_from_cache(
+        db,
+        query_embeddings,
+        query_weights,
+        threshold,
+        top_k,
+        sql_filter,
+        None,
+        &cache,
+    )
 }
 
 fn docptrs_for_cached_counts(rowid: u32, counts: &str) -> Vec<DocPtr> {
@@ -170,7 +191,7 @@ fn flush_exact_batch(
     let ptrs = std::mem::take(ptrs);
     for (query_idx, query) in query_embeddings.iter().enumerate() {
         let unindexed = vec![(ptrs.clone(), matrix.clone())];
-        let mut batch = match_centroids_raw(&[], query, &unindexed, f32::NEG_INFINITY, top_k)?;
+        let mut batch = match_centroids_raw(&[], query, None, &unindexed, f32::NEG_INFINITY, top_k)?;
         out[query_idx].append(&mut batch);
         out[query_idx].sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         out[query_idx].truncate(top_k);
@@ -178,6 +199,30 @@ fn flush_exact_batch(
     tensors.clear();
     *rows = 0;
     Ok(())
+}
+
+fn query_embeddings_for_search(
+    embedder: &Embedder,
+    cache: &mut EmbeddingsCache,
+    q: &str,
+) -> Result<QueryEmbeddings> {
+    if query_token_salience_enabled() {
+        return embed_query_for_search(embedder, q);
+    }
+
+    let embeddings = match cache.get(&q.to_string()) {
+        Some(existing) => existing,
+        None => {
+            let (embeddings, _) = embedder.embed(q)?;
+            let embeddings = embeddings.get(0)?;
+            cache.put(&q.to_string(), &embeddings);
+            embeddings
+        }
+    };
+    Ok(QueryEmbeddings {
+        embeddings,
+        weights: None,
+    })
 }
 
 pub fn exact_match_centroids_bulk(
@@ -252,6 +297,7 @@ pub fn match_centroids_with_cache(
     match_centroids_from_cache(
         db,
         query_embeddings,
+        None,
         threshold,
         top_k,
         sql_filter,
@@ -263,6 +309,7 @@ pub fn match_centroids_with_cache(
 pub(crate) fn match_centroids_from_cache(
     db: &DB,
     query_embeddings: &Tensor,
+    query_weights: Option<&[f32]>,
     threshold: f32,
     top_k: usize,
     sql_filter: Option<&crate::SqlStatementInternal>,
@@ -280,6 +327,7 @@ pub(crate) fn match_centroids_from_cache(
     let scored_results = match_centroids_raw(
         &generation_files,
         query_embeddings,
+        query_weights,
         &[],
         threshold,
         top_k,
@@ -827,23 +875,16 @@ pub fn search(
 
     let sem_matches = if let Some(embedder) = embedder {
         if q.len() > 3 {
-            let qe = match cache.get(&q) {
-                Some(existing) => existing,
-                None => {
-                    let (qe, _) = embedder.embed(&q)?;
-                    let qe = qe.get(0)?;
-                    cache.put(&q, &qe);
-                    qe
-                }
-            };
+            let qe = query_embeddings_for_search(embedder, cache, &q)?;
             let embedding_cache = SqliteEmbeddingCache::new(db);
-            match_centroids_with_cache(
+            match_centroids_from_cache(
                 db,
-                &qe,
+                &qe.embeddings,
+                qe.weights.as_deref(),
                 threshold,
                 top_k,
                 sql_filter,
-                embedder,
+                Some(embedder),
                 &embedding_cache,
             )?
         } else {
@@ -1001,35 +1042,36 @@ fn search_rowids_inner(
     };
 
     let sem_matches = if q.len() > 3 {
-        let qe = match cache.get(&q) {
-            Some(existing) => existing,
-            None => {
-                let (qe, _) = embedder.embed(&q)?;
-                let qe = qe.get(0)?;
-                cache.put(&q, &qe);
-                qe
-            }
-        };
+        let qe = query_embeddings_for_search(embedder, cache, &q)?;
         match (embedding_cache, compute_missing_embeddings) {
-            (Some(embedding_cache), true) => match_centroids_with_cache(
+            (Some(embedding_cache), true) => match_centroids_from_cache(
                 db,
-                &qe,
+                &qe.embeddings,
+                qe.weights.as_deref(),
                 threshold,
                 top_k,
                 sql_filter,
-                embedder,
+                Some(embedder),
                 embedding_cache,
             )?,
             (Some(embedding_cache), false) => match_centroids_from_cache(
                 db,
-                &qe,
+                &qe.embeddings,
+                qe.weights.as_deref(),
                 threshold,
                 top_k,
                 sql_filter,
                 None,
                 embedding_cache,
             )?,
-            (None, _) => match_centroids(db, &qe, threshold, top_k, sql_filter)?,
+            (None, _) => match_centroids_with_query_weights(
+                db,
+                &qe.embeddings,
+                qe.weights.as_deref(),
+                threshold,
+                top_k,
+                sql_filter,
+            )?,
         }
     } else {
         vec![]

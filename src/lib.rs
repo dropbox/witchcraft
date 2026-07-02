@@ -114,8 +114,9 @@ pub use sqlite_index::{
     count_unindexed_embeddings_with_cache, embed_chunks, embed_chunks_with_cache,
     exact_match_centroids_bulk, fulltext_search,
     index_chunks, index_chunks_with_cache, index_chunks_with_cache_and_options,
-    index_chunks_with_options, match_centroids, match_centroids_with_cache, search,
-    search_cached_rowids_with_cache, search_rowids, semantic_index_unavailable_reason,
+    index_chunks_with_options, match_centroids, match_centroids_with_cache,
+    match_centroids_with_query_weights, search, search_cached_rowids_with_cache, search_rowids,
+    semantic_index_unavailable_reason,
 };
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) use sqlite_index::fts5_query;
@@ -158,7 +159,6 @@ const INDEX_BATCH_SIZE: usize = 0x10000;
 const INDEX_TARGET_BUCKET_VECTORS: usize = INDEX_BATCH_SIZE / INDEX_KMEANS_BRANCHING;
 const BUCKET_READ_COALESCE_GAP_BYTES: usize = 16 * 1024;
 
-#[cfg(any(test, feature = "deterministic"))]
 fn kmeans_salience_enabled() -> bool {
     std::env::var("WARP_KMEANS_SALIENCE")
         .ok()
@@ -285,6 +285,68 @@ fn document_token_keep_fraction() -> Option<f64> {
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
+}
+
+fn document_token_wordpiece_expansion_enabled() -> bool {
+    !matches!(
+        std::env::var("WARP_DOC_TOKEN_WORDPIECE_EXPANSION").as_deref(),
+        Ok("0") | Ok("false") | Ok("False") | Ok("FALSE") | Ok("off") | Ok("OFF")
+    )
+}
+
+pub fn query_token_salience_enabled() -> bool {
+    matches!(
+        std::env::var("WARP_QUERY_TOKEN_SALIENCE").as_deref(),
+        Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("on") | Ok("ON")
+    )
+}
+
+fn sigmoid(value: f32) -> f32 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exp = value.exp();
+        exp / (1.0 + exp)
+    }
+}
+
+fn query_weights_from_gate_scores(gate_scores: Vec<f32>) -> Vec<f32> {
+    gate_scores
+        .into_iter()
+        .map(|score| {
+            let weight = sigmoid(score);
+            if weight.is_finite() {
+                weight
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+pub struct QueryEmbeddings {
+    pub embeddings: Tensor,
+    pub weights: Option<Vec<f32>>,
+}
+
+pub fn embed_query_for_search(embedder: &Embedder, text: &str) -> Result<QueryEmbeddings> {
+    if query_token_salience_enabled() {
+        let output = embedder.embed_with_gate_scores_and_tokens(text)?;
+        let weights = output
+            .gate_scores
+            .map(query_weights_from_gate_scores)
+            .ok_or_else(|| anyhow::anyhow!("WARP_QUERY_TOKEN_SALIENCE requires token_gate tensors in ModernBERT assets"))?;
+        Ok(QueryEmbeddings {
+            embeddings: output.embeddings.get(0)?,
+            weights: Some(weights),
+        })
+    } else {
+        let (embeddings, _) = embedder.embed(text)?;
+        Ok(QueryEmbeddings {
+            embeddings: embeddings.get(0)?,
+            weights: None,
+        })
+    }
 }
 
 pub fn default_embedding_cache_dir() -> PathBuf {
@@ -2506,9 +2568,52 @@ pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<Ge
 /// Pure index search: scores query embeddings against generation sidecar files.
 /// No database access — loads generation metadata and reads bucket payloads from sidecar files.
 /// `unindexed` contains (doc_rowid, embeddings) for documents not yet in any generation.
+struct QueryScoreWeights<'a> {
+    weights: Option<&'a [f32]>,
+    scaler: f32,
+}
+
+impl<'a> QueryScoreWeights<'a> {
+    fn new(token_count: usize, weights: Option<&'a [f32]>) -> Result<Self> {
+        if let Some(weights) = weights {
+            anyhow::ensure!(
+                weights.len() == token_count,
+                "query weight count {} does not match query token count {token_count}",
+                weights.len()
+            );
+            let sum: f32 = weights.iter().copied().sum();
+            if sum.is_finite() && sum > 0.0 {
+                return Ok(Self {
+                    weights: Some(weights),
+                    scaler: 1.0 / sum,
+                });
+            }
+        }
+        Ok(Self {
+            weights: None,
+            scaler: 1.0 / token_count as f32,
+        })
+    }
+
+    fn score(&self, values: &[f32]) -> f32 {
+        match self.weights {
+            Some(weights) => {
+                self.scaler
+                    * values
+                        .iter()
+                        .zip(weights.iter())
+                        .map(|(value, weight)| value * weight)
+                        .sum::<f32>()
+            }
+            None => self.scaler * values.iter().copied().sum::<f32>(),
+        }
+    }
+}
+
 pub fn match_centroids_raw(
     generation_files: &[PathBuf],
     query_embeddings: &Tensor,
+    query_weights: Option<&[f32]>,
     unindexed: &[(Vec<DocPtr>, Tensor)],
     threshold: f32,
     top_k: usize,
@@ -2732,7 +2837,8 @@ pub fn match_centroids_raw(
 
     let missing_similarities = missing;
 
-    let missing_score: f32 = missing_similarities.iter().sum::<f32>() / m as f32;
+    let query_score_weights = QueryScoreWeights::new(m, query_weights)?;
+    let missing_score: f32 = query_score_weights.score(&missing_similarities);
     let cutoff = if missing_score > threshold {
         missing_score
     } else {
@@ -2757,7 +2863,6 @@ pub fn match_centroids_raw(
     let mut prev_idx = 0u32;
     let mut prev_sub_idx = 0u32;
 
-    let scaler = 1.0f32 / n as f32;
     for i in 0.. {
 
         let is_beyond_end = i == all.len();
@@ -2772,7 +2877,7 @@ pub fn match_centroids_raw(
             let sub_idx_change = idx_change || prev_sub_idx != sub_idx;
 
             if sub_idx_change {
-                let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
+                let sub_score = query_score_weights.score(&sub_scores);
                 if sub_score > best_sub_score {
                     best_sub_score = sub_score;
                     best_sub_idx = prev_sub_idx;
@@ -2781,7 +2886,7 @@ pub fn match_centroids_raw(
                 sub_scores.copy_from_slice(&missing_similarities);
             }
             if idx_change {
-                let doc_score = scaler * (doc_scores.iter().copied().sum::<f32>());
+                let doc_score = query_score_weights.score(&doc_scores);
                 if doc_score > cutoff {
                     scored_results.push((doc_score, prev_idx, best_sub_idx));
                 }
@@ -2919,12 +3024,13 @@ fn sample_embeddings_for_rowids(
             let actual_sparsity = 1.0 - actual_keep_fraction;
             let expansion = actual_keep_fraction / requested_keep_fraction;
             info!(
-                "document token pruning requested keep {:.1}% but retained {}/{} tokens ({:.1}% keep, {:.1}% sparse) after wordpiece expansion; expansion factor {:.3}x",
+                "document token pruning requested keep {:.1}% but retained {}/{} tokens ({:.1}% keep, {:.1}% sparse); wordpiece expansion={}; expansion factor {:.3}x",
                 100.0 * requested_keep_fraction,
                 total_embeddings,
                 total_original_embeddings,
                 100.0 * actual_keep_fraction,
                 100.0 * actual_sparsity,
+                document_token_wordpiece_expansion_enabled(),
                 expansion
             );
         }
@@ -3052,7 +3158,10 @@ fn prune_document_embeddings_by_gate_fraction(
     for idx in ranked {
         selected[idx] = true;
     }
-    expand_selection_to_wordpiece_groups(offsets, tokens, counts, &mut selected);
+    let wordpiece_expansion = document_token_wordpiece_expansion_enabled();
+    if wordpiece_expansion {
+        expand_selection_to_wordpiece_groups(offsets, tokens, counts, &mut selected);
+    }
     let expanded_keep = selected.iter().filter(|selected| **selected).count();
 
     let rows_vec = embeddings.to_vec2::<f32>()?;
@@ -3091,7 +3200,8 @@ fn prune_document_embeddings_by_gate_fraction(
     }
     let pruned = Tensor::from_vec(flat, (pruned_count, cols), embeddings.device())?;
     debug!(
-        "document token gate pruning seeded {keep}/{rows} tokens and kept {pruned_count}/{rows} after wordpiece expansion ({:.1}%)",
+        "document token gate pruning seeded {keep}/{rows} tokens and kept {pruned_count}/{rows} after wordpiece expansion={} ({:.1}%)",
+        wordpiece_expansion,
         100.0 * (pruned_count as f64) / (rows as f64)
     );
     Ok(PrunedDocumentEmbeddings {

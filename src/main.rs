@@ -237,15 +237,15 @@ pub fn bulk_search(
 
         let sem_matches = if let Some(embedder) = embedder {
             let now = std::time::Instant::now();
-            let (qe, _offsets) = embedder.embed(&question)?;
-            let qe = qe.get(0)?;
+            let qe = witchcraft::embed_query_for_search(embedder, &question)?;
             let embedder_latency_ms = now.elapsed().as_millis() as u32;
             embedder_histogram.record(embedder_latency_ms);
 
             let match_start = std::time::Instant::now();
-            let matches = witchcraft::match_centroids(
+            let matches = witchcraft::match_centroids_with_query_weights(
                 db,
-                &qe,
+                &qe.embeddings,
+                qe.weights.as_deref(),
                 0.0,
                 top_k,
                 None,
