@@ -272,32 +272,30 @@ fn model_id_prefix() -> &'static str {
 }
 
 fn model_id_for_dim(dim: usize) -> String {
-    let prefix = model_id_prefix();
+    let prefix = format!(
+        "{}-p{:03}",
+        model_id_prefix(),
+        (document_token_keep_fraction() * 100.0).round() as usize
+    );
     if dim == DEFAULT_EMBEDDING_DIM {
-        prefix.to_string()
+        prefix
     } else {
         format!("{prefix}-d{dim}")
     }
 }
 
-fn document_token_keep_fraction() -> Option<f64> {
+fn document_token_keep_fraction() -> f64 {
     std::env::var("WARP_DOC_TOKEN_KEEP_FRACTION")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
-}
-
-fn document_token_wordpiece_expansion_enabled() -> bool {
-    !matches!(
-        std::env::var("WARP_DOC_TOKEN_WORDPIECE_EXPANSION").as_deref(),
-        Ok("0") | Ok("false") | Ok("False") | Ok("FALSE") | Ok("off") | Ok("OFF")
-    )
+        .unwrap_or(0.25)
 }
 
 pub fn query_token_salience_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("WARP_QUERY_TOKEN_SALIENCE").as_deref(),
-        Ok("1") | Ok("true") | Ok("True") | Ok("TRUE") | Ok("on") | Ok("ON")
+        Ok("0") | Ok("false") | Ok("False") | Ok("FALSE") | Ok("off") | Ok("OFF")
     )
 }
 
@@ -365,17 +363,7 @@ pub(crate) fn dim_from_model_id(model: &str) -> usize {
 }
 
 fn cached_embeddings_match_current_encoder(embeddings: &CachedEmbeddings) -> bool {
-    if embeddings.model != model_id_for_dim(dim_from_model_id(&embeddings.model)) {
-        return false;
-    }
-    if document_token_keep_fraction().is_some() {
-        return embeddings
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.gate_scores.as_ref())
-            .is_some();
-    }
-    true
+    embeddings.model == model_id_for_dim(dim_from_model_id(&embeddings.model))
 }
 
 #[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
@@ -2952,18 +2940,9 @@ fn cached_embeddings_for_rowid(
     cache: &dyn EmbeddingCache,
     rowid: u64,
 ) -> Result<CachedEmbeddings> {
-    let (cached, _) = cached_embeddings_for_rowid_with_original_count(cache, rowid)?;
-    Ok(cached)
-}
-
-fn cached_embeddings_for_rowid_with_original_count(
-    cache: &dyn EmbeddingCache,
-    rowid: u64,
-) -> Result<(CachedEmbeddings, usize)> {
     let cached = load_cached_embeddings(cache, rowid, "")?
         .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))?;
-    let original_count = cached.embedding_count;
-    Ok((cached_embeddings_for_index(cached)?, original_count))
+    cached_embeddings_for_index(cached)
 }
 
 fn sample_embeddings_for_rowids(
@@ -2971,7 +2950,6 @@ fn sample_embeddings_for_rowids(
     cache: &dyn EmbeddingCache,
 ) -> Result<(Tensor, Option<Vec<f32>>, usize)> {
     let mut total_embeddings = 0;
-    let mut total_original_embeddings = 0usize;
     #[cfg(any(test, feature = "deterministic"))]
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     #[cfg(not(any(test, feature = "deterministic")))]
@@ -2981,9 +2959,7 @@ fn sample_embeddings_for_rowids(
     let mut saw_salience = false;
 
     for record in active_rowid_records(records) {
-        let (embeddings, original_embedding_count) =
-            cached_embeddings_for_rowid_with_original_count(cache, record.rowid)?;
-        total_original_embeddings += original_embedding_count;
+        let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
         let gate_scores = embeddings
             .metadata
             .as_ref()
@@ -3016,24 +2992,6 @@ fn sample_embeddings_for_rowids(
             }
         }
         total_embeddings += m;
-    }
-
-    if let Some(requested_keep_fraction) = document_token_keep_fraction() {
-        if total_original_embeddings > 0 {
-            let actual_keep_fraction = total_embeddings as f64 / total_original_embeddings as f64;
-            let actual_sparsity = 1.0 - actual_keep_fraction;
-            let expansion = actual_keep_fraction / requested_keep_fraction;
-            info!(
-                "document token pruning requested keep {:.1}% but retained {}/{} tokens ({:.1}% keep, {:.1}% sparse); wordpiece expansion={}; expansion factor {:.3}x",
-                100.0 * requested_keep_fraction,
-                total_embeddings,
-                total_original_embeddings,
-                100.0 * actual_keep_fraction,
-                100.0 * actual_sparsity,
-                document_token_wordpiece_expansion_enabled(),
-                expansion
-            );
-        }
     }
 
     if all_embeddings.is_empty() {
@@ -3158,18 +3116,14 @@ fn prune_document_embeddings_by_gate_fraction(
     for idx in ranked {
         selected[idx] = true;
     }
-    let wordpiece_expansion = document_token_wordpiece_expansion_enabled();
-    if wordpiece_expansion {
-        expand_selection_to_wordpiece_groups(offsets, tokens, counts, &mut selected);
-    }
-    let expanded_keep = selected.iter().filter(|selected| **selected).count();
+    let selected_count = selected.iter().filter(|selected| **selected).count();
 
     let rows_vec = embeddings.to_vec2::<f32>()?;
-    let mut pruned_rows = Vec::with_capacity(expanded_keep);
+    let mut pruned_rows = Vec::with_capacity(selected_count);
     let mut pruned_counts = Vec::with_capacity(counts.len());
-    let mut pruned_offsets = Vec::with_capacity(expanded_keep);
-    let mut pruned_tokens = Vec::with_capacity(expanded_keep);
-    let mut pruned_gate_scores = Vec::with_capacity(expanded_keep);
+    let mut pruned_offsets = Vec::with_capacity(selected_count);
+    let mut pruned_tokens = Vec::with_capacity(selected_count);
+    let mut pruned_gate_scores = Vec::with_capacity(selected_count);
     let mut offset = 0usize;
 
     for &count in counts {
@@ -3191,8 +3145,8 @@ fn prune_document_embeddings_by_gate_fraction(
 
     let pruned_count = pruned_rows.len();
     anyhow::ensure!(
-        pruned_count == expanded_keep,
-        "selected {expanded_keep} grouped document tokens but retained {pruned_count}"
+        pruned_count == selected_count,
+        "selected {selected_count} document tokens but retained {pruned_count}"
     );
     let mut flat = Vec::with_capacity(pruned_count * cols);
     for row in pruned_rows {
@@ -3200,8 +3154,7 @@ fn prune_document_embeddings_by_gate_fraction(
     }
     let pruned = Tensor::from_vec(flat, (pruned_count, cols), embeddings.device())?;
     debug!(
-        "document token gate pruning seeded {keep}/{rows} tokens and kept {pruned_count}/{rows} after wordpiece expansion={} ({:.1}%)",
-        wordpiece_expansion,
+        "document token gate pruning kept {pruned_count}/{rows} tokens ({:.1}%)",
         100.0 * (pruned_count as f64) / (rows as f64)
     );
     Ok(PrunedDocumentEmbeddings {
@@ -3213,114 +3166,10 @@ fn prune_document_embeddings_by_gate_fraction(
     })
 }
 
-fn expand_selection_to_wordpiece_groups(
-    offsets: &[(usize, usize)],
-    tokens: &[String],
-    counts: &[u32],
-    selected: &mut [bool],
-) {
-    let mut chunk_offset = 0usize;
-    for &count in counts {
-        let count = count as usize;
-        let chunk_end = chunk_offset + count;
-        let mut group_start = chunk_offset;
-        for row_idx in chunk_offset..chunk_end {
-            if row_idx > group_start
-                && starts_wordpiece_group(
-                    tokens[row_idx].as_str(),
-                    offsets[row_idx - 1],
-                    offsets[row_idx],
-                )
-            {
-                expand_group_if_selected(selected, group_start, row_idx);
-                group_start = row_idx;
-            }
-        }
-        expand_group_if_selected(selected, group_start, chunk_end);
-        chunk_offset = chunk_end;
-    }
-}
-
-fn starts_wordpiece_group(
-    token: &str,
-    previous: (usize, usize),
-    current: (usize, usize),
-) -> bool {
-    if token.starts_with('Ġ') || token.starts_with('▁') || token.starts_with('[') {
-        return true;
-    }
-    if current.0 >= current.1 {
-        return true;
-    }
-    if previous.0 >= previous.1 || current.0 < previous.1 {
-        return true;
-    }
-    if current.0 == previous.0 && current.1 == previous.1 {
-        return false;
-    }
-    if current.0 != previous.1 {
-        return true;
-    }
-    token.chars().next().map(char::is_whitespace).unwrap_or(true)
-}
-
-fn expand_group_if_selected(selected: &mut [bool], start: usize, end: usize) {
-    if start >= end || !selected[start..end].iter().any(|selected| *selected) {
-        return;
-    }
-    for selected in &mut selected[start..end] {
-        *selected = true;
-    }
-}
-
 pub(crate) fn cached_embeddings_for_index(
     cached: CachedEmbeddings,
 ) -> Result<CachedEmbeddings> {
-    let Some(keep_fraction) = document_token_keep_fraction() else {
-        return Ok(cached);
-    };
-    let metadata = cached.metadata.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "WARP_DOC_TOKEN_KEEP_FRACTION requires cached token metadata; re-run embedding with gate-capable assets"
-        )
-    })?;
-    let gate_scores = metadata.gate_scores.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "WARP_DOC_TOKEN_KEEP_FRACTION requires token_gate tensors in ModernBERT assets"
-        )
-    })?;
-    let dim = dim_from_model_id(&cached.model);
-    let embeddings = Tensor::embeddings_from_packed(&cached.embeddings, dim, &Device::Cpu)?;
-    let counts: Vec<u32> = cached
-        .counts
-        .split(',')
-        .filter_map(|count| count.parse::<u32>().ok())
-        .collect();
-    let pruned = prune_document_embeddings_by_gate_fraction(
-        &embeddings,
-        &metadata.offsets,
-        &metadata.tokens,
-        &counts,
-        gate_scores,
-        keep_fraction,
-    )?;
-    let (rows, cols) = pruned.embeddings.dims2()?;
-    Ok(CachedEmbeddings {
-        model: model_id_for_dim(cols),
-        counts: pruned
-            .counts
-            .iter()
-            .map(|count| count.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-        embedding_count: rows,
-        embeddings: pruned.embeddings.embeddings_to_packed()?,
-        metadata: Some(CachedEmbeddingMetadata {
-            offsets: pruned.offsets,
-            tokens: pruned.tokens,
-            gate_scores: Some(pruned.gate_scores),
-        }),
-    })
+    Ok(cached)
 }
 
 #[cfg(debug_assertions)]
@@ -3372,12 +3221,28 @@ pub(crate) fn compute_cached_embeddings(
     let output = embedder.embed_with_gate_scores_and_tokens(body)?;
     let embeddings = output.embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
     let counts = token_counts_for_lens(lens, &output.offsets)?;
+    let gate_scores = output.gate_scores.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("document token pruning requires token_gate tensors in ModernBERT assets")
+    })?;
+    let unpruned_rows = embeddings.dims2()?.0;
+    let pruned = prune_document_embeddings_by_gate_fraction(
+        &embeddings,
+        &output.offsets,
+        &output.tokens,
+        &counts,
+        gate_scores,
+        document_token_keep_fraction(),
+    )?;
+    let embeddings = pruned.embeddings;
+    let counts = pruned.counts;
     let (rows, cols) = embeddings.dims2()?;
     let dt = now.elapsed().as_secs_f64();
     debug!(
-        "embedder took {} ms ({} rows/s).",
+        "embedder took {} ms ({} rows/s), pruned {}/{} document tokens.",
         now.elapsed().as_millis(),
-        ((rows as f64) / dt).round()
+        ((rows as f64) / dt).round(),
+        rows,
+        unpruned_rows,
     );
 
     debug!(
@@ -3416,9 +3281,9 @@ pub(crate) fn compute_cached_embeddings(
         embedding_count: rows,
         embeddings: bytes,
         metadata: Some(CachedEmbeddingMetadata {
-            offsets: output.offsets,
-            tokens: output.tokens,
-            gate_scores: output.gate_scores,
+            offsets: pruned.offsets,
+            tokens: pruned.tokens,
+            gate_scores: Some(pruned.gate_scores),
         }),
     })
 }
