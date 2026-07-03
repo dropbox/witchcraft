@@ -690,6 +690,50 @@ mod tests {
     }
 
     #[test]
+    fn test_force_flush_indexes_small_buffered_batch() -> anyhow::Result<()> {
+        use crate::packops::TensorPackOps;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("force_flush.sqlite");
+        let mut db = DB::new(path.clone())?;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"force-flush-index");
+        db.add_doc(None, &uuid, None, "{}", "force flush indexed row", None)?;
+
+        let (hash, rowid): (String, i64) = db
+            .query("SELECT hash, rowid FROM document WHERE uuid = ?1")?
+            .query_row((uuid.to_string(),), |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let model = crate::model_id_for_dim(crate::DEFAULT_EMBEDDING_DIM);
+        let embedding = Tensor::from_vec(
+            vec![1.0f32; crate::DEFAULT_EMBEDDING_DIM],
+            (1, crate::DEFAULT_EMBEDDING_DIM),
+            &Device::Cpu,
+        )?;
+        let cache =
+            crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
+        cache.put(
+            &hash,
+            &crate::CachedEmbeddings {
+                model,
+                counts: "1".to_string(),
+                embedding_count: 1,
+                embeddings: embedding.embeddings_to_packed()?,
+            },
+        )?;
+
+        crate::index_chunks_with_cache(&db, &cache, None, false)?;
+        let reason = crate::semantic_index_unavailable_reason(&db)?.unwrap();
+        assert!(reason.contains("buffered unindexed rowids"));
+
+        let options = crate::IndexOptions::default().force_flush();
+        crate::index_chunks_with_cache_and_options(&db, &cache, None, false, options)?;
+        assert_eq!(crate::semantic_index_unavailable_reason(&db)?, None);
+
+        let index = crate::file_index::FileBackedIndex::new(path);
+        assert_eq!(index.active_rowids()?.get(&(rowid as u64)), Some(&true));
+        Ok(())
+    }
+
+    #[test]
     fn test_semantic_index_readiness_reports_stale_and_missing_indexes() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("stale.sqlite");

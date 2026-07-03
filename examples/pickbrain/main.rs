@@ -336,10 +336,9 @@ fn ingest(
 }
 
 fn embed_and_index(db: &DB, embedder: &Embedder, _device: &candle_core::Device) -> Result<()> {
-    let embedded = witchcraft::embed_chunks(db, embedder, None)?;
-    if embedded > 0 {
-        witchcraft::index_chunks(db, None, false)?;
-    }
+    let _embedded = witchcraft::embed_chunks(db, embedder, None)?;
+    let options = witchcraft::IndexOptions::default().force_flush();
+    witchcraft::index_chunks_with_options(db, None, false, options)?;
     Ok(())
 }
 

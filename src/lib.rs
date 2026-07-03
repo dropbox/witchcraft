@@ -194,6 +194,7 @@ pub type DocPtr = (u32, u32);
 #[derive(Clone, Copy, Debug)]
 pub struct IndexOptions {
     residual_quant_bits: u8,
+    force_flush: bool,
 }
 
 impl IndexOptions {
@@ -201,7 +202,13 @@ impl IndexOptions {
         packops::validate_residual_quant_bits(residual_quant_bits)?;
         Ok(Self {
             residual_quant_bits,
+            force_flush: false,
         })
+    }
+
+    pub fn force_flush(mut self) -> Self {
+        self.force_flush = true;
+        self
     }
 
     pub fn residual_quant_bits(&self) -> u8 {
@@ -213,6 +220,7 @@ impl Default for IndexOptions {
     fn default() -> Self {
         Self {
             residual_quant_bits: packops::DEFAULT_RESIDUAL_QUANT_BITS,
+            force_flush: false,
         }
     }
 }
@@ -4032,7 +4040,7 @@ pub(crate) fn index_buffered_embeddings_with_options(
         .sum();
     info!("standalone index has {} buffered embeddings ({} indexed)", x, indexed);
 
-    if x < L0_CAPACITY {
+    if x < L0_CAPACITY && !options.force_flush {
         debug!("buffering {} embeddings (< {} threshold)", x, L0_CAPACITY);
         return Ok(());
     }
