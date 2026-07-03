@@ -66,9 +66,7 @@ mod db;
 pub use db::DB;
 
 mod embedding_cache;
-pub use embedding_cache::{
-    CachedEmbeddingMetadata, CachedEmbeddings, EmbeddingCache, FileEmbeddingCache,
-};
+pub use embedding_cache::{CachedEmbeddings, EmbeddingCache, FileEmbeddingCache};
 
 mod embedder;
 pub use embedder::Embedder;
@@ -158,19 +156,6 @@ const INDEX_KMEANS_ITERATIONS: usize = 5;
 const INDEX_BATCH_SIZE: usize = 0x10000;
 const INDEX_TARGET_BUCKET_VECTORS: usize = INDEX_BATCH_SIZE / INDEX_KMEANS_BRANCHING;
 const BUCKET_READ_COALESCE_GAP_BYTES: usize = 16 * 1024;
-
-fn kmeans_salience_enabled() -> bool {
-    std::env::var("WARP_KMEANS_SALIENCE")
-        .ok()
-        .is_some_and(|value| value != "0")
-}
-
-fn gate_score_to_kmeans_weight(score: f32) -> f32 {
-    if !score.is_finite() {
-        return 1.0;
-    }
-    (1.0 / (1.0 + (-score).exp())).max(1e-3)
-}
 
 fn weighted_center_indices<R: RngExt + ?Sized>(
     weights: &[f32],
@@ -2940,30 +2925,23 @@ fn cached_embeddings_for_rowid(
     cache: &dyn EmbeddingCache,
     rowid: u64,
 ) -> Result<CachedEmbeddings> {
-    let cached = load_cached_embeddings(cache, rowid, "")?
-        .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))?;
-    cached_embeddings_for_index(cached)
+    load_cached_embeddings(cache, rowid, "")?
+        .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))
 }
 
 fn sample_embeddings_for_rowids(
     records: &[RowidRecord],
     cache: &dyn EmbeddingCache,
-) -> Result<(Tensor, Option<Vec<f32>>, usize)> {
+) -> Result<(Tensor, usize)> {
     let mut total_embeddings = 0;
     #[cfg(any(test, feature = "deterministic"))]
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
-    let mut all_weights = kmeans_salience_enabled().then(Vec::new);
-    let mut saw_salience = false;
 
     for record in active_rowid_records(records) {
         let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
-        let gate_scores = embeddings
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.gate_scores.as_ref());
         anyhow::ensure!(
             embeddings.embedding_count == record.rows as usize,
             "rowid {} catalog says {} vectors but embedding blob has {}",
@@ -2982,14 +2960,6 @@ fn sample_embeddings_for_rowids(
         for i in subset_idx {
             let row = t.get(i)?;
             all_embeddings.push(row);
-            if let Some(weights) = all_weights.as_mut() {
-                let weight = gate_scores
-                    .filter(|scores| scores.len() == m)
-                    .map(|scores| gate_score_to_kmeans_weight(scores[i]))
-                    .unwrap_or(1.0);
-                saw_salience |= gate_scores.is_some_and(|scores| scores.len() == m);
-                weights.push(weight);
-            }
         }
         total_embeddings += m;
     }
@@ -2997,14 +2967,11 @@ fn sample_embeddings_for_rowids(
     if all_embeddings.is_empty() {
         return Ok((
             Tensor::zeros(&[0, DEFAULT_EMBEDDING_DIM], DType::F32, &Device::Cpu)?,
-            None,
             0,
         ));
     }
     let matrix = Tensor::stack(&all_embeddings, 0)?;
-    let weights =
-        all_weights.filter(|weights| saw_salience && weights.len() == all_embeddings.len());
-    Ok((matrix, weights, total_embeddings))
+    Ok((matrix, total_embeddings))
 }
 
 fn token_counts_for_lens(lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u32>> {
@@ -3068,9 +3035,6 @@ fn token_counts_for_lens(lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u
 struct PrunedDocumentEmbeddings {
     embeddings: Tensor,
     counts: Vec<u32>,
-    offsets: Vec<(usize, usize)>,
-    tokens: Vec<String>,
-    gate_scores: Vec<f32>,
 }
 
 fn prune_document_embeddings_by_gate_fraction(
@@ -3121,9 +3085,6 @@ fn prune_document_embeddings_by_gate_fraction(
     let rows_vec = embeddings.to_vec2::<f32>()?;
     let mut pruned_rows = Vec::with_capacity(selected_count);
     let mut pruned_counts = Vec::with_capacity(counts.len());
-    let mut pruned_offsets = Vec::with_capacity(selected_count);
-    let mut pruned_tokens = Vec::with_capacity(selected_count);
-    let mut pruned_gate_scores = Vec::with_capacity(selected_count);
     let mut offset = 0usize;
 
     for &count in counts {
@@ -3133,9 +3094,6 @@ fn prune_document_embeddings_by_gate_fraction(
             let row_idx = offset + local_idx;
             if selected[row_idx] {
                 pruned_rows.push(rows_vec[row_idx].clone());
-                pruned_offsets.push(offsets[row_idx]);
-                pruned_tokens.push(tokens[row_idx].clone());
-                pruned_gate_scores.push(gate_scores[row_idx]);
                 kept += 1;
             }
         }
@@ -3160,9 +3118,6 @@ fn prune_document_embeddings_by_gate_fraction(
     Ok(PrunedDocumentEmbeddings {
         embeddings: pruned,
         counts: pruned_counts,
-        offsets: pruned_offsets,
-        tokens: pruned_tokens,
-        gate_scores: pruned_gate_scores,
     })
 }
 
@@ -3171,7 +3126,6 @@ pub(crate) fn cached_embeddings_for_index(
 ) -> Result<CachedEmbeddings> {
     Ok(cached)
 }
-
 #[cfg(debug_assertions)]
 fn rowwise_cosine_min(a: &Tensor, b: &Tensor) -> Result<f32> {
     let (rows, cols) = a.dims2()?;
@@ -3280,11 +3234,6 @@ pub(crate) fn compute_cached_embeddings(
             .join(","),
         embedding_count: rows,
         embeddings: bytes,
-        metadata: Some(CachedEmbeddingMetadata {
-            offsets: pruned.offsets,
-            tokens: pruned.tokens,
-            gate_scores: Some(pruned.gate_scores),
-        }),
     })
 }
 
@@ -3876,8 +3825,6 @@ fn write_buckets_for_rowids(
     expected_count: u64,
     residual_quant_bits: u8,
 ) -> Result<(Vec<tempfile::NamedTempFile>, CenterSidecarData, Option<Vec<f32>>)> {
-    log::info!("write_buckets_for_rowids");
-    let bar = progress::new_with_label(expected_count, "indexing");
     let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
     let mut writes_total = 0;
@@ -3896,6 +3843,7 @@ fn write_buckets_for_rowids(
         assigned_bucket_indices_for_rowids(records, cache, index_kmeans, expected_count)?;
     let center_sidecar = prepare_center_sidecar_data(&centers_cpu, bucket_indices)?;
     let residual_centers_cpu = &center_sidecar.residual_centers_cpu;
+    let bar = progress::new_with_label(expected_count, "indexing");
     let mut records = active_rowid_records(records);
     let mut residual_radius_levels = None;
     let mut attempted_radius_training = false;
@@ -4012,14 +3960,12 @@ fn build_index_generation(
     records: &[RowidRecord],
     options: IndexOptions,
 ) -> Result<Option<FileIndexGeneration>> {
-    info!("get rowid_records_embedding_count");
     let active_embeddings = rowid_records_embedding_count(records);
     if active_embeddings == 0 {
         return Ok(None);
     }
 
-    info!("get sample_embeddings_for_rowids");
-    let (matrix, weights, total_embeddings) = sample_embeddings_for_rowids(records, cache)?;
+    let (matrix, total_embeddings) = sample_embeddings_for_rowids(records, cache)?;
     if total_embeddings == 0 {
         return Ok(None);
     }
@@ -4028,7 +3974,7 @@ fn build_index_generation(
         "building standalone L{} with {} embeddings",
         level, total_embeddings
     );
-    let centers = run_kmeans_for_index(&matrix, weights.as_deref(), total_embeddings)?;
+    let centers = run_kmeans_for_index(&matrix, None, total_embeddings)?;
     drop(matrix);
 
     let data_file = index.generation_file_name(level);
@@ -4087,7 +4033,7 @@ pub(crate) fn index_buffered_embeddings_with_options(
     info!("standalone index has {} buffered embeddings ({} indexed)", x, indexed);
 
     if x < L0_CAPACITY {
-        info!("buffering {} embeddings (< {} threshold)", x, L0_CAPACITY);
+        debug!("buffering {} embeddings (< {} threshold)", x, L0_CAPACITY);
         return Ok(());
     }
 
@@ -4110,10 +4056,8 @@ pub(crate) fn index_buffered_embeddings_with_options(
     let mut inputs = vec![buffer];
     let mut stale_generations = vec![];
     let mut kept_generations = vec![];
-    info!("scan generations...");
     for generation in generations {
         if generation.level <= target_level {
-            info!("push...");
             inputs.push(index.generation_rowid_records(&generation)?);
             stale_generations.push(generation);
         } else {
@@ -4125,14 +4069,12 @@ pub(crate) fn index_buffered_embeddings_with_options(
     if kept_generations.is_empty() {
         merged.retain(|record| record.rows > 0);
     }
-    info!("build/keep generations...");
     if let Some(generation) =
         build_index_generation(index, cache, target_level, &merged, options)?
     {
         kept_generations.push(generation);
     }
     kept_generations.sort_by_key(|generation| generation.level);
-    info!("writing manifests...");
     index.write_manifest(&kept_generations)?;
     let _ = std::fs::remove_file(index.rowid_buffer_path());
     index.remove_generation_files(&stale_generations);

@@ -263,7 +263,6 @@ fn decode_embedding_blob(bytes: &[u8]) -> Result<CachedEmbeddings> {
         counts,
         embedding_count,
         embeddings,
-        metadata: None,
     })
 }
 

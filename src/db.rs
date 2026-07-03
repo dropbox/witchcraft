@@ -194,8 +194,7 @@ impl DB {
                  model TEXT NOT NULL,
                  embeddings BLOB NOT NULL,
                  counts TEXT NOT NULL,
-                 embedding_count INTEGER NOT NULL,
-                 metadata TEXT);
+                 embedding_count INTEGER NOT NULL);
 
              CREATE TRIGGER document_after_delete AFTER DELETE ON document
              BEGIN
@@ -295,8 +294,7 @@ impl DB {
                  model TEXT NOT NULL,
                  embeddings BLOB NOT NULL,
                  counts TEXT NOT NULL,
-                 embedding_count INTEGER NOT NULL DEFAULT 0,
-                 metadata TEXT);
+                 embedding_count INTEGER NOT NULL DEFAULT 0);
 
              CREATE TRIGGER IF NOT EXISTS document_after_delete AFTER DELETE ON document
              BEGIN
@@ -317,12 +315,6 @@ impl DB {
             connection.execute_batch(
                 "ALTER TABLE chunk
                  ADD COLUMN embedding_count INTEGER NOT NULL DEFAULT 0;",
-            )?;
-        }
-        if !Self::has_column(connection, "chunk", "metadata")? {
-            connection.execute_batch(
-                "ALTER TABLE chunk
-                 ADD COLUMN metadata TEXT;",
             )?;
         }
         Self::backfill_chunk_embedding_counts(connection)?;
@@ -422,7 +414,6 @@ impl DB {
     /// Open without integrity check — for CLI batch operations where startup
     /// latency on large databases is prohibitive.
     pub fn new_fast(db_fn: PathBuf) -> SQLResult<Self> {
-        log::info!("new fast!");
         Self::open_internal(db_fn, true)
     }
 

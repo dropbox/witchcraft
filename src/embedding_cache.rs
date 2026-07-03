@@ -1,19 +1,11 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: [u8; 8] = *b"WEMB0001";
 const HASH_CHARS: usize = 32;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CachedEmbeddingMetadata {
-    pub offsets: Vec<(usize, usize)>,
-    pub tokens: Vec<String>,
-    pub gate_scores: Option<Vec<f32>>,
-}
 
 #[derive(Clone, Debug)]
 pub struct CachedEmbeddings {
@@ -21,7 +13,6 @@ pub struct CachedEmbeddings {
     pub counts: String,
     pub embedding_count: usize,
     pub embeddings: Vec<u8>,
-    pub metadata: Option<CachedEmbeddingMetadata>,
 }
 
 pub trait EmbeddingCache {
@@ -105,26 +96,11 @@ impl EmbeddingCache for FileEmbeddingCache {
         file.read_exact(&mut embeddings)
             .with_context(|| format!("failed to read embeddings from {}", path.display()))?;
 
-        let metadata_len = match read_u64_optional(&mut file)? {
-            Some(len) => len as usize,
-            None => 0,
-        };
-        let metadata = if metadata_len > 0 {
-            let mut metadata = vec![0u8; metadata_len];
-            file.read_exact(&mut metadata)
-                .with_context(|| format!("failed to read metadata from {}", path.display()))?;
-            Some(serde_json::from_slice(&metadata)
-                .with_context(|| format!("metadata is not valid JSON in {}", path.display()))?)
-        } else {
-            None
-        };
-
         Ok(Some(CachedEmbeddings {
             model,
             counts,
             embedding_count,
             embeddings,
-            metadata,
         }))
     }
 
@@ -147,13 +123,6 @@ impl EmbeddingCache for FileEmbeddingCache {
             file.write_all(embeddings.model.as_bytes())?;
             file.write_all(embeddings.counts.as_bytes())?;
             file.write_all(&embeddings.embeddings)?;
-            if let Some(metadata) = &embeddings.metadata {
-                let metadata = serde_json::to_vec(metadata)?;
-                write_u64(&mut file, metadata.len())?;
-                file.write_all(&metadata)?;
-            } else {
-                write_u64(&mut file, 0)?;
-            }
             file.flush()?;
             fs::rename(&tmp_path, &path).with_context(|| {
                 format!(
@@ -184,15 +153,6 @@ fn read_u64(reader: &mut impl Read) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn read_u64_optional(reader: &mut impl Read) -> Result<Option<u64>> {
-    let mut bytes = [0u8; std::mem::size_of::<u64>()];
-    match reader.read_exact(&mut bytes) {
-        Ok(()) => Ok(Some(u64::from_le_bytes(bytes))),
-        Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(None),
-        Err(err) => Err(err.into()),
-    }
-}
-
 fn write_u32(writer: &mut impl Write, value: usize) -> Result<()> {
     writer.write_all(&u32::try_from(value)?.to_le_bytes())?;
     Ok(())
@@ -217,7 +177,6 @@ mod tests {
             counts: "1,2,3".to_string(),
             embedding_count: 6,
             embeddings: vec![1, 2, 3, 4],
-            metadata: None,
         };
 
         cache.put(hash, &value).unwrap();
@@ -227,7 +186,6 @@ mod tests {
         assert_eq!(loaded.counts, value.counts);
         assert_eq!(loaded.embedding_count, value.embedding_count);
         assert_eq!(loaded.embeddings, value.embeddings);
-        assert!(loaded.metadata.is_none());
     }
 
     #[test]
