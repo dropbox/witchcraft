@@ -433,7 +433,6 @@ pub fn fulltext_search(
             LIMIT ?",
         )
     };
-
     let mut query = db.query(&sql)?;
 
     // Build complete params list: query param (if q.len() > 0), filter params, top_k
@@ -455,31 +454,31 @@ pub fn fulltext_search(
         ))
     })?;
     for result in results {
-        let (rowid, body, lens, _score) = result?;
-        let score_query = fts_query
-            .as_ref()
-            .map(|(_, normalized)| normalized.as_str())
-            .unwrap_or("");
-        let score2 = strsim::jaro_winkler(score_query, &body) as f32;
+        let (rowid, body, lens, score) = result?;
+        let rank_score = -score;
 
         let lens: Vec<usize> = lens
             .split(',')
             .filter_map(|s| s.parse::<usize>().ok())
             .collect();
 
-        let mut max = -1.0f64;
         let mut i_max = 0;
         if !lens.is_empty() {
+            let score_query = fts_query
+                .as_ref()
+                .map(|(_, normalized)| normalized.as_str())
+                .unwrap_or("");
             let bodies = split_by_codepoints(&body, &lens);
+            let mut max = -1.0f64;
             for (i, &b) in bodies.iter().enumerate() {
-                let score = strsim::jaro_winkler(score_query, b);
-                if score > max {
-                    max = score;
+                let s = strsim::jaro_winkler(score_query, b);
+                if s > max {
+                    max = s;
                     i_max = i;
                 }
             }
         }
-        fts_matches.push((score2, rowid, i_max as u32));
+        fts_matches.push((rank_score, rowid, i_max as u32));
     }
     Ok(fts_matches)
 }
