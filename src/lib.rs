@@ -110,10 +110,11 @@ mod sqlite_index;
 pub use sqlite_index::{
     count_unindexed_cached_embeddings, count_unindexed_embeddings,
     count_unindexed_embeddings_with_cache, embed_chunks, embed_chunks_with_cache,
-    exact_match_centroids_bulk, fulltext_search, index_chunks, index_chunks_with_cache,
-    index_chunks_with_cache_and_options, index_chunks_with_options, match_centroids,
-    match_centroids_with_cache, match_centroids_with_query_weights, search,
-    search_cached_rowids_with_cache, search_rowids, semantic_index_unavailable_reason,
+    exact_match_centroids_bulk, fulltext_search,
+    index_chunks, index_chunks_with_cache, index_chunks_with_cache_and_options,
+    index_chunks_with_options, match_centroids, match_centroids_with_cache,
+    match_centroids_with_query_weights, search, search_cached_rowids_with_cache, search_rowids,
+    semantic_index_unavailable_reason,
 };
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) use sqlite_index::fts5_query;
@@ -325,11 +326,7 @@ pub fn embed_query_for_search(embedder: &Embedder, text: &str) -> Result<QueryEm
         let weights = output
             .gate_scores
             .map(query_weights_from_gate_scores)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "WARP_QUERY_TOKEN_SALIENCE requires token_gate tensors in ModernBERT assets"
-                )
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("WARP_QUERY_TOKEN_SALIENCE requires token_gate tensors in ModernBERT assets"))?;
         Ok(QueryEmbeddings {
             embeddings: output.embeddings.get(0)?,
             weights: Some(weights),
@@ -659,8 +656,7 @@ fn kmeans_inner(
 
     for _ in 0..max_iter {
         let packed_centers = fast_ops::PackedRight::new(&centers)?;
-        let cluster_assignments =
-            matmul_argmax_batched(data, &packed_centers, KMEANS_MATMUL_BATCH)?;
+        let cluster_assignments = matmul_argmax_batched(data, &packed_centers, KMEANS_MATMUL_BATCH)?;
         let assignments = cluster_assignments.to_vec1::<u32>()?;
 
         // Single O(m × n) pass: accumulate per-cluster sums directly into a
@@ -891,7 +887,10 @@ fn coarse_tree_leaf_parent_centers(
     Ok(Some((parents, parent_bytes)))
 }
 
-fn bucket_leaf_indices(bucket_indices: &[usize], centroid_count: usize) -> Result<Vec<usize>> {
+fn bucket_leaf_indices(
+    bucket_indices: &[usize],
+    centroid_count: usize,
+) -> Result<Vec<usize>> {
     let mut leaf_by_bucket = vec![usize::MAX; centroid_count];
     for (leaf_idx, &bucket_idx) in bucket_indices.iter().enumerate() {
         anyhow::ensure!(
@@ -921,9 +920,7 @@ fn parent_value(
         .checked_mul(f32_center_bytes_for_dim(dim))
         .and_then(|offset| offset.checked_add(dim_idx * std::mem::size_of::<f32>()))
         .ok_or_else(|| anyhow::anyhow!("parent center offset overflow"))?;
-    Ok(f32::from_le_bytes(
-        parent_bytes[offset..offset + 4].try_into()?,
-    ))
+    Ok(f32::from_le_bytes(parent_bytes[offset..offset + 4].try_into()?))
 }
 
 fn encode_q4_center_residual_block(
@@ -1070,13 +1067,15 @@ fn center_block_to_f32_bytes(
     center_format: u32,
 ) -> Result<Vec<u8>> {
     match center_format {
-        BUCKET_CENTER_FORMAT => decode_q4_center_residual_block(
-            center_block,
-            bucket_indices,
-            coarse_tree,
-            centroid_count,
-            dim,
-        ),
+        BUCKET_CENTER_FORMAT => {
+            decode_q4_center_residual_block(
+                center_block,
+                bucket_indices,
+                coarse_tree,
+                centroid_count,
+                dim,
+            )
+        }
         _ => anyhow::bail!("bucket center format {center_format} is not supported"),
     }
 }
@@ -1169,10 +1168,9 @@ fn preadv_once(file: &File, offset: u64, buffers: &mut [&mut [u8]]) -> io::Resul
         libc::preadv(
             file.as_raw_fd(),
             iovecs.as_mut_ptr(),
-            iovecs
-                .len()
-                .try_into()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many iovecs"))?,
+            iovecs.len().try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many iovecs")
+            })?,
             offset.try_into().map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidInput, "preadv offset overflow")
             })?,
@@ -1303,10 +1301,7 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
     let centroid_count: usize = read_u32_le(prefix, offset)?.try_into()?;
     offset += std::mem::size_of::<u32>();
     let embedding_dim: usize = read_u32_le(prefix, offset)?.try_into()?;
-    anyhow::ensure!(
-        embedding_dim > 0,
-        "bucket sidecar embedding dimension is zero"
-    );
+    anyhow::ensure!(embedding_dim > 0, "bucket sidecar embedding dimension is zero");
     offset += std::mem::size_of::<u32>();
     let center_format = read_u32_le(prefix, offset)?;
     match center_format {
@@ -1376,7 +1371,10 @@ fn validate_residual_radius_levels(levels: &[f32], residual_quant_bits: u8) -> R
             level >= 0.0,
             "Lloyd-Max radius level {level} must be non-negative"
         );
-        anyhow::ensure!(level >= previous, "Lloyd-Max radius levels must be sorted");
+        anyhow::ensure!(
+            level >= previous,
+            "Lloyd-Max radius levels must be sorted"
+        );
         previous = level;
     }
     Ok(())
@@ -1766,7 +1764,8 @@ fn merge_and_write_buckets_to_path(
     let payload_len = payload_chunks
         .iter()
         .try_fold(0u64, |total, &(_, _, len)| {
-            total.checked_add(u64::try_from(len).ok()?)
+            total
+                .checked_add(u64::try_from(len).ok()?)
         })
         .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload length overflow"))?;
     anyhow::ensure!(
@@ -1879,7 +1878,12 @@ pub fn weighted_reciprocal_rank_fusion(
             });
     }
 
-    fn add_ranked_list(scores: &mut HashMap<u32, FusedDoc>, list: &[DocPtr], weight: f64, k: f64) {
+    fn add_ranked_list(
+        scores: &mut HashMap<u32, FusedDoc>,
+        list: &[DocPtr],
+        weight: f64,
+        k: f64,
+    ) {
         if weight == 0.0 {
             return;
         }
@@ -2095,13 +2099,19 @@ fn clear_generations_cache() {
     GENERATIONS_CACHE.write().unwrap().clear();
 }
 
-fn build_coarse_tree_from_centers(leaf_centers: &Tensor, device: &Device) -> Result<CoarseTree> {
+fn build_coarse_tree_from_centers(
+    leaf_centers: &Tensor,
+    device: &Device,
+) -> Result<CoarseTree> {
     let (leaf_count, _) = leaf_centers.dims2()?;
     if leaf_count <= COARSE_TREE_BRANCHING {
         return Ok(CoarseTree { levels: vec![] });
     }
 
-    let root_count = (leaf_count as f64).sqrt().ceil().max(2.0) as usize;
+    let root_count = (leaf_count as f64)
+        .sqrt()
+        .ceil()
+        .max(2.0) as usize;
     let root_count = root_count.min(leaf_count - 1);
     let leaf_centers = leaf_centers.to_device(&Device::Cpu)?;
     debug!(
@@ -2180,10 +2190,7 @@ fn deserialize_coarse_tree(bytes: &[u8], device: &Device) -> Result<CoarseTree> 
         let center_end = cursor
             .checked_add(center_bytes_len)
             .ok_or_else(|| anyhow::anyhow!("coarse tree center cursor overflow"))?;
-        anyhow::ensure!(
-            center_end <= bytes.len(),
-            "coarse tree center data is truncated"
-        );
+        anyhow::ensure!(center_end <= bytes.len(), "coarse tree center data is truncated");
         let centers = Tensor::from_f32_bytes(&bytes[cursor..center_end], dim, device)?;
         cursor = center_end;
 
@@ -2228,8 +2235,7 @@ impl GenerationCentroids {
             let n_expand = (k_level as f64).sqrt().ceil() as usize;
             let level_sim = fast_ops::matmul_t(query_embeddings, &level.centers)?;
             let level_sim = level_sim.to_device(&Device::Cpu)?;
-            let level_sorted = level_sim
-                .arg_sort_last_dim(false)?
+            let level_sorted = level_sim.arg_sort_last_dim(false)?
                 .to_device(&Device::Cpu)?
                 .to_vec2::<u32>()?;
 
@@ -2452,10 +2458,7 @@ fn vmax_inplace(current: &mut [f32], row: &[f32]) {
 }
 
 /// Load generation centroid data from sidecar files (cached).
-pub fn load_generations(
-    paths: &[PathBuf],
-    device: &Device,
-) -> Result<Arc<Vec<GenerationCentroids>>> {
+pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<GenerationCentroids>>> {
     let key = paths.to_vec();
     {
         let cache = GENERATIONS_CACHE.read().unwrap();
@@ -2469,7 +2472,8 @@ pub fn load_generations(
         let file = File::open(path)?;
         let sidecar_len: usize = file.metadata()?.len().try_into()?;
         let header = bucket_data_header_from_file(&file, sidecar_len)?;
-        let residual_radius_levels = bucket_data_residual_radius_levels_from_file(&file, &header)?;
+        let residual_radius_levels =
+            bucket_data_residual_radius_levels_from_file(&file, &header)?;
         let residual_dequant_table = packops::make_residual_dequant_table_with_radius_levels(
             header.residual_quant_bits,
             residual_radius_levels.as_deref(),
@@ -2538,10 +2542,7 @@ pub fn load_generations(
     }
 
     let result = Arc::new(all);
-    GENERATIONS_CACHE
-        .write()
-        .unwrap()
-        .insert(key, result.clone());
+    GENERATIONS_CACHE.write().unwrap().insert(key, result.clone());
     Ok(result)
 }
 
@@ -2636,15 +2637,11 @@ pub fn match_centroids_raw(
         let candidates = gen.routed_centroid_candidates(query_embeddings)?;
         io_counters.candidate_buckets += candidates.len();
         let candidate_indices: Vec<u32> = candidates.iter().map(|&idx| idx as u32).collect();
-        let candidate_index_tensor = Tensor::from_slice(
-            candidate_indices.as_slice(),
-            (candidate_indices.len(),),
-            device,
-        )?;
-        let candidate_centers = gen
-            .centers_matrix
-            .index_select(&candidate_index_tensor, 0)?;
-        let query_centroid_similarity = fast_ops::matmul_t(query_embeddings, &candidate_centers)?;
+        let candidate_index_tensor =
+            Tensor::from_slice(candidate_indices.as_slice(), (candidate_indices.len(),), device)?;
+        let candidate_centers = gen.centers_matrix.index_select(&candidate_index_tensor, 0)?;
+        let query_centroid_similarity =
+            fast_ops::matmul_t(query_embeddings, &candidate_centers)?;
         let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
 
         let candidate_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
@@ -2663,7 +2660,8 @@ pub fn match_centroids_raw(
         let mut gen_centroid_score_ranges = Vec::with_capacity(m);
         for i in 0..m {
             let row = sorted_indices.get(i)?;
-            let row_scores_sorted = query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
+            let row_scores_sorted =
+                query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
             let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
             let row = row.to_vec1::<u32>()?;
             let mut cumsum = 0;
@@ -2684,8 +2682,10 @@ pub fn match_centroids_raw(
             }
             let confidence_tail_rank = (selection_limit / 2).max(1) - 1;
             let residual_tail_rank = tail_rank.min(confidence_tail_rank);
-            gen_centroid_score_ranges
-                .push((row_scores_sorted[0], row_scores_sorted[residual_tail_rank]));
+            gen_centroid_score_ranges.push((
+                row_scores_sorted[0],
+                row_scores_sorted[residual_tail_rank],
+            ));
             if cumsum < t_prime {
                 missing[i] = missing[i].max(row_scores_sorted[selection_limit - 1]);
             }
@@ -2759,7 +2759,9 @@ pub fn match_centroids_raw(
         let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
 
         let mut residual_sims_flat = residual_sims.flatten_all()?.to_vec1::<f32>()?;
-        for (doc_idx, &(gen_idx, cluster_idx)) in document_clusters.iter().enumerate() {
+        for (doc_idx, &(gen_idx, cluster_idx)) in
+            document_clusters.iter().enumerate()
+        {
             let gen = &generations[gen_idx];
             let centroid_scores = &gen_centroid_scores_all[gen_idx];
             let centroid_score_ranges = &gen_centroid_score_ranges_all[gen_idx];
@@ -2843,6 +2845,7 @@ pub fn match_centroids_raw(
     let mut prev_sub_idx = 0u32;
 
     for i in 0.. {
+
         let is_beyond_end = i == all.len();
         let ((idx, sub_idx), pos) = if is_beyond_end {
             ((u32::MAX, u32::MAX), 0)
@@ -2926,7 +2929,10 @@ fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
     document_indices
 }
 
-fn cached_embeddings_for_rowid(cache: &dyn EmbeddingCache, rowid: u64) -> Result<CachedEmbeddings> {
+fn cached_embeddings_for_rowid(
+    cache: &dyn EmbeddingCache,
+    rowid: u64,
+) -> Result<CachedEmbeddings> {
     load_cached_embeddings(cache, rowid, "")?
         .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))
 }
@@ -3123,7 +3129,9 @@ fn prune_document_embeddings_by_gate_fraction(
     })
 }
 
-pub(crate) fn cached_embeddings_for_index(cached: CachedEmbeddings) -> Result<CachedEmbeddings> {
+pub(crate) fn cached_embeddings_for_index(
+    cached: CachedEmbeddings,
+) -> Result<CachedEmbeddings> {
     Ok(cached)
 }
 #[cfg(debug_assertions)]
@@ -3505,7 +3513,10 @@ fn run_kmeans_for_index(
         centers.centers.dims2()?.0 == next_leaf_offset,
         "index kmeans produced inconsistent leaf offsets"
     );
-    anyhow::ensure!(next_leaf_offset > 0, "index kmeans produced no centers");
+    anyhow::ensure!(
+        next_leaf_offset > 0,
+        "index kmeans produced no centers"
+    );
     debug!("kmeans took {} ms.", now.elapsed().as_millis());
     Ok(centers)
 }
@@ -3604,12 +3615,12 @@ fn learn_residual_radius_levels(
         "residual training data dimension {dim} does not match center dimension {center_dim}"
     );
     anyhow::ensure!(
-        dim % 4 == 0,
-        "hyperspherical residual radius training requires an embedding dimension divisible by four"
+        dim % 2 == 0,
+        "polar residual radius training requires an even embedding dimension"
     );
     let data = data_cpu.flatten_all()?.to_vec1::<f32>()?;
     let centers = residual_centers_cpu.flatten_all()?.to_vec1::<f32>()?;
-    let mut radii = Vec::with_capacity(rows * (dim / 4));
+    let mut radii = Vec::with_capacity(rows * (dim / 2));
 
     for (row, &bucket) in cluster_assignments.iter().enumerate() {
         let bucket: usize = bucket.try_into()?;
@@ -3619,20 +3630,19 @@ fn learn_residual_radius_levels(
         );
         let row_offset = row * dim;
         let center_offset = bucket * dim;
-        for dim_idx in (0..dim).step_by(4) {
+        for dim_idx in (0..dim).step_by(2) {
             let x = data[row_offset + dim_idx] - centers[center_offset + dim_idx];
             let y = data[row_offset + dim_idx + 1] - centers[center_offset + dim_idx + 1];
-            let z = data[row_offset + dim_idx + 2] - centers[center_offset + dim_idx + 2];
-            let w = data[row_offset + dim_idx + 3] - centers[center_offset + dim_idx + 3];
-            radii.push((x.mul_add(x, y.mul_add(y, z.mul_add(z, w * w)))).sqrt());
+            radii.push(x.mul_add(x, y * y).sqrt());
         }
     }
 
-    // Keep angular quantization analytic. Radius levels adapt to the residual-energy
-    // distribution without changing the fixed-size hyperspherical code.
+    // We tried learning angle levels too, with residual radius^2 as the weight.
+    // It converged to nearly uniform bins and regressed nfcorpus at 2 and 3 bits,
+    // so keep angle quantization analytic and only learn the residual radii.
     let levels = packops::lloyd_max_radius_levels(&radii, residual_quant_bits)?;
     info!(
-        "Lloyd-Max hyperspherical radius levels bits={} samples={} levels={:?}",
+        "Lloyd-Max polar radius levels bits={} samples={} levels={:?}",
         residual_quant_bits,
         radii.len(),
         levels
@@ -3822,11 +3832,7 @@ fn write_buckets_for_rowids(
     index_kmeans: &IndexKMeans,
     expected_count: u64,
     residual_quant_bits: u8,
-) -> Result<(
-    Vec<tempfile::NamedTempFile>,
-    CenterSidecarData,
-    Option<Vec<f32>>,
-)> {
+) -> Result<(Vec<tempfile::NamedTempFile>, CenterSidecarData, Option<Vec<f32>>)> {
     let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
     let mut writes_total = 0;
@@ -4032,10 +4038,7 @@ pub(crate) fn index_buffered_embeddings_with_options(
         .iter()
         .map(|generation| generation.num_embeddings)
         .sum();
-    info!(
-        "standalone index has {} buffered embeddings ({} indexed)",
-        x, indexed
-    );
+    info!("standalone index has {} buffered embeddings ({} indexed)", x, indexed);
 
     if x < L0_CAPACITY && !options.force_flush {
         debug!("buffering {} embeddings (< {} threshold)", x, L0_CAPACITY);
@@ -4074,7 +4077,8 @@ pub(crate) fn index_buffered_embeddings_with_options(
     if kept_generations.is_empty() {
         merged.retain(|record| record.rows > 0);
     }
-    if let Some(generation) = build_index_generation(index, cache, target_level, &merged, options)?
+    if let Some(generation) =
+        build_index_generation(index, cache, target_level, &merged, options)?
     {
         kept_generations.push(generation);
     }
