@@ -2982,57 +2982,33 @@ fn sample_embeddings_for_rowids(
     Ok((matrix, total_embeddings))
 }
 
-fn token_counts_for_lens(lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u32>> {
-    let mut lengths: Vec<usize> = lens
+fn token_counts_for_lens(body: &str, lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u32>> {
+    let lengths: Vec<usize> = lens
         .split(',')
         .filter_map(|s| s.parse::<usize>().ok())
         .collect();
     anyhow::ensure!(!lengths.is_empty(), "document chunk lens are empty");
 
-    for i in 1..lengths.len() {
-        lengths[i] += lengths[i - 1];
+    let mut boundaries: Vec<usize> = body.char_indices().map(|(idx, _)| idx).collect();
+    boundaries.push(body.len());
+    let mut ends = Vec::with_capacity(lengths.len());
+    let mut end = 0usize;
+    for length in lengths {
+        end += length;
+        anyhow::ensure!(end < boundaries.len(), "document chunk lengths exceed body length");
+        ends.push(boundaries[end]);
     }
 
-    let mut i = 0;
-    let mut j = 0;
-
-    let i_end = offsets.len();
-    let j_end = lengths.len();
-    let mut count: u32 = 0;
-    let mut done = false;
-    let mut flush = false;
-    let mut counts = vec![];
-
-    while !done {
-        let o = if i < offsets.len() {
-            offsets[i].1
-        } else {
-            usize::MAX
-        };
-
-        let l = if j < lengths.len() {
-            lengths[j]
-        } else {
-            usize::MAX
-        };
-
-        if o <= l {
-            i += 1;
-            count += 1;
-        } else {
-            j += 1;
-            flush = true;
-        }
-
-        done = i == i_end && j == j_end;
-
-        if flush || done {
-            counts.push(count);
-            count = 0;
-            flush = false;
-        }
+    let mut counts = vec![0u32; ends.len()];
+    for &(_, token_end) in offsets {
+        let chunk_idx = ends.partition_point(|&chunk_end| chunk_end < token_end);
+        anyhow::ensure!(
+            chunk_idx < ends.len(),
+            "token offset {token_end} exceeds document length {}",
+            ends[ends.len() - 1]
+        );
+        counts[chunk_idx] += 1;
     }
-    anyhow::ensure!(count == 0, "unfinished token count while splitting chunks");
     anyhow::ensure!(
         counts.iter().sum::<u32>() == offsets.len() as u32,
         "token counts do not cover all offsets"
@@ -3182,7 +3158,7 @@ pub(crate) fn compute_cached_embeddings(
     let now = std::time::Instant::now();
     let output = embedder.embed_with_gate_scores_and_tokens(body)?;
     let embeddings = output.embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
-    let counts = token_counts_for_lens(lens, &output.offsets)?;
+    let counts = token_counts_for_lens(body, lens, &output.offsets)?;
     let gate_scores = output.gate_scores.as_ref().ok_or_else(|| {
         anyhow::anyhow!("document token pruning requires token_gate tensors in ModernBERT assets")
     })?;
@@ -3255,13 +3231,18 @@ pub(crate) fn load_or_compute_cached_embeddings(
     embedder: &Embedder,
 ) -> Result<(CachedEmbeddings, bool)> {
     if let Some(embeddings) = load_cached_embeddings(cache, rowid, hash)? {
-        return Ok((embeddings, false));
+        let chunk_count = lens.split(',').filter_map(|s| s.parse::<usize>().ok()).count();
+        let count_count = embeddings.counts.split(',').filter_map(|s| s.parse::<u32>().ok()).count();
+        if count_count == chunk_count {
+            return Ok((embeddings, false));
+        }
+        warn!(
+            "cached embeddings for document {rowid} have {count_count} chunk counts, expected {chunk_count}; recomputing"
+        );
     }
 
     let embeddings = compute_cached_embeddings(embedder, body, lens)?;
-    if load_cached_embeddings(cache, rowid, hash)?.is_none() {
-        cache.put(hash, &embeddings)?;
-    }
+    cache.put(hash, &embeddings)?;
     Ok((embeddings, true))
 }
 
@@ -4186,6 +4167,18 @@ pub fn split_by_codepoints<'a>(s: &'a str, lengths: &[usize]) -> Vec<&'a str> {
         pos = end_pos;
     }
     parts
+}
+
+#[test]
+fn token_counts_match_document_chunk_count() {
+    let counts = token_counts_for_lens("abcde", "3,2", &[(0, 1), (1, 3), (3, 4), (4, 5)]).unwrap();
+    assert_eq!(counts, vec![2, 2]);
+}
+
+#[test]
+fn token_counts_use_utf8_byte_offsets() {
+    let counts = token_counts_for_lens("åbcde", "3,2", &[(0, 2), (2, 4), (4, 6)]).unwrap();
+    assert_eq!(counts, vec![2, 1]);
 }
 
 #[test]
