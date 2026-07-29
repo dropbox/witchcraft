@@ -282,7 +282,7 @@ fn document_token_keep_fraction() -> f64 {
         .ok()
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
-        .unwrap_or(0.25)
+        .unwrap_or(0.3)
 }
 
 pub fn query_token_salience_enabled() -> bool {
