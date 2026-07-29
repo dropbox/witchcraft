@@ -107,10 +107,7 @@ pub(crate) fn validate_polar_radius_levels(levels: &[f32], bits: u8) -> Result<(
             level >= 0.0,
             "Lloyd-Max radius level {level} must be non-negative"
         );
-        anyhow::ensure!(
-            level >= previous,
-            "Lloyd-Max radius levels must be sorted"
-        );
+        anyhow::ensure!(level >= previous, "Lloyd-Max radius levels must be sorted");
         previous = level;
     }
     Ok(())
@@ -200,322 +197,146 @@ fn centroid_confidence_weight(centroid_score: f32, score_range: (f32, f32)) -> f
 }
 
 #[cfg(feature = "polar-quant")]
-pub(crate) trait PolarMode {
-    type DequantTable;
+const HYPERSPHERICAL_RADIUS_MAX: [f32; 5] = [0.0, 0.0, 1.0, 1.0, 0.5];
 
-    const BITS: u8;
-    const RADIUS_MAX: f32;
-
-    fn row_bytes(cols: usize) -> usize;
-    fn assert_row_width(cols: usize);
-    fn make_dequant_table() -> Self::DequantTable;
-    fn encode_row(flat: &[f32]) -> Vec<u8>;
-    fn decode_rows(bytes: &[u8], cols: usize, table: &Self::DequantTable) -> Vec<f32>;
-
-    fn max_code() -> u8 {
-        (1u8 << Self::BITS) - 1
-    }
-
-    fn level_count() -> u8 {
-        1u8 << Self::BITS
-    }
-
-    fn encode_pair_code(x: f32, y: f32) -> u8 {
-        let radius = (x.mul_add(x, y * y)).sqrt();
-        let angle_code = Self::quantize_angle(y.atan2(x));
-        let radius_code = Self::quantize_radius(radius);
-        (radius_code << Self::BITS) | angle_code
-    }
-
-    fn encode_pair_code_with_radius_levels(x: f32, y: f32, levels: Option<&[f32]>) -> u8 {
-        let radius = (x.mul_add(x, y * y)).sqrt();
-        let angle_code = Self::quantize_angle(y.atan2(x));
-        let radius_code = match levels {
-            Some(levels) => {
-                quantize_polar_radius_with_levels(radius, levels, Self::max_code())
-            }
-            None => Self::quantize_radius(radius),
-        };
-        (radius_code << Self::BITS) | angle_code
-    }
-
-    fn decode_pair_code(code: u8) -> [f32; 2] {
-        let radius_code = code >> Self::BITS;
-        let angle_code = code & Self::max_code();
-        let radius = Self::dequantize_radius(radius_code);
-        let angle = Self::dequantize_angle(angle_code);
-        [radius * angle.cos(), radius * angle.sin()]
-    }
-
-    fn decode_pair_code_with_radius_levels(code: u8, levels: Option<&[f32]>) -> [f32; 2] {
-        let radius_code = code >> Self::BITS;
-        let angle_code = code & Self::max_code();
-        let radius = match levels {
-            Some(levels) => levels[radius_code as usize],
-            None => Self::dequantize_radius(radius_code),
-        };
-        let angle = Self::dequantize_angle(angle_code);
-        [radius * angle.cos(), radius * angle.sin()]
-    }
-
-    fn quantize_radius(radius: f32) -> u8 {
-        quantize_polar_radius(radius, Self::RADIUS_MAX, Self::max_code())
-    }
-
-    fn dequantize_radius(code: u8) -> f32 {
-        dequantize_polar_radius(code, Self::RADIUS_MAX, Self::max_code())
-    }
-
-    fn quantize_angle(angle: f32) -> u8 {
-        let levels = Self::level_count();
-        let step = std::f32::consts::TAU / levels as f32;
-        let angle = angle.rem_euclid(std::f32::consts::TAU);
-        ((angle / step).round() as u8) % levels
-    }
-
-    fn dequantize_angle(code: u8) -> f32 {
-        (code.min(Self::max_code()) as f32) * std::f32::consts::TAU / Self::level_count() as f32
-    }
-
-    fn residual_centroid_confidence_weight(
-        _centroid_score: f32,
-        _score_range: (f32, f32),
-    ) -> f32 {
-        1.0
-    }
+#[cfg(feature = "polar-quant")]
+fn hyperspherical_row_bytes(cols: usize, bits: u8) -> usize {
+    assert!(
+        cols % 4 == 0,
+        "column count must be divisible by four for hyperspherical packing"
+    );
+    cols * usize::from(bits) / 8
 }
 
 #[cfg(feature = "polar-quant")]
-fn make_pair_table<M: PolarMode, const N: usize>() -> [[f32; 2]; N] {
-    let mut table = [[0f32; 2]; N];
-    for (code, slot) in table.iter_mut().enumerate() {
-        *slot = M::decode_pair_code(code as u8);
+fn hyperspherical_encode_code(values: &[f32], bits: u8, levels: Option<&[f32]>) -> u32 {
+    debug_assert_eq!(values.len(), 4);
+    let max_code = (1u32 << bits) - 1;
+    let radius = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let radius_code = match levels {
+        Some(levels) => quantize_polar_radius_with_levels(radius, levels, max_code as u8),
+        None => quantize_polar_radius(
+            radius,
+            HYPERSPHERICAL_RADIUS_MAX[bits as usize],
+            max_code as u8,
+        ),
+    } as u32;
+    if radius == 0.0 {
+        return radius_code;
     }
-    table
+    let theta1 = (values[0] / radius).clamp(-1.0, 1.0).acos();
+    let theta2 = values[2].hypot(values[3]).atan2(values[1]);
+    let phi = values[3].atan2(values[2]).rem_euclid(std::f32::consts::TAU);
+    let theta_code = |theta: f32| {
+        ((theta / std::f32::consts::PI * max_code as f32).round() as u32).min(max_code)
+    };
+    let phi_code =
+        ((phi / std::f32::consts::TAU * (max_code + 1) as f32).round() as u32) & max_code;
+    radius_code
+        | (theta_code(theta1) << bits)
+        | (theta_code(theta2) << (2 * bits))
+        | (phi_code << (3 * bits))
 }
 
 #[cfg(feature = "polar-quant")]
-fn make_pair_table_with_radius_levels<M: PolarMode, const N: usize>(
-    levels: Option<&[f32]>,
-) -> Result<[[f32; 2]; N]> {
+fn hyperspherical_decode_code(code: u32, bits: u8, levels: Option<&[f32]>) -> [f32; 4] {
+    let max_code = (1u32 << bits) - 1;
+    let radius_code = (code & max_code) as u8;
+    let radius = levels.map_or_else(
+        || {
+            dequantize_polar_radius(
+                radius_code,
+                HYPERSPHERICAL_RADIUS_MAX[bits as usize],
+                max_code as u8,
+            )
+        },
+        |levels| levels[radius_code as usize],
+    );
+    let theta =
+        |shift: u8| ((code >> shift) & max_code) as f32 * std::f32::consts::PI / max_code as f32;
+    let theta1 = theta(bits);
+    let theta2 = theta(2 * bits);
+    let phi =
+        ((code >> (3 * bits)) & max_code) as f32 * std::f32::consts::TAU / (max_code + 1) as f32;
+    let sin_theta1 = theta1.sin();
+    let sin_theta2 = theta2.sin();
+    [
+        radius * theta1.cos(),
+        radius * sin_theta1 * theta2.cos(),
+        radius * sin_theta1 * sin_theta2 * phi.cos(),
+        radius * sin_theta1 * sin_theta2 * phi.sin(),
+    ]
+}
+
+#[cfg(feature = "polar-quant")]
+fn make_hyperspherical_table(bits: u8, levels: Option<&[f32]>) -> Result<Vec<[f32; 4]>> {
     if let Some(levels) = levels {
-        validate_polar_radius_levels(levels, M::BITS)?;
+        validate_polar_radius_levels(levels, bits)?;
     }
-    let mut table = [[0f32; 2]; N];
-    for (code, slot) in table.iter_mut().enumerate() {
-        *slot = M::decode_pair_code_with_radius_levels(code as u8, levels);
-    }
-    Ok(table)
+    Ok((0..(1usize << (4 * usize::from(bits))))
+        .map(|code| hyperspherical_decode_code(code as u32, bits, levels))
+        .collect())
 }
 
 #[cfg(feature = "polar-quant")]
-pub(crate) struct Polar2Bit;
-
-#[cfg(feature = "polar-quant")]
-impl PolarMode for Polar2Bit {
-    type DequantTable = [[f32; 4]; 256];
-
-    const BITS: u8 = 2;
-    const RADIUS_MAX: f32 = 1.0;
-
-    fn row_bytes(cols: usize) -> usize {
-        cols / 4
-    }
-
-    fn assert_row_width(cols: usize) {
-        assert!(
-            cols % 4 == 0,
-            "column count must be divisible by four for 2-bit polar packing"
-        );
-    }
-
-    fn make_dequant_table() -> Self::DequantTable {
-        let pairs = make_pair_table::<Self, 16>();
-        let mut table = [[0f32; 4]; 256];
-        for (byte, slot) in table.iter_mut().enumerate() {
-            let high = ((byte as u8) >> 4) as usize;
-            let low = ((byte as u8) & 0x0f) as usize;
-            let [x0, y0] = pairs[high];
-            let [x1, y1] = pairs[low];
-            *slot = [x0, y0, x1, y1];
-        }
-        table
-    }
-
-    fn encode_row(flat: &[f32]) -> Vec<u8> {
-        Self::assert_row_width(flat.len());
-        let mut packed = Vec::with_capacity(flat.len() / 4);
-        for pair_pair in flat.chunks_exact(4) {
-            let high = Self::encode_pair_code(pair_pair[0], pair_pair[1]);
-            let low = Self::encode_pair_code(pair_pair[2], pair_pair[3]);
-            packed.push((high << 4) | low);
-        }
-        packed
-    }
-
-    fn decode_rows(bytes: &[u8], cols: usize, table: &Self::DequantTable) -> Vec<f32> {
-        Self::assert_row_width(cols);
-        let mut out = Vec::with_capacity(bytes.len() * 4);
-        for &byte in bytes {
-            let [x0, y0, x1, y1] = table[byte as usize];
-            out.push(x0);
-            out.push(y0);
-            out.push(x1);
-            out.push(y1);
-        }
-        out
-    }
-
-    fn residual_centroid_confidence_weight(
-        centroid_score: f32,
-        score_range: (f32, f32),
-    ) -> f32 {
-        centroid_confidence_weight(centroid_score, score_range)
-    }
-}
-
-#[cfg(feature = "polar-quant")]
-pub(crate) struct Polar3Bit;
-
-#[cfg(feature = "polar-quant")]
-impl PolarMode for Polar3Bit {
-    type DequantTable = [[f32; 2]; 64];
-
-    const BITS: u8 = 3;
-    const RADIUS_MAX: f32 = 1.0;
-
-    fn row_bytes(cols: usize) -> usize {
-        (cols * 3 + 7) / 8
-    }
-
-    fn assert_row_width(cols: usize) {
-        assert!(
-            cols % 2 == 0,
-            "column count must be even for 3-bit polar packing"
-        );
-    }
-
-    fn make_dequant_table() -> Self::DequantTable {
-        make_pair_table::<Self, 64>()
-    }
-
-    fn encode_row(flat: &[f32]) -> Vec<u8> {
-        Self::assert_row_width(flat.len());
-        let mut packed = Vec::with_capacity(Self::row_bytes(flat.len()));
-        let mut acc = 0u32;
-        let mut bits = 0usize;
-        for pair in flat.chunks_exact(2) {
-            let code = Self::encode_pair_code(pair[0], pair[1]);
-            acc |= (code as u32) << bits;
-            bits += 6;
-            while bits >= 8 {
-                packed.push(acc as u8);
-                acc >>= 8;
-                bits -= 8;
-            }
-        }
-        if bits > 0 {
+fn hyperspherical_encode_row(flat: &[f32], bits: u8, levels: Option<&[f32]>) -> Vec<u8> {
+    assert!(
+        flat.len() % 4 == 0,
+        "column count must be divisible by four for hyperspherical packing"
+    );
+    let code_bits = 4 * usize::from(bits);
+    let mut packed = Vec::with_capacity(hyperspherical_row_bytes(flat.len(), bits));
+    let mut acc = 0u32;
+    let mut acc_bits = 0usize;
+    for values in flat.chunks_exact(4) {
+        acc |= hyperspherical_encode_code(values, bits, levels) << acc_bits;
+        acc_bits += code_bits;
+        while acc_bits >= 8 {
             packed.push(acc as u8);
+            acc >>= 8;
+            acc_bits -= 8;
         }
-        debug_assert_eq!(packed.len(), Self::row_bytes(flat.len()));
-        packed
     }
-
-    fn decode_rows(bytes: &[u8], cols: usize, table: &Self::DequantTable) -> Vec<f32> {
-        Self::assert_row_width(cols);
-        let row_bytes = Self::row_bytes(cols);
-        assert!(
-            bytes.len() % row_bytes == 0,
-            "Packed data length ({}) must be divisible by 3-bit polar row bytes ({})",
-            bytes.len(),
-            row_bytes
-        );
-        let pairs_per_row = cols / 2;
-        let mut out = Vec::with_capacity((bytes.len() * 8) / 3);
-        for row in bytes.chunks_exact(row_bytes) {
-            let mut acc = 0u32;
-            let mut bits = 0usize;
-            let mut byte_idx = 0usize;
-            for _ in 0..pairs_per_row {
-                while bits < 6 {
-                    acc |= (row[byte_idx] as u32) << bits;
-                    bits += 8;
-                    byte_idx += 1;
-                }
-                let code = (acc & 0x3f) as usize;
-                acc >>= 6;
-                bits -= 6;
-                let [x, y] = table[code];
-                out.push(x);
-                out.push(y);
-            }
-        }
-        out
+    if acc_bits > 0 {
+        packed.push(acc as u8);
     }
-
-    fn residual_centroid_confidence_weight(
-        centroid_score: f32,
-        score_range: (f32, f32),
-    ) -> f32 {
-        centroid_confidence_weight(centroid_score, score_range)
-    }
+    debug_assert_eq!(packed.len(), hyperspherical_row_bytes(flat.len(), bits));
+    packed
 }
 
 #[cfg(feature = "polar-quant")]
-pub(crate) struct Polar4Bit;
-
-#[cfg(feature = "polar-quant")]
-impl PolarMode for Polar4Bit {
-    type DequantTable = [[f32; 2]; 256];
-
-    const BITS: u8 = 4;
-    const RADIUS_MAX: f32 = 0.25;
-
-    fn row_bytes(cols: usize) -> usize {
-        cols / 2
-    }
-
-    fn assert_row_width(cols: usize) {
-        assert!(cols % 2 == 0, "column count must be even for polar packing");
-    }
-
-    fn make_dequant_table() -> Self::DequantTable {
-        make_pair_table::<Self, 256>()
-    }
-
-    fn encode_row(flat: &[f32]) -> Vec<u8> {
-        Self::assert_row_width(flat.len());
-        let mut packed = Vec::with_capacity(flat.len() / 2);
-        for pair in flat.chunks_exact(2) {
-            packed.push(Self::encode_pair_code(pair[0], pair[1]));
+fn hyperspherical_decode_rows(bytes: &[u8], cols: usize, bits: u8, table: &[[f32; 4]]) -> Vec<f32> {
+    let row_bytes = hyperspherical_row_bytes(cols, bits);
+    assert!(
+        bytes.len() % row_bytes == 0,
+        "packed data length must be divisible by hyperspherical row bytes"
+    );
+    let code_bits = 4 * usize::from(bits);
+    let code_mask = (1u32 << code_bits) - 1;
+    let mut out = Vec::with_capacity(bytes.len() * 8 / usize::from(bits));
+    for row in bytes.chunks_exact(row_bytes) {
+        let mut acc = 0u32;
+        let mut acc_bits = 0usize;
+        let mut byte_idx = 0usize;
+        for _ in 0..cols / 4 {
+            while acc_bits < code_bits {
+                acc |= (row[byte_idx] as u32) << acc_bits;
+                acc_bits += 8;
+                byte_idx += 1;
+            }
+            out.extend_from_slice(&table[(acc & code_mask) as usize]);
+            acc >>= code_bits;
+            acc_bits -= code_bits;
         }
-        packed
     }
-
-    fn decode_rows(bytes: &[u8], cols: usize, table: &Self::DequantTable) -> Vec<f32> {
-        Self::assert_row_width(cols);
-        let mut out = Vec::with_capacity(bytes.len() * 2);
-        for &byte in bytes {
-            let [x, y] = table[byte as usize];
-            out.push(x);
-            out.push(y);
-        }
-        out
-    }
-
-    fn residual_centroid_confidence_weight(
-        centroid_score: f32,
-        score_range: (f32, f32),
-    ) -> f32 {
-        centroid_confidence_weight(centroid_score, score_range)
-    }
+    out
 }
 
 #[cfg(feature = "polar-quant")]
 pub(crate) struct PolarDequantTables {
-    q2: <Polar2Bit as PolarMode>::DequantTable,
-    q3: <Polar3Bit as PolarMode>::DequantTable,
-    q4: <Polar4Bit as PolarMode>::DequantTable,
+    q2: Vec<[f32; 4]>,
+    q3: Vec<[f32; 4]>,
+    q4: Vec<[f32; 4]>,
 }
 
 #[cfg(feature = "polar-quant")]
@@ -548,11 +369,10 @@ pub(crate) fn residual_centroid_confidence_weight(
     score_range: (f32, f32),
     bits: u8,
 ) -> f32 {
-    match bits {
-        2 => Polar2Bit::residual_centroid_confidence_weight(centroid_score, score_range),
-        3 => Polar3Bit::residual_centroid_confidence_weight(centroid_score, score_range),
-        4 => Polar4Bit::residual_centroid_confidence_weight(centroid_score, score_range),
-        _ => 1.0,
+    if matches!(bits, 2 | 3) {
+        centroid_confidence_weight(centroid_score, score_range)
+    } else {
+        1.0
     }
 }
 
@@ -581,22 +401,6 @@ pub(crate) fn make_residual_dequant_table() -> Result<ResidualDequantTable> {
 }
 
 #[cfg(feature = "polar-quant")]
-fn make_polar2_dequant_table_with_radius_levels(
-    levels: Option<&[f32]>,
-) -> Result<<Polar2Bit as PolarMode>::DequantTable> {
-    let pairs = make_pair_table_with_radius_levels::<Polar2Bit, 16>(levels)?;
-    let mut table = [[0f32; 4]; 256];
-    for (byte, slot) in table.iter_mut().enumerate() {
-        let high = ((byte as u8) >> 4) as usize;
-        let low = ((byte as u8) & 0x0f) as usize;
-        let [x0, y0] = pairs[high];
-        let [x1, y1] = pairs[low];
-        *slot = [x0, y0, x1, y1];
-    }
-    Ok(table)
-}
-
-#[cfg(feature = "polar-quant")]
 pub(crate) fn make_residual_dequant_table_with_radius_levels(
     bits: u8,
     levels: Option<&[f32]>,
@@ -604,19 +408,19 @@ pub(crate) fn make_residual_dequant_table_with_radius_levels(
     validate_residual_quant_bits(bits)?;
     Ok(PolarDequantTables {
         q2: if bits == 2 {
-            make_polar2_dequant_table_with_radius_levels(levels)?
+            make_hyperspherical_table(2, levels)?
         } else {
-            Polar2Bit::make_dequant_table()
+            make_hyperspherical_table(2, None)?
         },
         q3: if bits == 3 {
-            make_pair_table_with_radius_levels::<Polar3Bit, 64>(levels)?
+            make_hyperspherical_table(3, levels)?
         } else {
-            Polar3Bit::make_dequant_table()
+            make_hyperspherical_table(3, None)?
         },
         q4: if bits == 4 {
-            make_pair_table_with_radius_levels::<Polar4Bit, 256>(levels)?
+            make_hyperspherical_table(4, levels)?
         } else {
-            Polar4Bit::make_dequant_table()
+            make_hyperspherical_table(4, None)?
         },
     })
 }
@@ -695,9 +499,9 @@ pub(crate) fn residuals_from_bytes(
 ) -> Result<Tensor> {
     validate_residual_quant_bits(bits)?;
     let out = match bits {
-        2 => Polar2Bit::decode_rows(bytes, cols, &table.q2),
-        3 => Polar3Bit::decode_rows(bytes, cols, &table.q3),
-        4 => Polar4Bit::decode_rows(bytes, cols, &table.q4),
+        2 => hyperspherical_decode_rows(bytes, cols, 2, &table.q2),
+        3 => hyperspherical_decode_rows(bytes, cols, 3, &table.q3),
+        4 => hyperspherical_decode_rows(bytes, cols, 4, &table.q4),
         _ => unreachable!(),
     };
     assert!(
@@ -713,22 +517,7 @@ pub(crate) fn residuals_from_bytes(
 #[cfg(feature = "polar-quant")]
 pub(crate) fn polar_row_bytes(cols: usize, bits: u8) -> Result<usize> {
     validate_residual_quant_bits(bits)?;
-    let row_bytes = match bits {
-        2 => {
-            Polar2Bit::assert_row_width(cols);
-            Polar2Bit::row_bytes(cols)
-        }
-        3 => {
-            Polar3Bit::assert_row_width(cols);
-            Polar3Bit::row_bytes(cols)
-        }
-        4 => {
-            Polar4Bit::assert_row_width(cols);
-            Polar4Bit::row_bytes(cols)
-        }
-        _ => unreachable!(),
-    };
-    Ok(row_bytes)
+    Ok(hyperspherical_row_bytes(cols, bits))
 }
 
 /// Normalize a histogram so that it sums to 2^log2_scale (<= 2^16),
@@ -1248,13 +1037,7 @@ impl TensorPackOps for Tensor {
     fn to_polar_bytes(&self, bits: u8) -> Result<Vec<u8>> {
         let flat = self.flatten_all()?.to_vec1::<f32>()?;
         validate_residual_quant_bits(bits)?;
-        let bytes = match bits {
-            2 => Polar2Bit::encode_row(&flat),
-            3 => Polar3Bit::encode_row(&flat),
-            4 => Polar4Bit::encode_row(&flat),
-            _ => unreachable!(),
-        };
-        Ok(bytes)
+        Ok(hyperspherical_encode_row(&flat, bits, None))
     }
 
     #[cfg(feature = "polar-quant")]
@@ -1268,68 +1051,8 @@ impl TensorPackOps for Tensor {
         };
         let flat = self.flatten_all()?.to_vec1::<f32>()?;
         validate_residual_quant_bits(bits)?;
-        let bytes = match bits {
-            2 => {
-                Polar2Bit::assert_row_width(flat.len());
-                validate_polar_radius_levels(levels, bits)?;
-                let mut packed = Vec::with_capacity(flat.len() / 4);
-                for pair_pair in flat.chunks_exact(4) {
-                    let high = Polar2Bit::encode_pair_code_with_radius_levels(
-                        pair_pair[0],
-                        pair_pair[1],
-                        Some(levels),
-                    );
-                    let low = Polar2Bit::encode_pair_code_with_radius_levels(
-                        pair_pair[2],
-                        pair_pair[3],
-                        Some(levels),
-                    );
-                    packed.push((high << 4) | low);
-                }
-                packed
-            }
-            3 => {
-                Polar3Bit::assert_row_width(flat.len());
-                validate_polar_radius_levels(levels, bits)?;
-                let mut packed = Vec::with_capacity(Polar3Bit::row_bytes(flat.len()));
-                let mut acc = 0u32;
-                let mut acc_bits = 0usize;
-                for pair in flat.chunks_exact(2) {
-                    let code = Polar3Bit::encode_pair_code_with_radius_levels(
-                        pair[0],
-                        pair[1],
-                        Some(levels),
-                    );
-                    acc |= (code as u32) << acc_bits;
-                    acc_bits += 6;
-                    while acc_bits >= 8 {
-                        packed.push(acc as u8);
-                        acc >>= 8;
-                        acc_bits -= 8;
-                    }
-                }
-                if acc_bits > 0 {
-                    packed.push(acc as u8);
-                }
-                debug_assert_eq!(packed.len(), Polar3Bit::row_bytes(flat.len()));
-                packed
-            }
-            4 => {
-                Polar4Bit::assert_row_width(flat.len());
-                validate_polar_radius_levels(levels, bits)?;
-                let mut packed = Vec::with_capacity(flat.len() / 2);
-                for pair in flat.chunks_exact(2) {
-                    packed.push(Polar4Bit::encode_pair_code_with_radius_levels(
-                        pair[0],
-                        pair[1],
-                        Some(levels),
-                    ));
-                }
-                packed
-            }
-            _ => unreachable!(),
-        };
-        Ok(bytes)
+        validate_polar_radius_levels(levels, bits)?;
+        Ok(hyperspherical_encode_row(&flat, bits, Some(levels)))
     }
 
     /*
@@ -1356,6 +1079,45 @@ impl TensorPackOps for Tensor {
         Ok(Tensor::from_vec(out, &[rows, cols], device)?)
     }
     */
+}
+
+#[cfg(all(test, feature = "polar-quant"))]
+mod hyperspherical_tests {
+    use super::*;
+
+    #[test]
+    fn hyperspherical_residuals_round_trip_at_all_bit_rates() -> Result<()> {
+        let values: Vec<f32> = vec![
+            0.10, -0.07, 0.03, -0.02, -0.04, 0.09, -0.08, 0.01, 0.02, 0.03, -0.11, 0.05, -0.06,
+            -0.02, 0.04, 0.08,
+        ];
+        let residuals = Tensor::from_vec(values, &[2, 8], &Device::Cpu)?;
+
+        for bits in [2, 3, 4] {
+            let levels = lloyd_max_radius_levels(&[0.0, 0.05, 0.1, 0.2, 0.4, 0.8], bits)?;
+            let bytes = residual_to_temp_bytes_with_radius_levels(&residuals, bits, Some(&levels))?;
+            assert_eq!(bytes.len(), 2 * polar_row_bytes(8, bits)?);
+            let table = make_residual_dequant_table_with_radius_levels(bits, Some(&levels))?;
+            let decoded = residuals_from_bytes(&bytes, 8, &table, bits, &Device::Cpu)?;
+            assert_eq!(decoded.dims2()?, (2, 8));
+            assert!(decoded
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .all(|value| value.is_finite()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hyperspherical_axis_encoding_is_finite() {
+        for bits in [2, 3, 4] {
+            let code = hyperspherical_encode_code(&[0.25, 0.0, 0.0, 0.0], bits, None);
+            let decoded = hyperspherical_decode_code(code, bits, None);
+            assert!(decoded.iter().all(|value| value.is_finite()));
+            assert!(decoded[0] > 0.0);
+        }
+    }
 }
 
 /*

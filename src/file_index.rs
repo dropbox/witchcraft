@@ -1,6 +1,6 @@
-use anyhow::Result;
 use crate::app_id::APP_ID_U32;
 use crate::file_writer::NewFileWriter;
+use anyhow::Result;
 use log::warn;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const GENERATION_DATA_APP_ID: u32 = APP_ID_U32;
-pub(crate) const GENERATION_DATA_VERSION: u32 = 4;
+pub(crate) const GENERATION_DATA_VERSION: u32 = 5;
 pub(crate) const GENERATION_DATA_HEADER_BYTES: usize =
     8 * std::mem::size_of::<u32>() + std::mem::size_of::<u64>();
 
@@ -108,9 +108,9 @@ impl FileBackedIndex {
             Err(err) => return Err(err.into()),
         };
         let mut lines = text.lines();
-        let header = lines
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("empty file index manifest {}", self.manifest_path.display()))?;
+        let header = lines.next().ok_or_else(|| {
+            anyhow::anyhow!("empty file index manifest {}", self.manifest_path.display())
+        })?;
         if let Some(reason) = file_index_manifest_stale_reason(header) {
             warn!(
                 "file index manifest {} is stale ({reason}), resetting file-backed index",
@@ -221,14 +221,16 @@ impl FileBackedIndex {
         std::fs::create_dir_all(&self.parent)?;
         let tmp = unique_tmp_path(&self.manifest_path, "manifest");
         let mut file = NewFileWriter::create_new(&tmp)?;
-        writeln!(file, "{}\t{}", GENERATION_DATA_APP_ID, GENERATION_DATA_VERSION)?;
+        writeln!(
+            file,
+            "{}\t{}",
+            GENERATION_DATA_APP_ID, GENERATION_DATA_VERSION
+        )?;
         for generation in generations {
             writeln!(
                 file,
                 "{}\t{}\t{}",
-                generation.level,
-                generation.num_embeddings,
-                generation.data_file
+                generation.level, generation.num_embeddings, generation.data_file
             )?;
         }
         file.finish()?;
@@ -258,7 +260,9 @@ impl FileBackedIndex {
     }
 
     pub(crate) fn buffered_rowid_records(&self) -> Result<Vec<RowidRecord>> {
-        Ok(sort_dedup_rowid_records(read_rowid_records(&self.rowid_buffer_path)?))
+        Ok(sort_dedup_rowid_records(read_rowid_records(
+            &self.rowid_buffer_path,
+        )?))
     }
 
     fn current_rowid_records(&self) -> Result<Vec<RowidRecord>> {
@@ -415,9 +419,8 @@ fn generation_rowids_offset_from_header(
         version == GENERATION_DATA_VERSION,
         "generation sidecar version {version} is not supported"
     );
-    let rowids_offset = u64::from_le_bytes(
-        header[ROWIDS_OFFSET_FIELD..ROWIDS_OFFSET_FIELD + 8].try_into()?,
-    );
+    let rowids_offset =
+        u64::from_le_bytes(header[ROWIDS_OFFSET_FIELD..ROWIDS_OFFSET_FIELD + 8].try_into()?);
     anyhow::ensure!(
         rowids_offset <= file_len,
         "generation sidecar rowid offset {} exceeds file length {}",
@@ -580,7 +583,9 @@ pub(crate) fn rowid_records_embedding_count(records: &[RowidRecord]) -> usize {
     records.iter().map(|record| record.rows as usize).sum()
 }
 
-pub(crate) fn active_rowid_records(records: &[RowidRecord]) -> impl Iterator<Item = RowidRecord> + '_ {
+pub(crate) fn active_rowid_records(
+    records: &[RowidRecord],
+) -> impl Iterator<Item = RowidRecord> + '_ {
     records.iter().copied().filter(|record| record.rows > 0)
 }
 
@@ -611,10 +616,7 @@ impl PartialOrd for RowidHeapEntry {
 mod tests {
     use super::*;
 
-    fn write_generation_test_header(
-        file: &mut impl Write,
-        version: u32,
-    ) -> Result<()> {
+    fn write_generation_test_header(file: &mut impl Write, version: u32) -> Result<()> {
         let header_bytes = u32::try_from(GENERATION_DATA_HEADER_BYTES)?;
         file.write_all(&GENERATION_DATA_APP_ID.to_le_bytes())?;
         file.write_all(&version.to_le_bytes())?;
