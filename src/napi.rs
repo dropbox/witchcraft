@@ -515,7 +515,7 @@ impl WitchcraftInner {
                     let now = std::time::Instant::now();
                     let results = crate::search(
                         db,
-                        embedder,
+                        Some(embedder),
                         &mut self.cache,
                         &q,
                         threshold,

@@ -85,7 +85,7 @@ mod tests {
                 println!("searching for {q}");
                 let results = crate::search(
                     &reader_db,
-                    &embedder,
+                    Some(&embedder),
                     &mut cache,
                     &q.to_string(),
                     THRESHOLD,
@@ -115,7 +115,7 @@ mod tests {
         }
         let _ = crate::search(
             &reader_db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"".to_string(),
             THRESHOLD,
@@ -219,7 +219,7 @@ mod tests {
         for (q, pos) in QUERIES {
             let results = crate::search(
                 &db,
-                &embedder,
+                Some(&embedder),
                 &mut cache,
                 &q.to_string(),
                 THRESHOLD,
@@ -235,7 +235,7 @@ mod tests {
         for (q, pos) in EASY_QUERIES {
             let results = crate::search(
                 &db,
-                &embedder,
+                Some(&embedder),
                 &mut cache,
                 &q.to_string(),
                 THRESHOLD,
@@ -303,7 +303,7 @@ mod tests {
         // Verify search works after full index
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"A group of flamingos".to_string(),
             THRESHOLD,
@@ -336,7 +336,7 @@ mod tests {
         // Verify search finds both old and new documents
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"A group of flamingos".to_string(),
             THRESHOLD,
@@ -352,7 +352,7 @@ mod tests {
 
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"dolphins sleeping habits".to_string(),
             THRESHOLD,
@@ -401,7 +401,7 @@ mod tests {
         // Verify search still works after compaction
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"A group of flamingos".to_string(),
             THRESHOLD,
@@ -417,7 +417,7 @@ mod tests {
 
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"dolphins sleeping habits".to_string(),
             THRESHOLD,
@@ -494,7 +494,7 @@ mod tests {
         for (q, _pos) in EASY_QUERIES {
             let results = crate::search(
                 &db,
-                &embedder,
+                Some(&embedder),
                 &mut cache,
                 &q.to_string(),
                 THRESHOLD,
@@ -508,7 +508,7 @@ mod tests {
 
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"dolphins sleeping habits".to_string(),
             THRESHOLD,
@@ -706,7 +706,7 @@ mod tests {
         index_chunks(&db, &device)?;
 
         let results = crate::search(
-            &db, &embedder, &mut cache,
+            &db, Some(&embedder), &mut cache,
             "honey preservation", 0.3, 10, false, None,
         )?;
         assert!(!results.is_empty(), "single-doc search must return the document");
@@ -947,7 +947,7 @@ mod tests {
 
         // Unfiltered search should return both
         let results = crate::search(
-            &db, &embedder, &mut cache, "flamingos", THRESHOLD, 10, false, None,
+            &db, Some(&embedder), &mut cache, "flamingos", THRESHOLD, 10, false, None,
         )?;
         assert!(results.len() == 2, "unfiltered search should find both flamingo docs, got {}", results.len());
 
@@ -963,7 +963,7 @@ mod tests {
             statements: None,
         };
         let results = crate::search(
-            &db, &embedder, &mut cache, "flamingos", THRESHOLD, 10, false, Some(&filter),
+            &db, Some(&embedder), &mut cache, "flamingos", THRESHOLD, 10, false, Some(&filter),
         )?;
         assert!(results.len() == 1, "filtered search should find exactly one doc, got {}", results.len());
         assert_eq!(results[0].1, uuid_b.to_string(), "filtered result should be uuid_b");
@@ -999,14 +999,14 @@ mod tests {
 
         // Search the empty DB first — this poisoned the global cache before the fix
         let overlay_results = crate::search(
-            &overlay, &embedder, &mut cache,
+            &overlay, Some(&embedder), &mut cache,
             "a lake with funny colors", THRESHOLD, 10, false, None,
         )?;
         assert!(overlay_results.is_empty());
 
         // Search the populated DB — must still find indexed results
         let baseline_results = crate::search(
-            &baseline, &embedder, &mut cache,
+            &baseline, Some(&embedder), &mut cache,
             "a lake with funny colors", THRESHOLD, 10, false, None,
         )?;
         assert!(

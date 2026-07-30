@@ -778,7 +778,7 @@ fn run_search(
     } else {
         witchcraft::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut witchcraft::EmbeddingsCache::new(1),
             q,
             0.5,
@@ -809,7 +809,7 @@ fn run_search_with(
     let now = std::time::Instant::now();
     let results = witchcraft::search(
         db,
-        embedder,
+        Some(embedder),
         &mut cache,
         q,
         0.5,
