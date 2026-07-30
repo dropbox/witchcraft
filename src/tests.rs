@@ -53,7 +53,7 @@ mod tests {
         ("A group of flamingos", 15),
         ("Bananas are berries", 0),
     ];
-    const THRESHOLD: f32 = 0.7;
+    const THRESHOLD: f32 = 0.71;
 
     fn index_chunks(db: &DB, _device: &candle_core::Device) -> anyhow::Result<()> {
         crate::index_chunks(db, None, false)
