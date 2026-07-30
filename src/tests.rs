@@ -771,8 +771,8 @@ mod tests {
             (1, crate::DEFAULT_EMBEDDING_DIM),
             &Device::Cpu,
         )?;
-        let err = crate::match_centroids(&db, &query, 0.0, 10, None).unwrap_err();
-        assert!(err.to_string().contains("not ready"));
+        let results = crate::match_centroids(&db, &query, 0.0, 10, None)?;
+        assert!(results.is_empty());
 
         let missing_path = dir.path().join("missing.sqlite");
         let mut missing_db = DB::new(missing_path)?;

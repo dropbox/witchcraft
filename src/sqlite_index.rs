@@ -293,11 +293,6 @@ pub(crate) fn match_centroids_from_cache(
     _cache: &dyn EmbeddingCache,
 ) -> Result<Vec<(f32, u32, u32)>> {
     let index = index_for_db(db);
-    if let Some(reason) = semantic_index_unavailable_reason(db)? {
-        anyhow::bail!(
-            "semantic index is not ready: {reason}; run warp-cli index or warp-cli reindex"
-        );
-    }
     let generation_files = index.generation_files()?;
 
     let scored_results = match_centroids_raw(
