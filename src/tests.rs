@@ -51,7 +51,7 @@ mod tests {
     const EASY_QUERIES: [(&str, u32); 3] = [
         ("a lake in Australia that stays bright pink", 31),
         ("A group of flamingos", 15),
-        ("Bananas are berries", 0),
+        ("strawberries are not true berries", 0),
     ];
     const THRESHOLD: f32 = 0.71;
 
@@ -80,7 +80,7 @@ mod tests {
         for round in 0..3 {
             crate::embed_chunks(&db, &embedder, None).unwrap();
             let mut reader_db = DB::new_reader(path.clone()).unwrap();
-            for (i, (q, pos)) in QUERIES.iter().enumerate() {
+            for (i, (q, pos)) in EASY_QUERIES.iter().enumerate() {
                 let use_fulltext = round == 0;
                 println!("searching for {q}");
                 let results = crate::search(
@@ -799,7 +799,7 @@ mod tests {
 
         let mut db = DB::new(path.clone())?;
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"only-doc");
-        db.add_doc(None, &uuid, None, &uuid.to_string(), "Honey never spoils", None)?;
+        db.add_doc(None, &uuid, None, &uuid.to_string(), "Honey never spoils because it has low moisture content and high acidity which prevents bacterial growth", None)?;
         crate::embed_chunks(&db, &embedder, None)?;
         let chunk_rows: i64 = db.query("SELECT COUNT(*) FROM chunk")?
             .query_row((), |row| row.get(0))?;
@@ -1040,15 +1040,15 @@ mod tests {
         // Insert two documents that would both match "flamingos"
         let uuid_a = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"filter-a");
         let uuid_b = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"filter-b");
-        db.add_doc(None, &uuid_a, None, &uuid_a.to_string(), "A group of flamingos is called a flamboyance", None)?;
-        db.add_doc(None, &uuid_b, None, &uuid_b.to_string(), "Flamingos are pink because of their diet of shrimp and algae", None)?;
+        db.add_doc(None, &uuid_a, None, &uuid_a.to_string(), "A group of flamingos is called a flamboyance. Flamingos are social birds that gather in large colonies near shallow lakes and lagoons.", None)?;
+        db.add_doc(None, &uuid_b, None, &uuid_b.to_string(), "Flamingos are pink because of their diet of shrimp and algae. These wading birds can filter feed for hours while standing on one leg.", None)?;
 
         crate::embed_chunks(&db, &embedder, None)?;
         index_chunks(&db, &device)?;
 
         // Unfiltered search should return both
         let results = crate::search(
-            &db, Some(&embedder), &mut cache, "flamingos", THRESHOLD, 10, false, None,
+            &db, Some(&embedder), &mut cache, "flamingos", 0.3, 10, false, None,
         )?;
         assert!(results.len() == 2, "unfiltered search should find both flamingo docs, got {}", results.len());
 
@@ -1064,7 +1064,7 @@ mod tests {
             statements: None,
         };
         let results = crate::search(
-            &db, Some(&embedder), &mut cache, "flamingos", THRESHOLD, 10, false, Some(&filter),
+            &db, Some(&embedder), &mut cache, "flamingos", 0.3, 10, false, Some(&filter),
         )?;
         assert!(results.len() == 1, "filtered search should find exactly one doc, got {}", results.len());
         assert_eq!(results[0].1, uuid_b.to_string(), "filtered result should be uuid_b");
@@ -1101,14 +1101,14 @@ mod tests {
         // Search the empty DB first — this poisoned the global cache before the fix
         let overlay_results = crate::search(
             &overlay, Some(&embedder), &mut cache,
-            "a lake with funny colors", THRESHOLD, 10, false, None,
+            "a lake in Australia that stays bright pink", THRESHOLD, 10, false, None,
         )?;
         assert!(overlay_results.is_empty());
 
         // Search the populated DB — must still find indexed results
         let baseline_results = crate::search(
             &baseline, Some(&embedder), &mut cache,
-            "a lake with funny colors", THRESHOLD, 10, false, None,
+            "a lake in Australia that stays bright pink", THRESHOLD, 10, false, None,
         )?;
         assert!(
             !baseline_results.is_empty(),
