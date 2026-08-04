@@ -1163,7 +1163,7 @@ mod tests {
 
         assert_eq!(
             query,
-            "\"what\" OR \"is\" OR \"the\" OR \"origin\" OR \"of\" OR \"COVID\" OR \"19\"*"
+            "\"what\" OR \"is\" OR \"the\" OR \"origin\" OR \"of\" OR \"COVID\" OR \"19\""
         );
         assert_eq!(normalized, "what is the origin of COVID 19");
     }

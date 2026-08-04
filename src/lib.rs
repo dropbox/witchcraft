@@ -110,11 +110,11 @@ mod sqlite_index;
 pub use sqlite_index::{
     count_unindexed_cached_embeddings, count_unindexed_embeddings,
     count_unindexed_embeddings_with_cache, embed_chunks, embed_chunks_with_cache,
-    exact_match_centroids_bulk, fulltext_search,
+    exact_match_centroids_bulk, fulltext_search, fulltext_search_with_prefix_wildcard,
     index_chunks, index_chunks_with_cache, index_chunks_with_cache_and_options,
     index_chunks_with_options, match_centroids, match_centroids_with_cache,
     match_centroids_with_query_weights, search, search_cached_rowids_with_cache, search_rowids,
-    semantic_index_unavailable_reason,
+    search_with_fulltext_prefix_wildcard, semantic_index_unavailable_reason,
 };
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) use sqlite_index::fts5_query;

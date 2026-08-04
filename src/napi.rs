@@ -513,7 +513,7 @@ impl WitchcraftInner {
                 },
                 |(embedder, db)| {
                     let now = std::time::Instant::now();
-                    let results = crate::search(
+                    let results = crate::search_with_fulltext_prefix_wildcard(
                         db,
                         Some(embedder),
                         &mut self.cache,

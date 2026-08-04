@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::sql_generator::build_filter_sql_and_params;
 
-const SCHEMA_VERSION: i32 = 13;
+const SCHEMA_VERSION: i32 = 14;
 const HASH_CHARS: usize = 32;
 const MAX_SQLITE_ROWID: u64 = i64::MAX as u64;
 
@@ -168,7 +168,8 @@ impl DB {
              CREATE INDEX document_index ON document(hash);
 
              CREATE VIRTUAL TABLE document_fts
-                 USING fts5(body, content='document', content_rowid='rowid');
+                 USING fts5(body, content='document', content_rowid='rowid',
+                            tokenize='porter unicode61');
              INSERT INTO document_fts(document_fts) VALUES('rebuild');
 
              CREATE TRIGGER document_fts_insert AFTER INSERT ON document

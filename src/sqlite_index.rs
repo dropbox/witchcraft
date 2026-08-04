@@ -512,6 +512,13 @@ impl EmbeddingCache for DocumentEmbeddingSource<'_> {
 }
 
 pub(crate) fn fts5_query(q: &str) -> Option<(String, String)> {
+    fts5_query_with_prefix_wildcard(q, false)
+}
+
+fn fts5_query_with_prefix_wildcard(
+    q: &str,
+    prefix_last_term: bool,
+) -> Option<(String, String)> {
     let terms: Vec<&str> = q
         .split(|c: char| !c.is_alphanumeric())
         .filter(|term| !term.is_empty())
@@ -531,7 +538,7 @@ pub(crate) fn fts5_query(q: &str) -> Option<(String, String)> {
         query.push('"');
         query.push_str(term);
         query.push('"');
-        if idx + 1 == terms.len() && !last_is_space {
+        if prefix_last_term && idx + 1 == terms.len() && !last_is_space {
             query.push('*');
         }
         normalized.push_str(term);
@@ -545,9 +552,23 @@ pub fn fulltext_search(
     top_k: usize,
     sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<Vec<(f32, u32, u32)>> {
+    fulltext_search_with_prefix_wildcard(db, q, top_k, sql_filter, false)
+}
+
+pub fn fulltext_search_with_prefix_wildcard(
+    db: &DB,
+    q: &str,
+    top_k: usize,
+    sql_filter: Option<&SqlStatementInternal>,
+    prefix_last_term: bool,
+) -> Result<Vec<(f32, u32, u32)>> {
     let mut fts_matches = vec![];
 
-    let fts_query = fts5_query(q);
+    let fts_query = if prefix_last_term {
+        fts5_query_with_prefix_wildcard(q, true)
+    } else {
+        fts5_query(q)
+    };
 
     let (filter_sql, mut filter_params) = build_filter_sql_and_params(sql_filter)?;
     let filter_clause = if !filter_sql.is_empty() {
@@ -831,12 +852,65 @@ pub fn search(
     use_fulltext: bool,
     sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
+    search_inner(
+        db,
+        embedder,
+        cache,
+        q,
+        threshold,
+        top_k,
+        use_fulltext,
+        sql_filter,
+        false,
+    )
+}
+
+pub fn search_with_fulltext_prefix_wildcard(
+    db: &DB,
+    embedder: Option<&Embedder>,
+    cache: &mut EmbeddingsCache,
+    q: &str,
+    threshold: f32,
+    top_k: usize,
+    use_fulltext: bool,
+    sql_filter: Option<&SqlStatementInternal>,
+) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
+    search_inner(
+        db,
+        embedder,
+        cache,
+        q,
+        threshold,
+        top_k,
+        use_fulltext,
+        sql_filter,
+        true,
+    )
+}
+
+fn search_inner(
+    db: &DB,
+    embedder: Option<&Embedder>,
+    cache: &mut EmbeddingsCache,
+    q: &str,
+    threshold: f32,
+    top_k: usize,
+    use_fulltext: bool,
+    sql_filter: Option<&SqlStatementInternal>,
+    fulltext_prefix_wildcard: bool,
+) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
     let now = std::time::Instant::now();
 
     let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
 
     let fts_matches = if use_fulltext {
-        fulltext_search(db, &q, top_k, sql_filter)?
+        fulltext_search_with_prefix_wildcard(
+            db,
+            &q,
+            top_k,
+            sql_filter,
+            fulltext_prefix_wildcard,
+        )?
     } else {
         vec![]
     };
@@ -1082,9 +1156,24 @@ mod tests {
 
         assert_eq!(
             query,
+            "\"what\" OR \"is\" OR \"the\" OR \"origin\" OR \"of\" OR \"COVID\" OR \"19\""
+        );
+        assert_eq!(normalized, "what is the origin of COVID 19");
+    }
+
+    #[test]
+    fn fts5_query_can_enable_final_prefix_wildcard() {
+        let (query, normalized) =
+            fts5_query_with_prefix_wildcard("what is the origin of COVID-19", true).unwrap();
+
+        assert_eq!(
+            query,
             "\"what\" OR \"is\" OR \"the\" OR \"origin\" OR \"of\" OR \"COVID\" OR \"19\"*"
         );
         assert_eq!(normalized, "what is the origin of COVID 19");
+
+        let (query, _) = fts5_query_with_prefix_wildcard("COVID ", true).unwrap();
+        assert_eq!(query, "\"COVID\"");
     }
 
     #[test]
