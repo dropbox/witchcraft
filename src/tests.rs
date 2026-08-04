@@ -1158,8 +1158,9 @@ mod tests {
 
     #[test]
     fn fts5_query_splits_punctuation_and_uses_or_terms() {
+        let stopwords = std::collections::HashSet::new();
         let (query, normalized) =
-            super::super::fts5_query("what is the origin of COVID-19").unwrap();
+            super::super::fts5_query("what is the origin of COVID-19", &stopwords).unwrap();
 
         assert_eq!(
             query,

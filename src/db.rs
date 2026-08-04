@@ -11,9 +11,22 @@ use uuid::Uuid;
 
 use super::sql_generator::build_filter_sql_and_params;
 
-const SCHEMA_VERSION: i32 = 14;
+const SCHEMA_VERSION: i32 = 15;
 const HASH_CHARS: usize = 32;
 const MAX_SQLITE_ROWID: u64 = i64::MAX as u64;
+const ENGLISH_STOPWORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is",
+    "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there",
+    "these", "they", "this", "to", "was", "will", "with",
+];
+
+fn english_stopword_values_sql() -> String {
+    ENGLISH_STOPWORDS
+        .iter()
+        .map(|word| format!("('{word}')"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 fn invalid_input_error(message: String) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
@@ -153,6 +166,7 @@ impl DB {
     }
 
     fn create_schema(connection: &Connection) -> SQLResult<()> {
+        let stopword_values = english_stopword_values_sql();
         connection.execute_batch(&format!(
             "PRAGMA application_id = {APP_ID};
              PRAGMA user_version = {SCHEMA_VERSION};
@@ -171,6 +185,11 @@ impl DB {
                  USING fts5(body, content='document', content_rowid='rowid',
                             tokenize='porter unicode61');
              INSERT INTO document_fts(document_fts) VALUES('rebuild');
+
+             CREATE TABLE document_fts_stopword(
+                 term TEXT NOT NULL PRIMARY KEY
+             ) WITHOUT ROWID;
+             INSERT INTO document_fts_stopword(term) VALUES {stopword_values};
 
              CREATE TRIGGER document_fts_insert AFTER INSERT ON document
              BEGIN
@@ -683,8 +702,9 @@ impl Drop for DB {
 
 #[cfg(test)]
 mod tests {
-    use super::DB;
+    use super::{DB, ENGLISH_STOPWORDS};
     use std::path::{Path, PathBuf};
+    use tempfile::tempdir;
 
     #[test]
     fn db_parent_uses_current_dir_for_bare_relative_path() {
@@ -718,5 +738,23 @@ mod tests {
         assert!(!rowids_buffer.exists());
         assert!(!manifest.exists());
         assert!(!old_sidecar.exists());
+    }
+
+    #[test]
+    fn new_database_contains_english_fts_stopwords() -> rusqlite::Result<()> {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("warp.sqlite");
+        let db = DB::new(path)?;
+
+        let mut count_query = db.query("SELECT COUNT(*) FROM document_fts_stopword")?;
+        let count: i64 = count_query.query_row((), |row| row.get(0))?;
+        assert_eq!(count, ENGLISH_STOPWORDS.len() as i64);
+
+        let mut stopword_query =
+            db.query("SELECT 1 FROM document_fts_stopword WHERE term = 'the'")?;
+        let found: i64 = stopword_query.query_row((), |row| row.get(0))?;
+        assert_eq!(found, 1);
+
+        Ok(())
     }
 }

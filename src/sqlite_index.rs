@@ -14,7 +14,7 @@ use anyhow::Result;
 use candle_core::{Device, Tensor};
 use log::{debug, info};
 use rusqlite::OptionalExtension;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 struct SqliteEmbeddingCache<'a> {
     db: &'a DB,
@@ -511,17 +511,51 @@ impl EmbeddingCache for DocumentEmbeddingSource<'_> {
     }
 }
 
-pub(crate) fn fts5_query(q: &str) -> Option<(String, String)> {
-    fts5_query_with_prefix_wildcard(q, false)
+fn load_fts_stopwords(db: &DB) -> Result<HashSet<String>> {
+    let mut exists_query =
+        db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'document_fts_stopword'")?;
+    let has_stopword_table = exists_query
+        .query_row((), |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !has_stopword_table {
+        debug!("document_fts_stopword table missing; continuing without FTS stopwords");
+        return Ok(HashSet::new());
+    }
+
+    let mut query = db.query("SELECT term FROM document_fts_stopword")?;
+    let rows = query.query_map((), |row| row.get::<_, String>(0))?;
+    let mut stopwords = HashSet::new();
+    for row in rows {
+        stopwords.insert(row?.to_lowercase());
+    }
+    Ok(stopwords)
+}
+
+pub(crate) fn fts5_query(q: &str, stopwords: &HashSet<String>) -> Option<(String, String)> {
+    fts5_query_with_prefix_wildcard(q, false, stopwords)
 }
 
 fn fts5_query_with_prefix_wildcard(
     q: &str,
     prefix_last_term: bool,
+    stopwords: &HashSet<String>,
 ) -> Option<(String, String)> {
-    let terms: Vec<&str> = q
+    let raw_terms: Vec<&str> = q
         .split(|c: char| !c.is_alphanumeric())
         .filter(|term| !term.is_empty())
+        .collect();
+    let last_raw_term_idx = raw_terms.len().checked_sub(1)?;
+    let terms: Vec<(usize, &str)> = raw_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &term)| {
+            if stopwords.contains(&term.to_lowercase()) {
+                None
+            } else {
+                Some((idx, term))
+            }
+        })
         .collect();
     if terms.is_empty() {
         return None;
@@ -530,7 +564,7 @@ fn fts5_query_with_prefix_wildcard(
     let last_is_space = q.chars().last().is_some_and(char::is_whitespace);
     let mut query = String::new();
     let mut normalized = String::new();
-    for (idx, term) in terms.iter().enumerate() {
+    for (idx, (raw_idx, term)) in terms.iter().enumerate() {
         if idx != 0 {
             query.push_str(" OR ");
             normalized.push(' ');
@@ -538,7 +572,7 @@ fn fts5_query_with_prefix_wildcard(
         query.push('"');
         query.push_str(term);
         query.push('"');
-        if prefix_last_term && idx + 1 == terms.len() && !last_is_space {
+        if prefix_last_term && *raw_idx == last_raw_term_idx && !last_is_space {
             query.push('*');
         }
         normalized.push_str(term);
@@ -564,10 +598,11 @@ pub fn fulltext_search_with_prefix_wildcard(
 ) -> Result<Vec<(f32, u32, u32)>> {
     let mut fts_matches = vec![];
 
+    let stopwords = load_fts_stopwords(db)?;
     let fts_query = if prefix_last_term {
-        fts5_query_with_prefix_wildcard(q, true)
+        fts5_query_with_prefix_wildcard(q, true, &stopwords)
     } else {
-        fts5_query(q)
+        fts5_query(q, &stopwords)
     };
 
     let (filter_sql, mut filter_params) = build_filter_sql_and_params(sql_filter)?;
@@ -1150,9 +1185,15 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    fn test_stopwords(words: &[&str]) -> HashSet<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
     #[test]
     fn fts5_query_splits_punctuation_and_uses_or_terms() {
-        let (query, normalized) = fts5_query("what is the origin of COVID-19").unwrap();
+        let stopwords = HashSet::new();
+        let (query, normalized) =
+            fts5_query("what is the origin of COVID-19", &stopwords).unwrap();
 
         assert_eq!(
             query,
@@ -1163,8 +1204,13 @@ mod tests {
 
     #[test]
     fn fts5_query_can_enable_final_prefix_wildcard() {
-        let (query, normalized) =
-            fts5_query_with_prefix_wildcard("what is the origin of COVID-19", true).unwrap();
+        let stopwords = HashSet::new();
+        let (query, normalized) = fts5_query_with_prefix_wildcard(
+            "what is the origin of COVID-19",
+            true,
+            &stopwords,
+        )
+        .unwrap();
 
         assert_eq!(
             query,
@@ -1172,8 +1218,29 @@ mod tests {
         );
         assert_eq!(normalized, "what is the origin of COVID 19");
 
-        let (query, _) = fts5_query_with_prefix_wildcard("COVID ", true).unwrap();
+        let (query, _) = fts5_query_with_prefix_wildcard("COVID ", true, &stopwords).unwrap();
         assert_eq!(query, "\"COVID\"");
+    }
+
+    #[test]
+    fn fts5_query_filters_configured_stopwords() {
+        let stopwords = test_stopwords(&["is", "of", "the"]);
+        let (query, normalized) =
+            fts5_query("what is the origin of COVID-19", &stopwords).unwrap();
+
+        assert_eq!(query, "\"what\" OR \"origin\" OR \"COVID\" OR \"19\"");
+        assert_eq!(normalized, "what origin COVID 19");
+        assert!(fts5_query("is the of", &stopwords).is_none());
+    }
+
+    #[test]
+    fn fts5_query_does_not_move_prefix_wildcard_before_final_stopword() {
+        let stopwords = test_stopwords(&["the"]);
+        let (query, normalized) =
+            fts5_query_with_prefix_wildcard("COVID the", true, &stopwords).unwrap();
+
+        assert_eq!(query, "\"COVID\"");
+        assert_eq!(normalized, "COVID");
     }
 
     #[test]
