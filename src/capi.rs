@@ -2,6 +2,7 @@ use crate::{
     index_buffered_embeddings, match_centroids_raw, CachedEmbeddings, Embedder, EmbeddingCache,
     EmbeddingsCache, FileBackedIndex,
 };
+use crate::file_index::RowidRecord;
 #[cfg(feature = "capi-embed-cache")]
 use crate::FileEmbeddingCache;
 use anyhow::{anyhow, Result};
@@ -505,7 +506,9 @@ pub unsafe extern "C" fn witchcraft_add(
             .state
             .lock()
             .map_err(|_| anyhow!("witchcraft handle lock poisoned"))?;
-        state.index.append_rowid_record(rowid, rows)?;
+        let mut appender = state.index.rowid_record_appender()?;
+        appender.append(RowidRecord { rowid, rows })?;
+        appender.finish()?;
         Ok(())
     }));
 

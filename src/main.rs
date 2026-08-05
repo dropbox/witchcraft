@@ -388,10 +388,11 @@ fn main() -> Result<()> {
         let db = DB::new_fast(db_name).unwrap();
         witchcraft::index_chunks(&db, Some(&embedder), false).unwrap();
     } else if args.len() == 2 && &args[1] == "reindex" {
-        let device = witchcraft::make_device();
-        let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
-        let db = DB::new_reader(db_name).unwrap();
-        witchcraft::index_chunks(&db, Some(&embedder), true).unwrap();
+        println!("reindex: opening {}", db_name.display());
+        let db = DB::new_fast(db_name).unwrap();
+        println!("reindex: rebuilding semantic index from cached embeddings");
+        witchcraft::index_chunks(&db, None, true).unwrap();
+        println!("reindex: done");
     } else if args.len() >= 3 && &args[1] == "saliency" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();

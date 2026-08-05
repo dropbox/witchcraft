@@ -49,6 +49,40 @@ pub(crate) struct FileBackedIndex {
     rowid_buffer_path: PathBuf,
 }
 
+pub(crate) struct RowidRecordAppender {
+    file: File,
+}
+
+impl RowidRecordAppender {
+    fn new(path: &Path, parent: &Path) -> Result<Self> {
+        std::fs::create_dir_all(parent)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self { file })
+    }
+
+    pub(crate) fn append(&mut self, record: RowidRecord) -> Result<()> {
+        let mut bytes = [0u8; ROWID_RECORD_BYTES];
+        bytes[..8].copy_from_slice(&record.rowid.to_le_bytes());
+        bytes[8..].copy_from_slice(&record.rows.to_le_bytes());
+        loop {
+            match self.file.write(&bytes) {
+                Ok(ROWID_RECORD_BYTES) => return Ok(()),
+                Ok(written) => {
+                    anyhow::bail!(
+                        "short append writing rowid record: wrote {written} of {ROWID_RECORD_BYTES} bytes"
+                    );
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        Ok(self.file.flush()?)
+    }
+}
+
 impl FileBackedIndex {
     pub(crate) fn new(base_path: PathBuf) -> Self {
         let parent = base_path
@@ -237,16 +271,8 @@ impl FileBackedIndex {
         Ok(())
     }
 
-    pub(crate) fn append_rowid_record(&self, rowid: u64, rows: u32) -> Result<()> {
-        std::fs::create_dir_all(&self.parent)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.rowid_buffer_path)?;
-        file.write_all(&rowid.to_le_bytes())?;
-        file.write_all(&rows.to_le_bytes())?;
-        file.flush()?;
-        Ok(())
+    pub(crate) fn rowid_record_appender(&self) -> Result<RowidRecordAppender> {
+        RowidRecordAppender::new(&self.rowid_buffer_path, &self.parent)
     }
 
     pub(crate) fn generation_files(&self) -> Result<Vec<PathBuf>> {
@@ -640,6 +666,50 @@ mod tests {
         write_rowid_records(&path, &records)?;
 
         assert_eq!(read_rowid_records(&path)?, records);
+        Ok(())
+    }
+
+    #[test]
+    fn rowid_record_appender_finishes_batch() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = FileBackedIndex::new(dir.path().join("standalone"));
+
+        let mut appender = index.rowid_record_appender()?;
+        appender.append(RowidRecord { rowid: 2, rows: 3 })?;
+        appender.append(RowidRecord { rowid: 9, rows: 0 })?;
+        appender.finish()?;
+
+        assert_eq!(
+            index.buffered_rowid_records()?,
+            vec![
+                RowidRecord { rowid: 2, rows: 3 },
+                RowidRecord { rowid: 9, rows: 0 },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rowid_record_appender_keeps_unfinished_batch_prefix() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let index = FileBackedIndex::new(dir.path().join("standalone"));
+        write_rowid_records(
+            index.rowid_buffer_path(),
+            &[RowidRecord { rowid: 2, rows: 3 }],
+        )?;
+
+        {
+            let mut appender = index.rowid_record_appender()?;
+            appender.append(RowidRecord { rowid: 9, rows: 0 })?;
+        }
+
+        assert_eq!(
+            index.buffered_rowid_records()?,
+            vec![
+                RowidRecord { rowid: 2, rows: 3 },
+                RowidRecord { rowid: 9, rows: 0 },
+            ]
+        );
         Ok(())
     }
 

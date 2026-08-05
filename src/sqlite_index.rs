@@ -1,4 +1,4 @@
-use crate::file_index::{sort_dedup_rowid_records, FileBackedIndex, RowidRecord};
+use crate::file_index::{FileBackedIndex, RowidRecord, RowidRecordAppender};
 use crate::packops::TensorPackOps;
 use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
@@ -6,9 +6,9 @@ use crate::{
     cached_embeddings_for_index, clear_generations_cache, document_cache_hash,
     dim_from_model_id, embed_query_for_search, hybrid_reciprocal_rank_fusion,
     index_buffered_embeddings_with_options, load_cached_embeddings, load_or_compute_cached_embeddings,
-    match_centroids_raw, query_token_salience_enabled, split_by_codepoints, CachedEmbeddings, DB,
-    DocPtr, Embedder, EmbeddingCache, EmbeddingsCache, IndexOptions, QueryEmbeddings,
-    SqlStatementInternal,
+    match_centroids_raw, model_id_for_dim, query_token_salience_enabled, split_by_codepoints,
+    CachedEmbeddings, DB, DocPtr, Embedder, EmbeddingCache, EmbeddingsCache, IndexOptions,
+    QueryEmbeddings, SqlStatementInternal,
 };
 use anyhow::Result;
 use candle_core::{Device, Tensor};
@@ -289,17 +289,30 @@ pub(crate) fn match_centroids_from_cache(
     threshold: f32,
     top_k: usize,
     sql_filter: Option<&crate::SqlStatementInternal>,
-    _embedder: Option<&Embedder>,
-    _cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+    cache: &dyn EmbeddingCache,
 ) -> Result<Vec<(f32, u32, u32)>> {
     let index = index_for_db(db);
     let generation_files = index.generation_files()?;
+    let source = if embedder.is_some() {
+        DocumentEmbeddingSource::new(db, cache)
+    } else {
+        DocumentEmbeddingSource::compatible(db, cache)
+    };
+    let buffered = index.buffered_rowid_records()?;
+    let unindexed = if !buffered.is_empty() {
+        unindexed_embeddings_for_buffered_rowids(db, &buffered, cache, embedder, &source)?
+    } else if generation_files.is_empty() {
+        unindexed_embeddings_for_current_documents(db, cache, embedder, &source)?
+    } else {
+        vec![]
+    };
 
     let scored_results = match_centroids_raw(
         &generation_files,
         query_embeddings,
         query_weights,
-        &[],
+        &unindexed,
         threshold,
         top_k,
     )?;
@@ -375,79 +388,432 @@ pub fn semantic_index_unavailable_reason(db: &DB) -> Result<Option<String>> {
     }
 }
 
-struct DocumentRowidPlan {
-    records: Vec<RowidRecord>,
-    hashes: HashMap<u64, String>,
+fn document_hash_for_rowid(db: &DB, rowid: u64) -> Result<Option<String>> {
+    let rowid: i64 = rowid.try_into()?;
+    let mut query = db.query(
+        "SELECT hash, body, lens FROM document
+         WHERE rowid = ?1 AND length(body) > 0",
+    )?;
+    let row = query
+        .query_row((rowid,), |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?;
+    Ok(row.map(|(hash, body, lens)| hash.unwrap_or_else(|| document_cache_hash(&body, &lens))))
 }
 
-impl DocumentRowidPlan {
-    fn new() -> Self {
-        Self {
-            records: vec![],
-            hashes: HashMap::new(),
-        }
-    }
-}
-
-fn current_document_rowid_plan(
+fn for_each_current_document_rowid_record(
     db: &DB,
     cache: &dyn EmbeddingCache,
     embedder: Option<&Embedder>,
-) -> Result<DocumentRowidPlan> {
+    mut f: impl FnMut(RowidRecord) -> Result<()>,
+) -> Result<()> {
+    if let Some(embedder) = embedder {
+        let mut query = db.query(
+            "SELECT rowid, hash, body, lens FROM document
+             WHERE length(body) > 0
+             ORDER BY rowid",
+        )?;
+        let rows = query.query_map((), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        for row in rows {
+            let (rowid, hash, body, lens) = row?;
+            let rowid: u64 = rowid.try_into()?;
+            let hash = hash.unwrap_or_else(|| document_cache_hash(&body, &lens));
+            let Some(embeddings) =
+                cached_embeddings_for_document(cache, Some(embedder), rowid, &hash, &body, &lens)?
+            else {
+                continue;
+            };
+            f(RowidRecord {
+                rowid,
+                rows: embeddings.embedding_count.try_into()?,
+            })?;
+        }
+        return Ok(());
+    }
+
     let mut query = db.query(
-        "SELECT rowid, hash, body, lens FROM document
+        "SELECT rowid, hash FROM document
          WHERE length(body) > 0
          ORDER BY rowid",
     )?;
     let rows = query.query_map((), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
     })?;
 
-    let mut plan = DocumentRowidPlan::new();
     for row in rows {
-        let (rowid, hash, body, lens) = row?;
-        let rowid_u64: u64 = rowid.try_into()?;
+        let (rowid, hash) = row?;
+        let rowid: u64 = rowid.try_into()?;
+        let hash = match hash {
+            Some(hash) => hash,
+            None => {
+                let Some(hash) = document_hash_for_rowid(db, rowid)? else {
+                    continue;
+                };
+                hash
+            }
+        };
+        let Some(embeddings) = load_cached_embeddings(cache, rowid, &hash)? else {
+            continue;
+        };
+        f(RowidRecord {
+            rowid,
+            rows: embeddings.embedding_count.try_into()?,
+        })?;
+    }
+    Ok(())
+}
+
+fn for_each_buffered_document_rowid_record(
+    db: &DB,
+    records: &[RowidRecord],
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+    mut f: impl FnMut(RowidRecord) -> Result<()>,
+) -> Result<()> {
+    let mut query = db.query(
+        "SELECT hash, body, lens FROM document
+         WHERE rowid = ?1 AND length(body) > 0",
+    )?;
+
+    for record in records.iter().copied().filter(|record| record.rows > 0) {
+        let rowid: i64 = record.rowid.try_into()?;
+        let row = query
+            .query_row((rowid,), |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?;
+        let Some((hash, body, lens)) = row else {
+            continue;
+        };
         let hash = hash.unwrap_or_else(|| document_cache_hash(&body, &lens));
         let Some(embeddings) =
-            cached_embeddings_for_document(cache, embedder, rowid_u64, &hash, &body, &lens)?
+            cached_embeddings_for_document(cache, embedder, record.rowid, &hash, &body, &lens)?
         else {
             continue;
         };
-        plan.hashes.insert(rowid_u64, hash);
-        plan.records.push(RowidRecord {
-            rowid: rowid_u64,
-            rows: embeddings.embedding_count.try_into()?,
-        });
+        anyhow::ensure!(
+            embeddings.embedding_count == record.rows as usize,
+            "rowid {} catalog says {} vectors but embedding blob has {}",
+            record.rowid,
+            record.rows,
+            embeddings.embedding_count
+        );
+        f(record)?;
     }
-    Ok(plan)
+    Ok(())
 }
 
-fn pending_rowid_records(
-    index: &FileBackedIndex,
-    current_records: &[RowidRecord],
-) -> Result<Vec<RowidRecord>> {
-    let mut known = index.all_rowid_map()?;
-    let mut pending = vec![];
+fn model_without_pruning_fraction(model: &str) -> Option<String> {
+    let (family, suffix) = model.rsplit_once("-p")?;
+    let dim_suffix = suffix.find("-d").map(|idx| &suffix[idx..]).unwrap_or("");
+    Some(format!("{family}{dim_suffix}"))
+}
 
-    for record in current_records {
-        match known.remove(&record.rowid) {
-            Some(rows) if rows == record.rows => {}
-            _ => pending.push(*record),
+fn cached_model_compatible_with_current_encoder(model: &str) -> bool {
+    let current = model_id_for_dim(dim_from_model_id(model));
+    match (
+        model_without_pruning_fraction(model),
+        model_without_pruning_fraction(&current),
+    ) {
+        (Some(model), Some(current)) => model == current,
+        _ => model == current,
+    }
+}
+
+fn normalize_compatible_cached_embeddings(
+    mut embeddings: CachedEmbeddings,
+) -> Option<CachedEmbeddings> {
+    if !cached_model_compatible_with_current_encoder(&embeddings.model) {
+        return None;
+    }
+    embeddings.model = model_id_for_dim(dim_from_model_id(&embeddings.model));
+    Some(embeddings)
+}
+
+fn current_model_sql_filter_values() -> (String, String) {
+    let current_model = model_id_for_dim(dim_from_model_id(""));
+    let family = current_model
+        .rsplit_once("-p")
+        .map(|(family, _)| family)
+        .unwrap_or(current_model.as_str());
+    let default_dim_models = format!("{family}-p[0-9][0-9][0-9]");
+    let dim_models = format!("{family}-p[0-9][0-9][0-9]-d[0-9]*");
+    (default_dim_models, dim_models)
+}
+
+fn for_each_current_sqlite_cached_document_rowid_record(
+    db: &DB,
+    mut f: impl FnMut(RowidRecord) -> Result<()>,
+) -> Result<()> {
+    let (default_dim_models, dim_models) = current_model_sql_filter_values();
+    let mut query = db.query(
+        "SELECT document.rowid, chunk.model, chunk.embedding_count
+         FROM document INDEXED BY document_nonempty_hash_index
+         JOIN chunk INDEXED BY chunk_hash_model_embedding_count_index
+         ON document.hash = chunk.hash
+         WHERE length(document.body) > 0
+           AND (chunk.model GLOB ?1 OR chunk.model GLOB ?2)",
+    )?;
+    let rows = query.query_map((&default_dim_models, &dim_models), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (rowid, model, embedding_count) = row?;
+        if !cached_model_compatible_with_current_encoder(&model) {
+            continue;
         }
+        f(RowidRecord {
+            rowid: rowid.try_into()?,
+            rows: embedding_count.try_into()?,
+        })?;
+    }
+    Ok(())
+}
+
+fn current_unmaterialized_embedding_count_from(
+    index: &FileBackedIndex,
+    for_each_record: impl FnOnce(&mut dyn FnMut(RowidRecord) -> Result<()>) -> Result<()>,
+) -> Result<usize> {
+    let indexed = index.indexed_rowid_map()?;
+    let mut count = 0usize;
+    let mut visit = |record: RowidRecord| {
+        if indexed.get(&record.rowid).copied() != Some(record.rows) {
+            count += record.rows as usize;
+        }
+        Ok(())
+    };
+    for_each_record(&mut visit)?;
+    Ok(count)
+}
+
+fn current_unmaterialized_embedding_count(
+    index: &FileBackedIndex,
+    db: &DB,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+) -> Result<usize> {
+    current_unmaterialized_embedding_count_from(index, |visit| {
+        for_each_current_document_rowid_record(db, cache, embedder, visit)
+    })
+}
+
+fn current_sqlite_cached_unmaterialized_embedding_count(
+    index: &FileBackedIndex,
+    db: &DB,
+) -> Result<usize> {
+    current_unmaterialized_embedding_count_from(index, |visit| {
+        for_each_current_sqlite_cached_document_rowid_record(db, visit)
+    })
+}
+
+fn current_document_row_count(db: &DB) -> Result<usize> {
+    let mut query = db.query("SELECT COUNT(*) FROM document WHERE length(body) > 0")?;
+    let total: i64 = query.query_row((), |row| row.get(0))?;
+    Ok(total.try_into()?)
+}
+
+fn current_sqlite_cached_document_row_count(db: &DB) -> Result<usize> {
+    let (default_dim_models, dim_models) = current_model_sql_filter_values();
+    let mut query = db.query(
+        "SELECT COUNT(*)
+         FROM document INDEXED BY document_nonempty_hash_index
+         JOIN chunk INDEXED BY chunk_hash_model_embedding_count_index
+         ON document.hash = chunk.hash
+         WHERE length(document.body) > 0
+           AND (chunk.model GLOB ?1 OR chunk.model GLOB ?2)",
+    )?;
+    let total: i64 = query.query_row((&default_dim_models, &dim_models), |row| row.get(0))?;
+    Ok(total.try_into()?)
+}
+
+fn append_unindexed_embedding(
+    unindexed: &mut Vec<(Vec<DocPtr>, Tensor)>,
+    record: RowidRecord,
+    cache: &dyn EmbeddingCache,
+) -> Result<()> {
+    if record.rows == 0 {
+        return Ok(());
     }
 
+    let cached = load_cached_embeddings(cache, record.rowid, "")?
+        .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {}", record.rowid))?;
+    anyhow::ensure!(
+        cached.embedding_count == record.rows as usize,
+        "rowid {} catalog says {} vectors but embedding blob has {}",
+        record.rowid,
+        record.rows,
+        cached.embedding_count
+    );
+    let embeddings = Tensor::embeddings_from_packed(
+        &cached.embeddings,
+        dim_from_model_id(&cached.model),
+        &Device::Cpu,
+    )?;
+    let rowid: u32 = record.rowid.try_into()?;
+    let ptrs = docptrs_for_cached_counts(rowid, &cached.counts);
+    anyhow::ensure!(
+        ptrs.len() == cached.embedding_count,
+        "rowid {} has {} embedding rows but {} document indices",
+        record.rowid,
+        cached.embedding_count,
+        ptrs.len()
+    );
+    unindexed.push((ptrs, embeddings));
+    Ok(())
+}
+
+fn unindexed_embeddings_for_buffered_rowids(
+    db: &DB,
+    records: &[RowidRecord],
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+    source: &dyn EmbeddingCache,
+) -> Result<Vec<(Vec<DocPtr>, Tensor)>> {
+    let mut unindexed = vec![];
+    for_each_buffered_document_rowid_record(db, records, cache, embedder, |record| {
+        append_unindexed_embedding(&mut unindexed, record, source)
+    })?;
+    Ok(unindexed)
+}
+
+fn unindexed_embeddings_for_current_documents(
+    db: &DB,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+    source: &dyn EmbeddingCache,
+) -> Result<Vec<(Vec<DocPtr>, Tensor)>> {
+    let mut unindexed = vec![];
+    for_each_current_document_rowid_record(db, cache, embedder, |record| {
+        append_unindexed_embedding(&mut unindexed, record, source)
+    })?;
+    Ok(unindexed)
+}
+
+#[derive(Default)]
+struct CurrentRowidDelta {
+    pending_records: usize,
+    unmaterialized_embeddings: usize,
+}
+
+fn append_rowid_record(
+    index: &FileBackedIndex,
+    appender: &mut Option<RowidRecordAppender>,
+    record: RowidRecord,
+) -> Result<()> {
+    if appender.is_none() {
+        *appender = Some(index.rowid_record_appender()?);
+    }
+    appender
+        .as_mut()
+        .expect("rowid appender should be initialized")
+        .append(record)
+}
+
+fn append_pending_rowid_records_from(
+    index: &FileBackedIndex,
+    db: &DB,
+    total: usize,
+    for_each_record: impl FnOnce(&mut dyn FnMut(RowidRecord) -> Result<()>) -> Result<()>,
+) -> Result<(CurrentRowidDelta, Vec<u64>)> {
+    let indexed = index.indexed_rowid_map()?;
+    let mut known = index.all_rowid_map()?;
+    let mut delta = CurrentRowidDelta::default();
+    let mut progress = ProgressReporter::new("queue rowids", total);
+    let mut appender = None;
+
+    {
+        let mut visit = |record: RowidRecord| {
+            if indexed.get(&record.rowid).copied() != Some(record.rows) {
+                delta.unmaterialized_embeddings += record.rows as usize;
+            }
+            match known.remove(&record.rowid) {
+                Some(rows) if rows == record.rows => {}
+                _ => {
+                    append_rowid_record(index, &mut appender, record)?;
+                    delta.pending_records += 1;
+                }
+            }
+            progress.inc(1);
+            Ok(())
+        };
+        for_each_record(&mut visit)?;
+    }
+    progress.finish();
+
+    let mut tombstones = HashSet::new();
     for (rowid, rows) in known {
         if rows > 0 {
-            pending.push(RowidRecord { rowid, rows: 0 });
+            tombstones.insert(rowid);
         }
     }
-    pending.sort_unstable_by_key(|record| record.rowid);
-    Ok(pending)
+
+    let (queued_tombstones, queued_tombstone_rowids) = queued_document_tombstones(db)?;
+    for tombstone in queued_tombstones {
+        tombstones.insert(tombstone.rowid);
+    }
+
+    let mut tombstones: Vec<_> = tombstones.into_iter().collect();
+    tombstones.sort_unstable();
+    for rowid in tombstones {
+        append_rowid_record(index, &mut appender, RowidRecord { rowid, rows: 0 })?;
+        delta.pending_records += 1;
+    }
+
+    if let Some(appender) = appender {
+        appender.finish()?;
+    }
+
+    Ok((delta, queued_tombstone_rowids))
+}
+
+fn append_pending_rowid_records(
+    index: &FileBackedIndex,
+    db: &DB,
+    cache: &dyn EmbeddingCache,
+    embedder: Option<&Embedder>,
+) -> Result<(CurrentRowidDelta, Vec<u64>)> {
+    let total = if embedder.is_some() {
+        current_document_row_count(db)?
+    } else {
+        0
+    };
+    append_pending_rowid_records_from(index, db, total, |visit| {
+        for_each_current_document_rowid_record(db, cache, embedder, visit)
+    })
+}
+
+fn append_pending_sqlite_cached_rowid_records(
+    index: &FileBackedIndex,
+    db: &DB,
+) -> Result<(CurrentRowidDelta, Vec<u64>)> {
+    append_pending_rowid_records_from(
+        index,
+        db,
+        current_sqlite_cached_document_row_count(db)?,
+        |visit| for_each_current_sqlite_cached_document_rowid_record(db, visit),
+    )
 }
 
 fn queued_document_tombstones(db: &DB) -> Result<(Vec<RowidRecord>, Vec<u64>)> {
@@ -484,26 +850,50 @@ fn clear_queued_document_tombstones(db: &DB, rowids: &[u64]) -> Result<()> {
 }
 
 struct DocumentEmbeddingSource<'a> {
+    db: &'a DB,
     cache: &'a dyn EmbeddingCache,
-    hashes: HashMap<u64, String>,
+    accept_compatible_models: bool,
 }
 
 impl<'a> DocumentEmbeddingSource<'a> {
-    fn new(cache: &'a dyn EmbeddingCache, hashes: HashMap<u64, String>) -> Self {
-        Self { cache, hashes }
+    fn new(db: &'a DB, cache: &'a dyn EmbeddingCache) -> Self {
+        Self {
+            db,
+            cache,
+            accept_compatible_models: false,
+        }
+    }
+
+    fn compatible(db: &'a DB, cache: &'a dyn EmbeddingCache) -> Self {
+        Self {
+            db,
+            cache,
+            accept_compatible_models: true,
+        }
+    }
+
+    fn filter_cached_embeddings(
+        &self,
+        embeddings: Option<CachedEmbeddings>,
+    ) -> Option<CachedEmbeddings> {
+        if self.accept_compatible_models {
+            embeddings.and_then(normalize_compatible_cached_embeddings)
+        } else {
+            embeddings
+        }
     }
 }
 
 impl EmbeddingCache for DocumentEmbeddingSource<'_> {
     fn get(&self, hash: &str) -> Result<Option<CachedEmbeddings>> {
-        self.cache.get(hash)
+        Ok(self.filter_cached_embeddings(self.cache.get(hash)?))
     }
 
     fn get_for_document(&self, rowid: u64, _hash: &str) -> Result<Option<CachedEmbeddings>> {
-        let Some(hash) = self.hashes.get(&rowid) else {
+        let Some(hash) = document_hash_for_rowid(self.db, rowid)? else {
             return Ok(None);
         };
-        self.cache.get(hash)
+        Ok(self.filter_cached_embeddings(self.cache.get_for_document(rowid, &hash)?))
     }
 
     fn put(&self, hash: &str, embeddings: &CachedEmbeddings) -> Result<()> {
@@ -681,20 +1071,6 @@ pub fn fulltext_search_with_prefix_wildcard(
     Ok(fts_matches)
 }
 
-fn unmaterialized_embedding_count(
-    index: &FileBackedIndex,
-    current_records: &[RowidRecord],
-) -> Result<usize> {
-    let indexed = index.indexed_rowid_map()?;
-    let mut count = 0usize;
-    for record in current_records {
-        if indexed.get(&record.rowid).copied() != Some(record.rows) {
-            count += record.rows as usize;
-        }
-    }
-    Ok(count)
-}
-
 pub fn embed_chunks_with_cache(
     db: &DB,
     embedder: &Embedder,
@@ -771,10 +1147,8 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
 }
 
 pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
-    let cache = SqliteEmbeddingCache::new(db);
     let index = index_for_db(db);
-    let current = current_document_rowid_plan(db, &cache, None)?;
-    unmaterialized_embedding_count(&index, &current.records)
+    current_sqlite_cached_unmaterialized_embedding_count(&index, db)
 }
 
 pub fn count_unindexed_embeddings_with_cache(
@@ -783,14 +1157,12 @@ pub fn count_unindexed_embeddings_with_cache(
     cache: &dyn EmbeddingCache,
 ) -> Result<usize> {
     let index = index_for_db(db);
-    let current = current_document_rowid_plan(db, cache, Some(embedder))?;
-    unmaterialized_embedding_count(&index, &current.records)
+    current_unmaterialized_embedding_count(&index, db, cache, Some(embedder))
 }
 
 pub fn count_unindexed_cached_embeddings(db: &DB, cache: &dyn EmbeddingCache) -> Result<usize> {
     let index = index_for_db(db);
-    let current = current_document_rowid_plan(db, cache, None)?;
-    unmaterialized_embedding_count(&index, &current.records)
+    current_unmaterialized_embedding_count(&index, db, cache, None)
 }
 
 fn cached_embeddings_for_document(
@@ -824,8 +1196,37 @@ pub fn index_chunks_with_options(
     reset: bool,
     options: IndexOptions,
 ) -> Result<()> {
+    if let Some(embedder) = embedder {
+        let cache = SqliteEmbeddingCache::new(db);
+        return index_chunks_with_cache_and_options(db, &cache, Some(embedder), reset, options);
+    }
+
+    let index = index_for_db(db);
+    if reset {
+        index.clear()?;
+        clear_generations_cache();
+        db.remove_all_bucket_data_sidecars();
+    }
+
+    let (delta, queued_tombstone_rowids) = append_pending_sqlite_cached_rowid_records(&index, db)?;
+    if delta.pending_records == 0 && delta.unmaterialized_embeddings == 0 {
+        clear_queued_document_tombstones(db, &queued_tombstone_rowids)?;
+        return Ok(());
+    }
+
+    clear_queued_document_tombstones(db, &queued_tombstone_rowids)?;
+
+    let indexed = index.indexed_embedding_count()?;
+    info!(
+        "database has {} unindexed embeddings ({} indexed)",
+        delta.unmaterialized_embeddings, indexed
+    );
+
     let cache = SqliteEmbeddingCache::new(db);
-    index_chunks_with_cache_and_options(db, &cache, embedder, reset, options)
+    let source = DocumentEmbeddingSource::compatible(db, &cache);
+    index_buffered_embeddings_with_options(&index, &source, options)?;
+    db.checkpoint();
+    Ok(())
 }
 
 pub fn index_chunks_with_cache(
@@ -851,27 +1252,26 @@ pub fn index_chunks_with_cache_and_options(
         db.remove_all_bucket_data_sidecars();
     }
 
-    let current = current_document_rowid_plan(db, cache, embedder)?;
-    let unmaterialized = unmaterialized_embedding_count(&index, &current.records)?;
-    let mut pending = pending_rowid_records(&index, &current.records)?;
-    let (queued_tombstones, queued_tombstone_rowids) = queued_document_tombstones(db)?;
-    pending.extend(queued_tombstones);
-    let pending = sort_dedup_rowid_records(pending);
-    if pending.is_empty() && unmaterialized == 0 {
+    let (delta, queued_tombstone_rowids) =
+        append_pending_rowid_records(&index, db, cache, embedder)?;
+    if delta.pending_records == 0 && delta.unmaterialized_embeddings == 0 {
         clear_queued_document_tombstones(db, &queued_tombstone_rowids)?;
         return Ok(());
     }
 
-    for record in &pending {
-        index.append_rowid_record(record.rowid, record.rows)?;
-    }
     clear_queued_document_tombstones(db, &queued_tombstone_rowids)?;
 
-    let x = unmaterialized;
     let indexed = index.indexed_embedding_count()?;
-    info!("database has {} unindexed embeddings ({} indexed)", x, indexed);
+    info!(
+        "database has {} unindexed embeddings ({} indexed)",
+        delta.unmaterialized_embeddings, indexed
+    );
 
-    let source = DocumentEmbeddingSource::new(cache, current.hashes);
+    let source = if embedder.is_some() {
+        DocumentEmbeddingSource::new(db, cache)
+    } else {
+        DocumentEmbeddingSource::compatible(db, cache)
+    };
     index_buffered_embeddings_with_options(&index, &source, options)?;
     db.checkpoint();
     Ok(())
@@ -1187,6 +1587,30 @@ mod tests {
 
     fn test_stopwords(words: &[&str]) -> HashSet<String> {
         words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn cached_model_compatibility_ignores_document_pruning_fraction() {
+        let current = model_id_for_dim(96);
+        let (family, suffix) = current.rsplit_once("-p").unwrap();
+        let dim_suffix = suffix.find("-d").map(|idx| &suffix[idx..]).unwrap_or("");
+        let alternate_pruning_fraction = format!("{family}-p025{dim_suffix}");
+
+        assert!(cached_model_compatible_with_current_encoder(&current));
+        assert!(cached_model_compatible_with_current_encoder(
+            &alternate_pruning_fraction
+        ));
+        let normalized = normalize_compatible_cached_embeddings(CachedEmbeddings {
+            model: alternate_pruning_fraction,
+            counts: "1".to_string(),
+            embedding_count: 1,
+            embeddings: vec![],
+        })
+        .unwrap();
+        assert_eq!(normalized.model, current);
+        assert!(!cached_model_compatible_with_current_encoder(
+            "other-encoder-p025-d96"
+        ));
     }
 
     #[test]

@@ -180,6 +180,9 @@ impl DB {
                  lens TEXT);
 
              CREATE INDEX document_index ON document(hash);
+             CREATE INDEX document_nonempty_hash_index
+                 ON document(hash)
+                 WHERE length(body) > 0;
 
              CREATE VIRTUAL TABLE document_fts
                  USING fts5(body, content='document', content_rowid='rowid',
@@ -215,6 +218,8 @@ impl DB {
                  embeddings BLOB NOT NULL,
                  counts TEXT NOT NULL,
                  embedding_count INTEGER NOT NULL);
+             CREATE INDEX chunk_hash_model_embedding_count_index
+                 ON chunk(hash, model, embedding_count);
 
              CREATE TRIGGER document_after_delete AFTER DELETE ON document
              BEGIN
@@ -308,6 +313,9 @@ impl DB {
 
         connection.execute_batch(&format!(
             "CREATE INDEX IF NOT EXISTS document_index ON document(hash);
+             CREATE INDEX IF NOT EXISTS document_nonempty_hash_index
+                 ON document(hash)
+                 WHERE length(body) > 0;
 
              CREATE TABLE IF NOT EXISTS chunk(
                  hash TEXT PRIMARY KEY CHECK (length(hash) = {HASH_CHARS}),
@@ -315,6 +323,8 @@ impl DB {
                  embeddings BLOB NOT NULL,
                  counts TEXT NOT NULL,
                  embedding_count INTEGER NOT NULL DEFAULT 0);
+             CREATE INDEX IF NOT EXISTS chunk_hash_model_embedding_count_index
+                 ON chunk(hash, model, embedding_count);
 
              CREATE TRIGGER IF NOT EXISTS document_after_delete AFTER DELETE ON document
              BEGIN
