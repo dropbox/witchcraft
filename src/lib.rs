@@ -2940,6 +2940,7 @@ fn cached_embeddings_for_rowid(
 fn sample_embeddings_for_rowids(
     records: &[RowidRecord],
     cache: &dyn EmbeddingCache,
+    expected_count: usize,
 ) -> Result<(Tensor, usize)> {
     let mut total_embeddings = 0;
     #[cfg(any(test, feature = "deterministic"))]
@@ -2947,6 +2948,7 @@ fn sample_embeddings_for_rowids(
     #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
     let mut all_embeddings = vec![];
+    let bar = progress::new_with_label(expected_count as u64, "sampling");
 
     for record in active_rowid_records(records) {
         let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
@@ -2970,7 +2972,9 @@ fn sample_embeddings_for_rowids(
             all_embeddings.push(row);
         }
         total_embeddings += m;
+        bar.inc(m as u64);
     }
+    bar.finish();
 
     if all_embeddings.is_empty() {
         return Ok((
@@ -3622,7 +3626,7 @@ fn learn_residual_radius_levels(
     // It converged to nearly uniform bins and regressed nfcorpus at 2 and 3 bits,
     // so keep angle quantization analytic and only learn the residual radii.
     let levels = packops::lloyd_max_radius_levels(&radii, residual_quant_bits)?;
-    info!(
+    debug!(
         "Lloyd-Max polar radius levels bits={} samples={} levels={:?}",
         residual_quant_bits,
         radii.len(),
@@ -3954,7 +3958,7 @@ fn build_index_generation(
         return Ok(None);
     }
 
-    let (matrix, total_embeddings) = sample_embeddings_for_rowids(records, cache)?;
+    let (matrix, total_embeddings) = sample_embeddings_for_rowids(records, cache, active_embeddings)?;
     if total_embeddings == 0 {
         return Ok(None);
     }

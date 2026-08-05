@@ -3,12 +3,12 @@ use crate::packops::TensorPackOps;
 use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
-    cached_embeddings_for_index, clear_generations_cache, document_cache_hash,
-    dim_from_model_id, embed_query_for_search, hybrid_reciprocal_rank_fusion,
-    index_buffered_embeddings_with_options, load_cached_embeddings, load_or_compute_cached_embeddings,
-    match_centroids_raw, model_id_for_dim, query_token_salience_enabled, split_by_codepoints,
-    CachedEmbeddings, DB, DocPtr, Embedder, EmbeddingCache, EmbeddingsCache, IndexOptions,
-    QueryEmbeddings, SqlStatementInternal,
+    cached_embeddings_for_index, clear_generations_cache, dim_from_model_id, document_cache_hash,
+    embed_query_for_search, hybrid_reciprocal_rank_fusion, index_buffered_embeddings_with_options,
+    load_cached_embeddings, load_or_compute_cached_embeddings, match_centroids_raw,
+    model_id_for_dim, query_token_salience_enabled, split_by_codepoints, CachedEmbeddings, DocPtr,
+    Embedder, EmbeddingCache, EmbeddingsCache, IndexOptions, QueryEmbeddings, SqlStatementInternal,
+    DB,
 };
 use anyhow::Result;
 use candle_core::{Device, Tensor};
@@ -166,7 +166,8 @@ fn flush_exact_batch(
     let ptrs = std::mem::take(ptrs);
     for (query_idx, query) in query_embeddings.iter().enumerate() {
         let unindexed = vec![(ptrs.clone(), matrix.clone())];
-        let mut batch = match_centroids_raw(&[], query, None, &unindexed, f32::NEG_INFINITY, top_k)?;
+        let mut batch =
+            match_centroids_raw(&[], query, None, &unindexed, f32::NEG_INFINITY, top_k)?;
         out[query_idx].append(&mut batch);
         out[query_idx].sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         out[query_idx].truncate(top_k);
@@ -214,10 +215,7 @@ pub fn exact_match_centroids_bulk(
          ORDER BY rowid",
     )?;
     let documents = query.query_map((), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<String>>(1)?,
-        ))
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
     })?;
 
     let mut ptrs = Vec::new();
@@ -252,10 +250,24 @@ pub fn exact_match_centroids_bulk(
         ptrs.extend(docptrs);
         tensors.push(embeddings);
         if rows >= EXACT_BATCH_ROWS {
-            flush_exact_batch(query_embeddings, &mut ptrs, &mut tensors, &mut rows, top_k, &mut out)?;
+            flush_exact_batch(
+                query_embeddings,
+                &mut ptrs,
+                &mut tensors,
+                &mut rows,
+                top_k,
+                &mut out,
+            )?;
         }
     }
-    flush_exact_batch(query_embeddings, &mut ptrs, &mut tensors, &mut rows, top_k, &mut out)?;
+    flush_exact_batch(
+        query_embeddings,
+        &mut ptrs,
+        &mut tensors,
+        &mut rows,
+        top_k,
+        &mut out,
+    )?;
     Ok(out)
 }
 
@@ -377,7 +389,8 @@ pub fn semantic_index_unavailable_reason(db: &DB) -> Result<Option<String>> {
     if !index.generation_files()?.is_empty() {
         return Ok(None);
     }
-    let has_documents = db.query("SELECT 1 FROM document WHERE length(body) > 0 LIMIT 1")?
+    let has_documents = db
+        .query("SELECT 1 FROM document WHERE length(body) > 0 LIMIT 1")?
         .query_row((), |_| Ok(()))
         .optional()?
         .is_some();
@@ -390,20 +403,27 @@ pub fn semantic_index_unavailable_reason(db: &DB) -> Result<Option<String>> {
 
 fn document_hash_for_rowid(db: &DB, rowid: u64) -> Result<Option<String>> {
     let rowid: i64 = rowid.try_into()?;
-    let mut query = db.query(
-        "SELECT hash, body, lens FROM document
+    let mut hash_query = db.query(
+        "SELECT hash FROM document
+         WHERE rowid = ?1 AND length(body) > 0 AND hash IS NOT NULL",
+    )?;
+    if let Some(hash) = hash_query
+        .query_row((rowid,), |row| row.get::<_, String>(0))
+        .optional()?
+    {
+        return Ok(Some(hash));
+    }
+
+    let mut body_query = db.query(
+        "SELECT body, lens FROM document
          WHERE rowid = ?1 AND length(body) > 0",
     )?;
-    let row = query
+    let row = body_query
         .query_row((rowid,), |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .optional()?;
-    Ok(row.map(|(hash, body, lens)| hash.unwrap_or_else(|| document_cache_hash(&body, &lens))))
+    Ok(row.map(|(body, lens)| document_cache_hash(&body, &lens)))
 }
 
 fn for_each_current_document_rowid_record(
@@ -853,6 +873,7 @@ struct DocumentEmbeddingSource<'a> {
     db: &'a DB,
     cache: &'a dyn EmbeddingCache,
     accept_compatible_models: bool,
+    resolve_hash_for_rowid: bool,
 }
 
 impl<'a> DocumentEmbeddingSource<'a> {
@@ -861,6 +882,7 @@ impl<'a> DocumentEmbeddingSource<'a> {
             db,
             cache,
             accept_compatible_models: false,
+            resolve_hash_for_rowid: true,
         }
     }
 
@@ -869,6 +891,16 @@ impl<'a> DocumentEmbeddingSource<'a> {
             db,
             cache,
             accept_compatible_models: true,
+            resolve_hash_for_rowid: true,
+        }
+    }
+
+    fn compatible_with_rowid_lookup(db: &'a DB, cache: &'a dyn EmbeddingCache) -> Self {
+        Self {
+            db,
+            cache,
+            accept_compatible_models: true,
+            resolve_hash_for_rowid: false,
         }
     }
 
@@ -889,7 +921,11 @@ impl EmbeddingCache for DocumentEmbeddingSource<'_> {
         Ok(self.filter_cached_embeddings(self.cache.get(hash)?))
     }
 
-    fn get_for_document(&self, rowid: u64, _hash: &str) -> Result<Option<CachedEmbeddings>> {
+    fn get_for_document(&self, rowid: u64, hash: &str) -> Result<Option<CachedEmbeddings>> {
+        if !hash.is_empty() || !self.resolve_hash_for_rowid {
+            return Ok(self.filter_cached_embeddings(self.cache.get_for_document(rowid, hash)?));
+        }
+
         let Some(hash) = document_hash_for_rowid(self.db, rowid)? else {
             return Ok(None);
         };
@@ -902,12 +938,10 @@ impl EmbeddingCache for DocumentEmbeddingSource<'_> {
 }
 
 fn load_fts_stopwords(db: &DB) -> Result<HashSet<String>> {
-    let mut exists_query =
-        db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'document_fts_stopword'")?;
-    let has_stopword_table = exists_query
-        .query_row((), |_| Ok(()))
-        .optional()?
-        .is_some();
+    let mut exists_query = db.query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'document_fts_stopword'",
+    )?;
+    let has_stopword_table = exists_query.query_row((), |_| Ok(())).optional()?.is_some();
     if !has_stopword_table {
         debug!("document_fts_stopword table missing; continuing without FTS stopwords");
         return Ok(HashSet::new());
@@ -1125,8 +1159,14 @@ pub fn embed_chunks_with_cache(
     for result in documents.by_ref() {
         let (rowid, hash, body, lens) = result?;
         let hash = hash.unwrap_or_else(|| document_cache_hash(&body, &lens));
-        let (_cached, computed) =
-            load_or_compute_cached_embeddings(cache, rowid.try_into()?, &hash, &body, &lens, embedder)?;
+        let (_cached, computed) = load_or_compute_cached_embeddings(
+            cache,
+            rowid.try_into()?,
+            &hash,
+            &body,
+            &lens,
+            embedder,
+        )?;
         if computed {
             count += 1;
         }
@@ -1182,11 +1222,7 @@ fn cached_embeddings_for_document(
     }
 }
 
-pub fn index_chunks(
-    db: &DB,
-    embedder: Option<&Embedder>,
-    reset: bool,
-) -> Result<()> {
+pub fn index_chunks(db: &DB, embedder: Option<&Embedder>, reset: bool) -> Result<()> {
     index_chunks_with_options(db, embedder, reset, IndexOptions::default())
 }
 
@@ -1223,7 +1259,7 @@ pub fn index_chunks_with_options(
     );
 
     let cache = SqliteEmbeddingCache::new(db);
-    let source = DocumentEmbeddingSource::compatible(db, &cache);
+    let source = DocumentEmbeddingSource::compatible_with_rowid_lookup(db, &cache);
     index_buffered_embeddings_with_options(&index, &source, options)?;
     db.checkpoint();
     Ok(())
@@ -1339,13 +1375,7 @@ fn search_inner(
     let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
 
     let fts_matches = if use_fulltext {
-        fulltext_search_with_prefix_wildcard(
-            db,
-            &q,
-            top_k,
-            sql_filter,
-            fulltext_prefix_wildcard,
-        )?
+        fulltext_search_with_prefix_wildcard(db, &q, top_k, sql_filter, fulltext_prefix_wildcard)?
     } else {
         vec![]
     };
@@ -1385,11 +1415,17 @@ fn search_inner(
         offsets.insert(key, *offset);
     }
 
-    let sem_idxs: Vec<DocPtr> = sem_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
+    let sem_idxs: Vec<DocPtr> = sem_matches
+        .iter()
+        .map(|&(_, idx, sub_idx)| (idx, sub_idx))
+        .collect();
     info!("semantic search found {} matches", sem_idxs.len());
 
     let mut fused = if use_fulltext {
-        let fts_idxs: Vec<DocPtr> = fts_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
+        let fts_idxs: Vec<DocPtr> = fts_matches
+            .iter()
+            .map(|&(_, idx, sub_idx)| (idx, sub_idx))
+            .collect();
         hybrid_reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
     } else {
         sem_idxs
@@ -1400,30 +1436,33 @@ fn search_inner(
     // Stale bucket entries from before a re-chunking may have out-of-range sub_idx
     // values that clamp to the same position, producing duplicates.
     let mut seen: HashMap<u32, bool> = HashMap::new();
-    let mut body_query = db.query("SELECT metadata,body,lens,date FROM document WHERE rowid = ?1")?;
+    let mut body_query =
+        db.query("SELECT metadata,body,lens,date FROM document WHERE rowid = ?1")?;
     for (idx, sub_idx) in fused {
-        let tuple : DocPtr = (idx, sub_idx);
+        let tuple: DocPtr = (idx, sub_idx);
         let score = match scores.get(&tuple) {
             Some(score) => *score,
             None => 0.0f32,
         };
-        let row = body_query.query_row((idx,), |row| {
-            let (metadata, body, lens, date) = (
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            );
-            let lens: Vec<usize> = lens
-                .split(',')
-                .map(|x| x.parse::<usize>().unwrap())
-                .collect();
-            let bodies: Vec<String> = split_by_codepoints(&body, &lens)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect();
-            Ok((metadata, bodies, date))
-        }).optional()?;
+        let row = body_query
+            .query_row((idx,), |row| {
+                let (metadata, body, lens, date) = (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                );
+                let lens: Vec<usize> = lens
+                    .split(',')
+                    .map(|x| x.parse::<usize>().unwrap())
+                    .collect();
+                let bodies: Vec<String> = split_by_codepoints(&body, &lens)
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                Ok((metadata, bodies, date))
+            })
+            .optional()?;
         let Some((metadata, bodies, date)) = row else {
             continue;
         };
@@ -1554,9 +1593,15 @@ fn search_rowids_inner(
         vec![]
     };
 
-    let sem_idxs: Vec<DocPtr> = sem_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
+    let sem_idxs: Vec<DocPtr> = sem_matches
+        .iter()
+        .map(|&(_, idx, sub_idx)| (idx, sub_idx))
+        .collect();
     let mut fused = if use_fulltext {
-        let fts_idxs: Vec<DocPtr> = fts_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
+        let fts_idxs: Vec<DocPtr> = fts_matches
+            .iter()
+            .map(|&(_, idx, sub_idx)| (idx, sub_idx))
+            .collect();
         hybrid_reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
     } else {
         sem_idxs
@@ -1616,8 +1661,7 @@ mod tests {
     #[test]
     fn fts5_query_splits_punctuation_and_uses_or_terms() {
         let stopwords = HashSet::new();
-        let (query, normalized) =
-            fts5_query("what is the origin of COVID-19", &stopwords).unwrap();
+        let (query, normalized) = fts5_query("what is the origin of COVID-19", &stopwords).unwrap();
 
         assert_eq!(
             query,
@@ -1629,12 +1673,9 @@ mod tests {
     #[test]
     fn fts5_query_can_enable_final_prefix_wildcard() {
         let stopwords = HashSet::new();
-        let (query, normalized) = fts5_query_with_prefix_wildcard(
-            "what is the origin of COVID-19",
-            true,
-            &stopwords,
-        )
-        .unwrap();
+        let (query, normalized) =
+            fts5_query_with_prefix_wildcard("what is the origin of COVID-19", true, &stopwords)
+                .unwrap();
 
         assert_eq!(
             query,
@@ -1649,8 +1690,7 @@ mod tests {
     #[test]
     fn fts5_query_filters_configured_stopwords() {
         let stopwords = test_stopwords(&["is", "of", "the"]);
-        let (query, normalized) =
-            fts5_query("what is the origin of COVID-19", &stopwords).unwrap();
+        let (query, normalized) = fts5_query("what is the origin of COVID-19", &stopwords).unwrap();
 
         assert_eq!(query, "\"what\" OR \"origin\" OR \"COVID\" OR \"19\"");
         assert_eq!(normalized, "what origin COVID 19");
