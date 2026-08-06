@@ -257,6 +257,9 @@ nfcorpus-score: prereqs env/pyvenv.cfg testset/nfcorpus/questions.test.tsv tests
 treccovid-score: treccovid-testset
 	./treccovid-score.sh querycsv output-treccovid.txt
 
+treccovid-hybrid-score: treccovid-testset
+	./treccovid-score.sh hybridcsv output-treccovid.txt
+
 treccovid-fulltext-score: treccovid-testset
 	./treccovid-score.sh fulltextcsv output-treccovid-fulltext.txt
 
