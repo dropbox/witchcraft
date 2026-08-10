@@ -3579,7 +3579,6 @@ fn assign_with_index_kmeans(data: &Tensor, routing: &IndexKMeansNode) -> Result<
     Ok(assignments)
 }
 
-#[cfg(feature = "polar-quant")]
 fn learn_residual_radius_levels(
     embeddings: &[Tensor],
     index_kmeans: &IndexKMeans,
@@ -3633,16 +3632,6 @@ fn learn_residual_radius_levels(
         levels
     );
     Ok(Some(levels))
-}
-
-#[cfg(not(feature = "polar-quant"))]
-fn learn_residual_radius_levels(
-    _embeddings: &[Tensor],
-    _index_kmeans: &IndexKMeans,
-    _residual_centers_cpu: &Tensor,
-    _residual_quant_bits: u8,
-) -> Result<Option<Vec<f32>>> {
-    Ok(None)
 }
 
 fn write_bucket_batch(
