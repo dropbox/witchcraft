@@ -2573,6 +2573,14 @@ pub fn match_centroids_raw(
     let device = query_embeddings.device();
     let generations = load_generations(generation_files, device)?;
     let total_start = std::time::Instant::now();
+    let indexed_generations_use_hadamard = generations
+        .iter()
+        .filter(|gen| !gen.sizes.is_empty())
+        .try_fold(true, |all, gen| {
+            Ok::<_, anyhow::Error>(
+                all && packops::residual_quant_uses_hadamard(gen.residual_quant_bits)?,
+            )
+        })?;
 
     let k = 32;
     let t_prime = 40000;
@@ -2689,13 +2697,23 @@ pub fn match_centroids_raw(
                 residual_bytes.len(),
                 gen.residual_bytes
             );
-            let residuals = packops::residuals_from_bytes(
-                residual_bytes,
-                gen.dim,
-                &gen.residual_dequant_table,
-                gen.residual_quant_bits,
-                &Device::Cpu,
-            )?;
+            let residuals = if indexed_generations_use_hadamard {
+                packops::residuals_from_bytes_in_quantized_domain(
+                    residual_bytes,
+                    gen.dim,
+                    &gen.residual_dequant_table,
+                    gen.residual_quant_bits,
+                    &Device::Cpu,
+                )?
+            } else {
+                packops::residuals_from_bytes(
+                    residual_bytes,
+                    gen.dim,
+                    &gen.residual_dequant_table,
+                    gen.residual_quant_bits,
+                    &Device::Cpu,
+                )?
+            };
             let (num_docs, _) = residuals.dims2()?;
             anyhow::ensure!(
                 num_docs == document_indices.len(),
@@ -2723,9 +2741,19 @@ pub fn match_centroids_raw(
     if !all_residuals.is_empty() {
         let all_residuals = Tensor::cat(&all_residuals, 0)?;
         let all_residuals = all_residuals.to_device(device)?;
+        let rotated_query_embeddings = if indexed_generations_use_hadamard {
+            Some(packops::rotate_rows_for_hadamard_residual_similarity(
+                query_embeddings,
+            )?)
+        } else {
+            None
+        };
+        let residual_query_embeddings = rotated_query_embeddings
+            .as_ref()
+            .unwrap_or(query_embeddings);
 
         let residual_sims =
-            fast_ops::matmul_t(query_embeddings, &all_residuals)?.transpose(0, 1)?;
+            fast_ops::matmul_t(residual_query_embeddings, &all_residuals)?.transpose(0, 1)?;
         let residual_sims = residual_sims.to_device(&Device::Cpu)?;
         let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
 

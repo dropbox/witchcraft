@@ -199,13 +199,31 @@ fn random_hadamard_inverse_rotate_row(row: &mut [f32]) -> Result<()> {
 
 pub(crate) fn preprocess_residual_for_quantization(row: &mut [f32], bits: u8) -> Result<()> {
     validate_residual_quant_bits(bits)?;
-    if matches!(
-        bits,
-        POLAR2_HADAMARD_QUANT_BITS | POLAR3_HADAMARD_QUANT_BITS
-    ) {
+    if residual_quant_uses_hadamard(bits)? {
         random_hadamard_rotate_row(row)?;
     }
     Ok(())
+}
+
+pub(crate) fn residual_quant_uses_hadamard(bits: u8) -> Result<bool> {
+    validate_residual_quant_bits(bits)?;
+    Ok(matches!(
+        bits,
+        POLAR2_HADAMARD_QUANT_BITS | POLAR3_HADAMARD_QUANT_BITS
+    ))
+}
+
+pub(crate) fn rotate_rows_for_hadamard_residual_similarity(rows: &Tensor) -> Result<Tensor> {
+    let device = rows.device();
+    let (row_count, cols) = rows.dims2()?;
+    let mut flat = rows
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    for row in flat.chunks_exact_mut(cols) {
+        random_hadamard_rotate_row(row)?;
+    }
+    Ok(Tensor::from_vec(flat, &[row_count, cols], &Device::Cpu)?.to_device(device)?)
 }
 
 fn quantize_polar_radius_with_levels(radius: f32, levels: &[f32], max_code: u8) -> u8 {
@@ -672,6 +690,27 @@ pub(crate) fn residuals_from_bytes(
     bits: u8,
     device: &Device,
 ) -> Result<Tensor> {
+    residuals_from_bytes_with_hadamard_inverse(bytes, cols, table, bits, device, true)
+}
+
+pub(crate) fn residuals_from_bytes_in_quantized_domain(
+    bytes: &[u8],
+    cols: usize,
+    table: &ResidualDequantTable,
+    bits: u8,
+    device: &Device,
+) -> Result<Tensor> {
+    residuals_from_bytes_with_hadamard_inverse(bytes, cols, table, bits, device, false)
+}
+
+fn residuals_from_bytes_with_hadamard_inverse(
+    bytes: &[u8],
+    cols: usize,
+    table: &ResidualDequantTable,
+    bits: u8,
+    device: &Device,
+    inverse_hadamard: bool,
+) -> Result<Tensor> {
     validate_residual_quant_bits(bits)?;
     let out = match bits {
         2 => Polar2Bit::decode_rows(bytes, cols, &table.q2),
@@ -679,15 +718,19 @@ pub(crate) fn residuals_from_bytes(
         4 => Polar4Bit::decode_rows(bytes, cols, &table.q4),
         POLAR2_HADAMARD_QUANT_BITS => {
             let mut out = Polar2Bit::decode_rows(bytes, cols, &table.q2);
-            for row in out.chunks_exact_mut(cols) {
-                random_hadamard_inverse_rotate_row(row)?;
+            if inverse_hadamard {
+                for row in out.chunks_exact_mut(cols) {
+                    random_hadamard_inverse_rotate_row(row)?;
+                }
             }
             out
         }
         POLAR3_HADAMARD_QUANT_BITS => {
             let mut out = Polar3Bit::decode_rows(bytes, cols, &table.q3);
-            for row in out.chunks_exact_mut(cols) {
-                random_hadamard_inverse_rotate_row(row)?;
+            if inverse_hadamard {
+                for row in out.chunks_exact_mut(cols) {
+                    random_hadamard_inverse_rotate_row(row)?;
+                }
             }
             out
         }

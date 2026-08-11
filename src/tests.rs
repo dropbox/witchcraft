@@ -767,6 +767,36 @@ mod tests {
             let decoded =
                 crate::packops::residuals_from_bytes(&bytes, 8, &table, bits, &Device::Cpu)?;
             assert_eq!(decoded.dims2()?, (1, 8));
+
+            let raw_decoded = crate::packops::residuals_from_bytes_in_quantized_domain(
+                &bytes,
+                8,
+                &table,
+                bits,
+                &Device::Cpu,
+            )?;
+            let query = Tensor::from_vec(
+                vec![-0.25f32, 0.5, 0.125, -0.75, 1.0, 0.25, -0.5, 0.375],
+                (1, 8),
+                &Device::Cpu,
+            )?;
+            let rotated_query =
+                crate::packops::rotate_rows_for_hadamard_residual_similarity(&query)?;
+            let decoded = decoded.flatten_all()?.to_vec1::<f32>()?;
+            let raw_decoded = raw_decoded.flatten_all()?.to_vec1::<f32>()?;
+            let query = query.flatten_all()?.to_vec1::<f32>()?;
+            let rotated_query = rotated_query.flatten_all()?.to_vec1::<f32>()?;
+            let original_dot: f32 = query
+                .iter()
+                .zip(decoded.iter())
+                .map(|(query, residual)| query * residual)
+                .sum();
+            let rotated_dot: f32 = rotated_query
+                .iter()
+                .zip(raw_decoded.iter())
+                .map(|(query, residual)| query * residual)
+                .sum();
+            assert!((original_dot - rotated_dot).abs() < 1e-5);
         }
         Ok(())
     }
