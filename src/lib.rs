@@ -138,7 +138,9 @@ const BUCKET_DATA_APP_ID: u32 = file_index::GENERATION_DATA_APP_ID;
 const BUCKET_DATA_VERSION: u32 = file_index::GENERATION_DATA_VERSION;
 const BUCKET_SCALAR_META_BYTES: usize = 20;
 const BUCKET_DATA_HEADER_BYTES: usize = file_index::GENERATION_DATA_HEADER_BYTES;
-pub(crate) const BUCKET_CENTER_FORMAT: u32 = 3;
+const BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA: u32 = 3;
+const BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA: u32 = 4;
+pub(crate) const BUCKET_CENTER_FORMAT: u32 = BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA;
 #[cfg(not(test))]
 const L0_CAPACITY: usize = 1024;
 #[cfg(test)]
@@ -235,7 +237,7 @@ fn center_block_bytes_for_count(
     center_format: u32,
 ) -> Result<usize> {
     match center_format {
-        BUCKET_CENTER_FORMAT => {
+        BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA => {
             let scale_len = centroid_count
                 .checked_mul(std::mem::size_of::<f32>())
                 .ok_or_else(|| anyhow::anyhow!("bucket center scale block length overflow"))?;
@@ -929,7 +931,16 @@ fn encode_q4_center_residual_block(
     coarse_tree: &CoarseTree,
     centroid_count: usize,
     dim: usize,
+    center_format: u32,
 ) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        matches!(
+            center_format,
+            BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA
+        ),
+        "bucket center format {center_format} is not supported"
+    );
+    let use_hadamard = center_format == BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA;
     let f32_row_bytes = f32_center_bytes_for_dim(dim);
     let expected_f32_len = centroid_count
         .checked_mul(f32_row_bytes)
@@ -957,7 +968,7 @@ fn encode_q4_center_residual_block(
             .checked_mul(f32_row_bytes)
             .ok_or_else(|| anyhow::anyhow!("f32 center row offset overflow"))?;
         let leaf_idx = leaf_by_bucket[centroid_idx];
-        let mut max_abs = 0.0f32;
+        let mut delta = Vec::with_capacity(dim);
         for dim_idx in 0..dim {
             let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
             let value = f32::from_le_bytes(f32_block[offset..offset + 4].try_into()?);
@@ -967,9 +978,15 @@ fn encode_q4_center_residual_block(
             } else {
                 parent_value(parent_info.as_ref(), leaf_idx, dim, dim_idx)?
             };
-            max_abs = max_abs.max((value - base).abs());
+            delta.push(value - base);
+        }
+        if use_hadamard {
+            packops::hadamard_rotate_values(&mut delta)?;
         }
 
+        let max_abs = delta.iter().fold(0.0f32, |max_abs, &value| {
+            max_abs.max(value.abs())
+        });
         let scale = packops::signed_q4_scale(max_abs);
         let scale_offset = centroid_idx * std::mem::size_of::<f32>();
         encoded[scale_offset..scale_offset + 4].copy_from_slice(&scale.to_le_bytes());
@@ -980,15 +997,8 @@ fn encode_q4_center_residual_block(
         let code_start = scale_len + centroid_idx * packed_row_bytes;
         let code_end = code_start + packed_row_bytes;
         let codes = &mut encoded[code_start..code_end];
-        for dim_idx in 0..dim {
-            let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
-            let value = f32::from_le_bytes(f32_block[offset..offset + 4].try_into()?);
-            let base = if leaf_idx == usize::MAX {
-                0.0
-            } else {
-                parent_value(parent_info.as_ref(), leaf_idx, dim, dim_idx)?
-            };
-            let packed = packops::quantize_signed_q4(value - base, scale);
+        for (dim_idx, &value) in delta.iter().enumerate() {
+            let packed = packops::quantize_signed_q4(value, scale);
             packops::write_signed_q4_code(codes, dim_idx, packed);
         }
     }
@@ -1002,8 +1012,17 @@ fn decode_q4_center_residual_block(
     coarse_tree: &CoarseTree,
     centroid_count: usize,
     dim: usize,
+    center_format: u32,
 ) -> Result<Vec<u8>> {
-    let expected_len = center_block_bytes_for_count(centroid_count, dim, BUCKET_CENTER_FORMAT)?;
+    anyhow::ensure!(
+        matches!(
+            center_format,
+            BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA
+        ),
+        "bucket center format {center_format} is not supported"
+    );
+    let use_hadamard = center_format == BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA;
+    let expected_len = center_block_bytes_for_count(centroid_count, dim, center_format)?;
     anyhow::ensure!(
         q4_block.len() == expected_len,
         "q4 center block length is invalid"
@@ -1032,6 +1051,7 @@ fn decode_q4_center_residual_block(
             .checked_mul(f32_row_bytes)
             .ok_or_else(|| anyhow::anyhow!("f32 center row offset overflow"))?;
         let leaf_idx = leaf_by_bucket[centroid_idx];
+        let mut delta = vec![0.0f32; dim];
         for (byte_idx, &byte) in q4_block[code_start..code_start + packed_row_bytes]
             .iter()
             .enumerate()
@@ -1043,15 +1063,21 @@ fn decode_q4_center_residual_block(
                 if dim_idx >= dim {
                     break;
                 }
-                let base = if leaf_idx == usize::MAX {
-                    0.0
-                } else {
-                    parent_value(parent_info.as_ref(), leaf_idx, dim, dim_idx)?
-                };
-                let value = base + values[lane] * scale;
-                let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
-                decoded[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                delta[dim_idx] = values[lane] * scale;
             }
+        }
+        if use_hadamard {
+            packops::hadamard_inverse_rotate_values(&mut delta)?;
+        }
+        for (dim_idx, &delta) in delta.iter().enumerate() {
+            let base = if leaf_idx == usize::MAX {
+                0.0
+            } else {
+                parent_value(parent_info.as_ref(), leaf_idx, dim, dim_idx)?
+            };
+            let value = base + delta;
+            let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
+            decoded[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
         }
     }
 
@@ -1067,13 +1093,14 @@ fn center_block_to_f32_bytes(
     center_format: u32,
 ) -> Result<Vec<u8>> {
     match center_format {
-        BUCKET_CENTER_FORMAT => {
+        BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA => {
             decode_q4_center_residual_block(
                 center_block,
                 bucket_indices,
                 coarse_tree,
                 centroid_count,
                 dim,
+                center_format,
             )
         }
         _ => anyhow::bail!("bucket center format {center_format} is not supported"),
@@ -1305,7 +1332,7 @@ fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<B
     offset += std::mem::size_of::<u32>();
     let center_format = read_u32_le(prefix, offset)?;
     match center_format {
-        BUCKET_CENTER_FORMAT => {}
+        BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA => {}
         _ => anyhow::bail!("bucket center format {center_format} is not supported"),
     }
     offset += std::mem::size_of::<u32>();
@@ -1559,6 +1586,7 @@ fn prepare_center_sidecar_data(
         &coarse_tree,
         centroid_count,
         center_dim,
+        BUCKET_CENTER_FORMAT,
     )?;
     let residual_center_block = center_block_to_f32_bytes(
         &stored_center_block,

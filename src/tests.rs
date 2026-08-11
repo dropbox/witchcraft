@@ -802,6 +802,58 @@ mod tests {
     }
 
     #[test]
+    fn test_center_q4_formats_decode_finite_centers() -> anyhow::Result<()> {
+        use crate::packops::TensorPackOps;
+
+        let center_count = 20usize;
+        let dim = 8usize;
+        let centers: Vec<f32> = (0..center_count * dim)
+            .map(|idx| {
+                let row = idx / dim;
+                let col = idx % dim;
+                ((row as f32 + 1.0) * (col as f32 - 3.5)) / 100.0
+            })
+            .collect();
+        let centers = Tensor::from_vec(centers, (center_count, dim), &Device::Cpu)?;
+        let center_block = centers.to_f32_bytes()?;
+        let bucket_indices: Vec<usize> = (0..center_count).collect();
+        let coarse_tree =
+            crate::build_coarse_tree_from_bucket_indices(&bucket_indices, &center_block, dim)?;
+
+        for center_format in [
+            crate::BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA,
+            crate::BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA,
+        ] {
+            let encoded = crate::encode_q4_center_residual_block(
+                &center_block,
+                &bucket_indices,
+                &coarse_tree,
+                center_count,
+                dim,
+                center_format,
+            )?;
+            assert_eq!(
+                encoded.len(),
+                crate::center_block_bytes_for_count(center_count, dim, center_format)?
+            );
+            let decoded = crate::center_block_to_f32_bytes(
+                &encoded,
+                &bucket_indices,
+                &coarse_tree,
+                center_count,
+                dim,
+                center_format,
+            )?;
+            let decoded = Tensor::from_f32_bytes(&decoded, dim, &Device::Cpu)?;
+            assert_eq!(decoded.dims2()?, (center_count, dim));
+            let decoded = decoded.flatten_all()?.to_vec1::<f32>()?;
+            assert!(decoded.iter().all(|value| value.is_finite()));
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_semantic_index_readiness_reports_stale_and_missing_indexes() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("stale.sqlite");

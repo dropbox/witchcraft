@@ -197,6 +197,14 @@ fn random_hadamard_inverse_rotate_row(row: &mut [f32]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn hadamard_rotate_values(row: &mut [f32]) -> Result<()> {
+    random_hadamard_rotate_row(row)
+}
+
+pub(crate) fn hadamard_inverse_rotate_values(row: &mut [f32]) -> Result<()> {
+    random_hadamard_inverse_rotate_row(row)
+}
+
 pub(crate) fn preprocess_residual_for_quantization(row: &mut [f32], bits: u8) -> Result<()> {
     validate_residual_quant_bits(bits)?;
     if residual_quant_uses_hadamard(bits)? {
