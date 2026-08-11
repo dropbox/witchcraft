@@ -734,6 +734,44 @@ mod tests {
     }
 
     #[test]
+    fn test_hadamard_polar_quantization_layout() -> anyhow::Result<()> {
+        use crate::packops::{
+            TensorPackOps, POLAR2_HADAMARD_QUANT_BITS, POLAR3_HADAMARD_QUANT_BITS,
+        };
+
+        for (bits, radius_bits, radius_levels, row_bytes) in [
+            (POLAR2_HADAMARD_QUANT_BITS, 2, 4, 2),
+            (POLAR3_HADAMARD_QUANT_BITS, 3, 8, 3),
+        ] {
+            assert_eq!(crate::packops::residual_radius_bits(bits)?, radius_bits);
+            assert_eq!(
+                crate::packops::residual_radius_level_count(bits)?,
+                radius_levels
+            );
+            assert_eq!(crate::packops::polar_row_bytes(8, bits)?, row_bytes);
+
+            let mut row = vec![1.0f32, 0.0, 0.25, -0.25, 0.5, 0.125, -0.375, 0.75];
+            let norm_before: f32 = row.iter().map(|value| value * value).sum();
+            crate::packops::preprocess_residual_for_quantization(&mut row, bits)?;
+            let norm_after: f32 = row.iter().map(|value| value * value).sum();
+            assert!((norm_before - norm_after).abs() < 1e-5);
+
+            let residual = Tensor::from_vec(
+                vec![1.0f32, 0.0, 0.25, -0.25, 0.5, 0.125, -0.375, 0.75],
+                (1, 8),
+                &Device::Cpu,
+            )?;
+            let bytes = residual.to_polar_bytes(bits)?;
+            assert_eq!(bytes.len(), row_bytes);
+            let table = crate::packops::make_residual_dequant_table_with_radius_levels(bits, None)?;
+            let decoded =
+                crate::packops::residuals_from_bytes(&bytes, 8, &table, bits, &Device::Cpu)?;
+            assert_eq!(decoded.dims2()?, (1, 8));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_semantic_index_readiness_reports_stale_and_missing_indexes() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let path = dir.path().join("stale.sqlite");

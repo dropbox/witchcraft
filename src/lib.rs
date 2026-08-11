@@ -1352,40 +1352,11 @@ fn bucket_data_header_from_file(file: &File, sidecar_len: usize) -> Result<Bucke
 }
 
 fn validate_residual_radius_levels(levels: &[f32], residual_quant_bits: u8) -> Result<()> {
-    packops::validate_residual_quant_bits(residual_quant_bits)?;
-    anyhow::ensure!(
-        residual_quant_bits != 0,
-        "Lloyd-Max radius levels require polar residual quantization"
-    );
-    let expected = 1usize << usize::from(residual_quant_bits);
-    anyhow::ensure!(
-        levels.len() == expected,
-        "Lloyd-Max radius level count {} does not match expected {}",
-        levels.len(),
-        expected
-    );
-    let mut previous = f32::NEG_INFINITY;
-    for &level in levels {
-        anyhow::ensure!(level.is_finite(), "Lloyd-Max radius level is not finite");
-        anyhow::ensure!(
-            level >= 0.0,
-            "Lloyd-Max radius level {level} must be non-negative"
-        );
-        anyhow::ensure!(
-            level >= previous,
-            "Lloyd-Max radius levels must be sorted"
-        );
-        previous = level;
-    }
-    Ok(())
+    packops::validate_polar_radius_levels(levels, residual_quant_bits)
 }
 
 fn residual_radius_levels_byte_len(residual_quant_bits: u8) -> Result<usize> {
-    packops::validate_residual_quant_bits(residual_quant_bits)?;
-    if residual_quant_bits == 0 {
-        return Ok(0);
-    }
-    Ok((1usize << usize::from(residual_quant_bits)) * std::mem::size_of::<f32>())
+    Ok(packops::residual_radius_level_count(residual_quant_bits)? * std::mem::size_of::<f32>())
 }
 
 fn residual_radius_levels_to_bytes(
@@ -3614,9 +3585,14 @@ fn learn_residual_radius_levels(
         );
         let row_offset = row * dim;
         let center_offset = bucket * dim;
+        let mut residual = Vec::with_capacity(dim);
+        for dim_idx in 0..dim {
+            residual.push(data[row_offset + dim_idx] - centers[center_offset + dim_idx]);
+        }
+        packops::preprocess_residual_for_quantization(&mut residual, residual_quant_bits)?;
         for dim_idx in (0..dim).step_by(2) {
-            let x = data[row_offset + dim_idx] - centers[center_offset + dim_idx];
-            let y = data[row_offset + dim_idx + 1] - centers[center_offset + dim_idx + 1];
+            let x = residual[dim_idx];
+            let y = residual[dim_idx + 1];
             radii.push(x.mul_add(x, y * y).sqrt());
         }
     }

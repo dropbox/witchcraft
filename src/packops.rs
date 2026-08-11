@@ -9,7 +9,9 @@ const MAX_WINDOW_ROWS: usize = 1024;
 const RANS_BITS: u32 = 12;
 const RANGE: f32 = 29.0;
 const POLAR_COMPANDING_PARAM: f32 = 255.0;
-pub(crate) const DEFAULT_RESIDUAL_QUANT_BITS: u8 = 2;
+pub(crate) const POLAR2_HADAMARD_QUANT_BITS: u8 = 6;
+pub(crate) const POLAR3_HADAMARD_QUANT_BITS: u8 = 5;
+pub(crate) const DEFAULT_RESIDUAL_QUANT_BITS: u8 = POLAR2_HADAMARD_QUANT_BITS;
 
 const fn signed_q4_decode_nibble(code: u8) -> f32 {
     if code >= 8 {
@@ -84,9 +86,8 @@ fn dequantize_polar_radius(code: u8, max_radius: f32, max_code: u8) -> f32 {
     normalized * max_radius
 }
 
-pub(crate) fn validate_polar_radius_levels(levels: &[f32], bits: u8) -> Result<()> {
-    validate_residual_quant_bits(bits)?;
-    let expected = 1usize << usize::from(bits);
+fn validate_polar_radius_level_bits(levels: &[f32], radius_bits: u8) -> Result<()> {
+    let expected = 1usize << usize::from(radius_bits);
     anyhow::ensure!(
         levels.len() == expected,
         "Lloyd-Max radius level count {} does not match expected {}",
@@ -100,11 +101,109 @@ pub(crate) fn validate_polar_radius_levels(levels: &[f32], bits: u8) -> Result<(
             level >= 0.0,
             "Lloyd-Max radius level {level} must be non-negative"
         );
-        anyhow::ensure!(
-            level >= previous,
-            "Lloyd-Max radius levels must be sorted"
-        );
+        anyhow::ensure!(level >= previous, "Lloyd-Max radius levels must be sorted");
         previous = level;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_polar_radius_levels(levels: &[f32], bits: u8) -> Result<()> {
+    validate_polar_radius_level_bits(levels, residual_radius_bits(bits)?)
+}
+
+pub(crate) fn residual_radius_bits(bits: u8) -> Result<u8> {
+    validate_residual_quant_bits(bits)?;
+    Ok(match bits {
+        POLAR2_HADAMARD_QUANT_BITS => 2,
+        POLAR3_HADAMARD_QUANT_BITS => 3,
+        bits => bits,
+    })
+}
+
+pub(crate) fn residual_radius_level_count(bits: u8) -> Result<usize> {
+    Ok(1usize << usize::from(residual_radius_bits(bits)?))
+}
+
+fn validate_hadamard_width(cols: usize) -> Result<()> {
+    anyhow::ensure!(
+        cols > 0,
+        "Hadamard-rotated polar residuals require non-zero dimension"
+    );
+    Ok(())
+}
+
+fn hadamard_sign(index: usize) -> f32 {
+    let mut x = (index as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    if x & 1 == 0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+fn normalized_fwht_power_of_two(row: &mut [f32]) {
+    debug_assert!(row.len().is_power_of_two());
+    let mut step = 1usize;
+    while step < row.len() {
+        for block in row.chunks_exact_mut(2 * step) {
+            for idx in 0..step {
+                let x = block[idx];
+                let y = block[idx + step];
+                block[idx] = x + y;
+                block[idx + step] = x - y;
+            }
+        }
+        step *= 2;
+    }
+    let scale = 1.0 / (row.len() as f32).sqrt();
+    for value in row {
+        *value *= scale;
+    }
+}
+
+fn normalized_fwht(row: &mut [f32]) -> Result<()> {
+    validate_hadamard_width(row.len())?;
+    let mut offset = 0usize;
+    while offset < row.len() {
+        let remaining = row.len() - offset;
+        let block_len = if remaining.is_power_of_two() {
+            remaining
+        } else {
+            remaining.next_power_of_two() / 2
+        };
+        normalized_fwht_power_of_two(&mut row[offset..offset + block_len]);
+        offset += block_len;
+    }
+    Ok(())
+}
+
+fn random_hadamard_rotate_row(row: &mut [f32]) -> Result<()> {
+    for (idx, value) in row.iter_mut().enumerate() {
+        *value *= hadamard_sign(idx);
+    }
+    normalized_fwht(row)
+}
+
+fn random_hadamard_inverse_rotate_row(row: &mut [f32]) -> Result<()> {
+    normalized_fwht(row)?;
+    for (idx, value) in row.iter_mut().enumerate() {
+        *value *= hadamard_sign(idx);
+    }
+    Ok(())
+}
+
+pub(crate) fn preprocess_residual_for_quantization(row: &mut [f32], bits: u8) -> Result<()> {
+    validate_residual_quant_bits(bits)?;
+    if matches!(
+        bits,
+        POLAR2_HADAMARD_QUANT_BITS | POLAR3_HADAMARD_QUANT_BITS
+    ) {
+        random_hadamard_rotate_row(row)?;
     }
     Ok(())
 }
@@ -157,12 +256,12 @@ fn lloyd_max_levels_from_sorted(sorted: &[f32], level_count: usize, iterations: 
 }
 
 pub(crate) fn lloyd_max_radius_levels(samples: &[f32], bits: u8) -> Result<Vec<f32>> {
-    validate_residual_quant_bits(bits)?;
+    let radius_bits = residual_radius_bits(bits)?;
     anyhow::ensure!(
         !samples.is_empty(),
         "cannot train Lloyd-Max radius quantizer without samples"
     );
-    let level_count = 1usize << usize::from(bits);
+    let level_count = 1usize << usize::from(radius_bits);
     let mut sorted: Vec<f32> = samples
         .iter()
         .copied()
@@ -219,9 +318,7 @@ pub(crate) trait PolarMode {
         let radius = (x.mul_add(x, y * y)).sqrt();
         let angle_code = Self::quantize_angle(y.atan2(x));
         let radius_code = match levels {
-            Some(levels) => {
-                quantize_polar_radius_with_levels(radius, levels, Self::max_code())
-            }
+            Some(levels) => quantize_polar_radius_with_levels(radius, levels, Self::max_code()),
             None => Self::quantize_radius(radius),
         };
         (radius_code << Self::BITS) | angle_code
@@ -265,10 +362,7 @@ pub(crate) trait PolarMode {
         (code.min(Self::max_code()) as f32) * std::f32::consts::TAU / Self::level_count() as f32
     }
 
-    fn residual_centroid_confidence_weight(
-        _centroid_score: f32,
-        _score_range: (f32, f32),
-    ) -> f32 {
+    fn residual_centroid_confidence_weight(_centroid_score: f32, _score_range: (f32, f32)) -> f32 {
         1.0
     }
 }
@@ -350,10 +444,7 @@ impl PolarMode for Polar2Bit {
         out
     }
 
-    fn residual_centroid_confidence_weight(
-        centroid_score: f32,
-        score_range: (f32, f32),
-    ) -> f32 {
+    fn residual_centroid_confidence_weight(centroid_score: f32, score_range: (f32, f32)) -> f32 {
         centroid_confidence_weight(centroid_score, score_range)
     }
 }
@@ -435,10 +526,7 @@ impl PolarMode for Polar3Bit {
         out
     }
 
-    fn residual_centroid_confidence_weight(
-        centroid_score: f32,
-        score_range: (f32, f32),
-    ) -> f32 {
+    fn residual_centroid_confidence_weight(centroid_score: f32, score_range: (f32, f32)) -> f32 {
         centroid_confidence_weight(centroid_score, score_range)
     }
 }
@@ -483,10 +571,7 @@ impl PolarMode for Polar4Bit {
         out
     }
 
-    fn residual_centroid_confidence_weight(
-        centroid_score: f32,
-        score_range: (f32, f32),
-    ) -> f32 {
+    fn residual_centroid_confidence_weight(centroid_score: f32, score_range: (f32, f32)) -> f32 {
         centroid_confidence_weight(centroid_score, score_range)
     }
 }
@@ -501,8 +586,11 @@ pub(crate) type ResidualDequantTable = PolarDequantTables;
 
 pub(crate) fn validate_residual_quant_bits(bits: u8) -> Result<()> {
     anyhow::ensure!(
-        matches!(bits, 2 | 3 | 4),
-        "polar residual quantization bits must be 2, 3, or 4, got {bits}"
+        matches!(
+            bits,
+            2 | 3 | 4 | POLAR2_HADAMARD_QUANT_BITS | POLAR3_HADAMARD_QUANT_BITS
+        ),
+        "polar residual quantization bits must be 2, 3, 4, 5 (Hadamard + 3-bit), or 6 (Hadamard + 2-bit), got {bits}"
     );
     Ok(())
 }
@@ -516,6 +604,12 @@ pub(crate) fn residual_centroid_confidence_weight(
         2 => Polar2Bit::residual_centroid_confidence_weight(centroid_score, score_range),
         3 => Polar3Bit::residual_centroid_confidence_weight(centroid_score, score_range),
         4 => Polar4Bit::residual_centroid_confidence_weight(centroid_score, score_range),
+        POLAR2_HADAMARD_QUANT_BITS => {
+            Polar2Bit::residual_centroid_confidence_weight(centroid_score, score_range)
+        }
+        POLAR3_HADAMARD_QUANT_BITS => {
+            Polar3Bit::residual_centroid_confidence_weight(centroid_score, score_range)
+        }
         _ => 1.0,
     }
 }
@@ -541,12 +635,12 @@ pub(crate) fn make_residual_dequant_table_with_radius_levels(
 ) -> Result<ResidualDequantTable> {
     validate_residual_quant_bits(bits)?;
     Ok(PolarDequantTables {
-        q2: if bits == 2 {
+        q2: if matches!(bits, 2 | POLAR2_HADAMARD_QUANT_BITS) {
             make_polar2_dequant_table_with_radius_levels(levels)?
         } else {
             Polar2Bit::make_dequant_table()
         },
-        q3: if bits == 3 {
+        q3: if matches!(bits, 3 | POLAR3_HADAMARD_QUANT_BITS) {
             make_pair_table_with_radius_levels::<Polar3Bit, 64>(levels)?
         } else {
             Polar3Bit::make_dequant_table()
@@ -583,6 +677,20 @@ pub(crate) fn residuals_from_bytes(
         2 => Polar2Bit::decode_rows(bytes, cols, &table.q2),
         3 => Polar3Bit::decode_rows(bytes, cols, &table.q3),
         4 => Polar4Bit::decode_rows(bytes, cols, &table.q4),
+        POLAR2_HADAMARD_QUANT_BITS => {
+            let mut out = Polar2Bit::decode_rows(bytes, cols, &table.q2);
+            for row in out.chunks_exact_mut(cols) {
+                random_hadamard_inverse_rotate_row(row)?;
+            }
+            out
+        }
+        POLAR3_HADAMARD_QUANT_BITS => {
+            let mut out = Polar3Bit::decode_rows(bytes, cols, &table.q3);
+            for row in out.chunks_exact_mut(cols) {
+                random_hadamard_inverse_rotate_row(row)?;
+            }
+            out
+        }
         _ => unreachable!(),
     };
     assert!(
@@ -609,6 +717,16 @@ pub(crate) fn polar_row_bytes(cols: usize, bits: u8) -> Result<usize> {
         4 => {
             Polar4Bit::assert_row_width(cols);
             Polar4Bit::row_bytes(cols)
+        }
+        POLAR2_HADAMARD_QUANT_BITS => {
+            validate_hadamard_width(cols)?;
+            Polar2Bit::assert_row_width(cols);
+            Polar2Bit::row_bytes(cols)
+        }
+        POLAR3_HADAMARD_QUANT_BITS => {
+            validate_hadamard_width(cols)?;
+            Polar3Bit::assert_row_width(cols);
+            Polar3Bit::row_bytes(cols)
         }
         _ => unreachable!(),
     };
@@ -1020,12 +1138,20 @@ impl TensorPackOps for Tensor {
     }
 
     fn to_polar_bytes(&self, bits: u8) -> Result<Vec<u8>> {
-        let flat = self.flatten_all()?.to_vec1::<f32>()?;
+        let mut flat = self.flatten_all()?.to_vec1::<f32>()?;
         validate_residual_quant_bits(bits)?;
         let bytes = match bits {
             2 => Polar2Bit::encode_row(&flat),
             3 => Polar3Bit::encode_row(&flat),
             4 => Polar4Bit::encode_row(&flat),
+            POLAR2_HADAMARD_QUANT_BITS => {
+                preprocess_residual_for_quantization(&mut flat, bits)?;
+                Polar2Bit::encode_row(&flat)
+            }
+            POLAR3_HADAMARD_QUANT_BITS => {
+                preprocess_residual_for_quantization(&mut flat, bits)?;
+                Polar3Bit::encode_row(&flat)
+            }
             _ => unreachable!(),
         };
         Ok(bytes)
@@ -1039,7 +1165,7 @@ impl TensorPackOps for Tensor {
         let Some(levels) = levels else {
             return self.to_polar_bytes(bits);
         };
-        let flat = self.flatten_all()?.to_vec1::<f32>()?;
+        let mut flat = self.flatten_all()?.to_vec1::<f32>()?;
         validate_residual_quant_bits(bits)?;
         let bytes = match bits {
             2 => {
@@ -1098,6 +1224,53 @@ impl TensorPackOps for Tensor {
                         Some(levels),
                     ));
                 }
+                packed
+            }
+            POLAR2_HADAMARD_QUANT_BITS => {
+                preprocess_residual_for_quantization(&mut flat, bits)?;
+                Polar2Bit::assert_row_width(flat.len());
+                validate_polar_radius_levels(levels, bits)?;
+                let mut packed = Vec::with_capacity(flat.len() / 4);
+                for pair_pair in flat.chunks_exact(4) {
+                    let high = Polar2Bit::encode_pair_code_with_radius_levels(
+                        pair_pair[0],
+                        pair_pair[1],
+                        Some(levels),
+                    );
+                    let low = Polar2Bit::encode_pair_code_with_radius_levels(
+                        pair_pair[2],
+                        pair_pair[3],
+                        Some(levels),
+                    );
+                    packed.push((high << 4) | low);
+                }
+                packed
+            }
+            POLAR3_HADAMARD_QUANT_BITS => {
+                preprocess_residual_for_quantization(&mut flat, bits)?;
+                Polar3Bit::assert_row_width(flat.len());
+                validate_polar_radius_levels(levels, bits)?;
+                let mut packed = Vec::with_capacity(Polar3Bit::row_bytes(flat.len()));
+                let mut acc = 0u32;
+                let mut acc_bits = 0usize;
+                for pair in flat.chunks_exact(2) {
+                    let code = Polar3Bit::encode_pair_code_with_radius_levels(
+                        pair[0],
+                        pair[1],
+                        Some(levels),
+                    );
+                    acc |= (code as u32) << acc_bits;
+                    acc_bits += 6;
+                    while acc_bits >= 8 {
+                        packed.push(acc as u8);
+                        acc >>= 8;
+                        acc_bits -= 8;
+                    }
+                }
+                if acc_bits > 0 {
+                    packed.push(acc as u8);
+                }
+                debug_assert_eq!(packed.len(), Polar3Bit::row_bytes(flat.len()));
                 packed
             }
             _ => unreachable!(),
