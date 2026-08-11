@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{Level, LevelFilter, Metadata, Record};
 use std::env;
 use std::io::Write;
@@ -365,9 +365,18 @@ struct SearchResult {
     source: String,
     branch: String,
     conv_key: String,
+    slack_open: Option<SlackOpenTarget>,
     bodies: Vec<String>,
     match_idx: usize,
     turns: Vec<TurnMeta>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SlackOpenTarget {
+    team_id: String,
+    channel_id: String,
+    root_ts: String,
+    conv_key: String,
 }
 
 // A turn from the original JSONL session file
@@ -700,6 +709,7 @@ fn parse_search_results(
                 source: meta["source"].as_str().unwrap_or("claude").to_string(),
                 branch: meta["branch"].as_str().unwrap_or("").to_string(),
                 conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
+                slack_open: slack_open_target_from_metadata(&meta),
                 bodies,
                 match_idx: idx,
                 turns: turns_arr,
@@ -885,6 +895,7 @@ fn search_tui(
     list_state.select(Some(0));
     let mut scroll_offset: usize = 0;
     let mut resume_session: Option<BranchSession> = None;
+    let mut slack_to_open: Option<SlackOpenTarget> = None;
     let mut confirm_resume: Option<BranchSession> = None;
     let mut searching = false;
     let mut search_filter = String::new();
@@ -906,6 +917,12 @@ fn search_tui(
             let area = f.area();
             let show_footer = confirm_resume.is_some() && matches!(view, View::Detail(_));
             let show_search = searching || !search_filter.is_empty();
+            let current_result = match view {
+                View::List => results.get(selected),
+                View::Detail(idx) => results.get(idx),
+            };
+            let can_open_slack = current_result.and_then(|r| r.slack_open.as_ref()).is_some();
+            let can_resume = current_result.map(can_resume_result).unwrap_or(false);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(if show_footer {
@@ -921,7 +938,10 @@ fn search_tui(
             } else {
                 match view {
                     View::List => "↑↓/jk navigate  ⏎ open  / search  q quit",
-                    View::Detail(idx) if !results[idx].session_id.is_empty() => {
+                    View::Detail(_) if can_open_slack => {
+                        "↑↓/jk scroll  r open slack  / search  esc back  q quit"
+                    }
+                    View::Detail(_) if can_resume => {
                         "↑↓/jk scroll  r resume  / search  esc back  q quit"
                     }
                     View::Detail(_) => "↑↓/jk scroll  / search  esc back  q quit",
@@ -1326,7 +1346,10 @@ fn search_tui(
                 }
                 (View::Detail(idx), KeyCode::Char('r'), _) => {
                     let r = &results[*idx];
-                    if !r.session_id.is_empty() {
+                    if let Some(target) = r.slack_open.clone() {
+                        slack_to_open = Some(target);
+                        break;
+                    } else if can_resume_result(r) {
                         let cwd = if !r.cwd.is_empty() {
                             r.cwd.clone()
                         } else {
@@ -1357,6 +1380,10 @@ fn search_tui(
 
     disable_raw_mode()?;
     crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    if let Some(target) = slack_to_open {
+        let url = open_slack_target(&target)?;
+        eprintln!("opened {url}");
+    }
     Ok(resume_session)
 }
 
@@ -1460,6 +1487,145 @@ fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
     }
 }
 
+fn parse_slack_conv_key(conv_key: &str) -> Option<(String, String, bool)> {
+    let (rest, is_thread) = if let Some(rest) = conv_key.strip_prefix("thr:") {
+        (rest, true)
+    } else if let Some(rest) = conv_key.strip_prefix("sess:") {
+        (rest, false)
+    } else {
+        return None;
+    };
+    let (channel_id, ts) = rest.rsplit_once('-')?;
+    if channel_id.is_empty() || ts.is_empty() {
+        None
+    } else {
+        Some((channel_id.to_string(), ts.to_string(), is_thread))
+    }
+}
+
+fn slack_open_target_from_metadata(meta: &serde_json::Value) -> Option<SlackOpenTarget> {
+    if meta["source"].as_str()? != "slack" {
+        return None;
+    }
+
+    let conv_key = meta["conv_key"].as_str().unwrap_or("").to_string();
+    let parsed = parse_slack_conv_key(&conv_key);
+    let channel_id = meta["channel_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| parsed.as_ref().map(|(channel_id, _, _)| channel_id.clone()))?;
+    let root_ts = meta["root_ts"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| parsed.as_ref().map(|(_, ts, _)| ts.clone()))
+        .unwrap_or_default();
+
+    Some(SlackOpenTarget {
+        team_id: meta["team_id"].as_str().unwrap_or("").to_string(),
+        channel_id,
+        root_ts,
+        conv_key,
+    })
+}
+
+fn slack_deep_link(team_id: &str, channel_id: &str, ts: &str) -> Option<String> {
+    if team_id.is_empty() || channel_id.is_empty() || ts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "slack://channel?team={team_id}&id={channel_id}&message={ts}"
+        ))
+    }
+}
+
+fn slack_channel_redirect(team_id: &str, channel_id: &str) -> Option<String> {
+    if channel_id.is_empty() {
+        None
+    } else if team_id.is_empty() {
+        Some(format!("https://slack.com/app_redirect?channel={channel_id}"))
+    } else {
+        Some(format!(
+            "https://slack.com/app_redirect?channel={channel_id}&team={team_id}"
+        ))
+    }
+}
+
+fn slack_thread_redirect(team_id: &str, channel_id: &str, thread_ts: &str) -> Option<String> {
+    if channel_id.is_empty() || thread_ts.is_empty() {
+        return None;
+    }
+    let base = if team_id.is_empty() {
+        "https://app.slack.com/client/".to_string()
+    } else {
+        format!("https://app.slack.com/client/{team_id}/")
+    };
+    Some(format!("{base}{channel_id}/thread/{channel_id}-{thread_ts}"))
+}
+
+fn slack_open_url(target: &SlackOpenTarget) -> Option<String> {
+    let is_thread = parse_slack_conv_key(&target.conv_key)
+        .map(|(_, _, is_thread)| is_thread)
+        .unwrap_or(false);
+    if is_thread {
+        slack_thread_redirect(&target.team_id, &target.channel_id, &target.root_ts)
+    } else {
+        slack_deep_link(&target.team_id, &target.channel_id, &target.root_ts)
+            .or_else(|| slack_channel_redirect(&target.team_id, &target.channel_id))
+    }
+}
+
+fn open_url(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut cmd = std::process::Command::new("open");
+        cmd.arg(url);
+        cmd
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg(url);
+        cmd
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(url);
+        cmd
+    };
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    compile_error!("unsupported platform for open_url");
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to launch opener for {url}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("opener exited with {status} for {url}");
+    }
+}
+
+fn open_slack_target(target: &SlackOpenTarget) -> Result<String> {
+    let url = slack_open_url(target).context("Slack result has no openable channel URL")?;
+    match open_url(&url) {
+        Ok(()) => Ok(url),
+        Err(_err) if url.starts_with("slack://") => {
+            let fallback = slack_channel_redirect(&target.team_id, &target.channel_id)
+                .context("Slack result has no browser fallback URL")?;
+            open_url(&fallback).with_context(|| {
+                format!("failed to open native Slack URL {url}; browser fallback also failed")
+            })?;
+            Ok(fallback)
+        }
+        Err(err) => Err(err),
+    }
+}
 
 /// Extract a display tag from a Slack conv_key.
 /// Thread keys (`thr:CHAN-TS`) → `thr:TS` (the thread timestamp, usable with --session).
@@ -1517,6 +1683,10 @@ fn read_or_indexed_turn(r: &SearchResult, turn_idx: usize, tm: &TurnMeta) -> Opt
     read_turn_at(&r.path, &r.source, tm)
         .filter(|turn| !turn.text.trim().is_empty())
         .or_else(|| indexed_turn(r, turn_idx, tm))
+}
+
+fn can_resume_result(r: &SearchResult) -> bool {
+    !r.session_id.is_empty() && matches!(r.source.as_str(), "claude" | "codex" | "pi")
 }
 
 fn first_line(text: &str) -> String {
@@ -1781,6 +1951,7 @@ fn find_recent_sessions(db_name: &PathBuf, branch: Option<&str>) -> Result<Vec<S
             source: meta["source"].as_str().unwrap_or("claude").to_string(),
             branch: meta["branch"].as_str().unwrap_or("").to_string(),
             conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
+            slack_open: slack_open_target_from_metadata(&meta),
             bodies: vec![body.clone()],
             match_idx: 0,
             turns: turns_arr,
@@ -2280,6 +2451,7 @@ mod tests {
             source: "claude".to_string(),
             branch: String::new(),
             conv_key: String::new(),
+            slack_open: None,
             bodies: vec![
                 "[project] title\n".to_string(),
                 "[User] run oxidize\nmore text\n".to_string(),
@@ -2331,6 +2503,50 @@ mod tests {
         assert_eq!(f.statement_type, SqlStatementType::Group);
         assert_eq!(f.logic, Some(SqlLogic::And));
         assert_eq!(f.statements.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_slack_channel_open_url_uses_native_deep_link() {
+        let meta = serde_json::json!({
+            "source": "slack",
+            "team_id": "T1",
+            "channel_id": "C1",
+            "conv_key": "sess:C1-1000.000100",
+            "root_ts": "1000.000100"
+        });
+        let target = slack_open_target_from_metadata(&meta).unwrap();
+        assert_eq!(
+            slack_open_url(&target).as_deref(),
+            Some("slack://channel?team=T1&id=C1&message=1000.000100")
+        );
+    }
+
+    #[test]
+    fn test_slack_thread_open_url_uses_https_thread_redirect() {
+        let meta = serde_json::json!({
+            "source": "slack",
+            "team_id": "T1",
+            "channel_id": "C1",
+            "conv_key": "thr:C1-1000.000100",
+            "root_ts": "1000.000100"
+        });
+        let target = slack_open_target_from_metadata(&meta).unwrap();
+        assert_eq!(
+            slack_open_url(&target).as_deref(),
+            Some("https://app.slack.com/client/T1/C1/thread/C1-1000.000100")
+        );
+    }
+
+    #[test]
+    fn test_slack_open_target_falls_back_to_conv_key_parts() {
+        let meta = serde_json::json!({
+            "source": "slack",
+            "team_id": "T1",
+            "conv_key": "thr:C1-1000.000100"
+        });
+        let target = slack_open_target_from_metadata(&meta).unwrap();
+        assert_eq!(target.channel_id, "C1");
+        assert_eq!(target.root_ts, "1000.000100");
     }
 
     #[test]
