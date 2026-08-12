@@ -656,7 +656,9 @@ fn kmeans_inner(
     // Pull data out once; kmeans always runs on CPU.
     let data_flat = data.flatten_all()?.to_vec1::<f32>()?;
 
-    for _ in 0..max_iter {
+    let mut previous_assignments: Option<Vec<u32>> = None;
+
+    for iter in 0..max_iter {
         let packed_centers = fast_ops::PackedRight::new(&centers)?;
         let cluster_assignments = matmul_argmax_batched(data, &packed_centers, KMEANS_MATMUL_BATCH)?;
         let assignments = cluster_assignments.to_vec1::<u32>()?;
@@ -703,9 +705,17 @@ fn kmeans_inner(
             }
         }
 
+        let stable_assignments = previous_assignments
+            .as_ref()
+            .is_some_and(|previous| previous == &assignments);
+        previous_assignments = Some(assignments);
         centers = Tensor::from_vec(centers_flat, (k, n), device)?;
         if let Some(bar) = bar {
             bar.inc(k as u64);
+        }
+        if stable_assignments && weight_sums.iter().all(|&weight_sum| weight_sum > 0.0) {
+            debug!("kmeans converged after {} iterations", iter + 1);
+            break;
         }
     }
     Ok(centers)
