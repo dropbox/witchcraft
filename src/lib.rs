@@ -154,7 +154,8 @@ const COARSE_TREE_BRANCHING: usize = 16;
 const INDEX_KMEANS_BRANCHING: usize = 128;
 const INDEX_ASSIGNMENT_BEAM: usize = 2;
 const KMEANS_MATMUL_BATCH: usize = 4096;
-const INDEX_KMEANS_ITERATIONS: usize = 5;
+const INDEX_KMEANS_ITERATIONS: usize = 10;
+const LEAF_KMEANS_ITERATIONS: usize = 10;
 const INDEX_BATCH_SIZE: usize = 0x10000;
 const INDEX_TARGET_BUCKET_VECTORS: usize = INDEX_BATCH_SIZE / INDEX_KMEANS_BRANCHING;
 const BUCKET_READ_COALESCE_GAP_BYTES: usize = 16 * 1024;
@@ -2127,7 +2128,7 @@ fn build_coarse_tree_from_centers(
         "building coarse tree root: {} leaves -> {} root buckets",
         leaf_count, root_count
     );
-    let root_centers = kmeans(&leaf_centers, root_count, 5)?;
+    let root_centers = kmeans(&leaf_centers, root_count, LEAF_KMEANS_ITERATIONS)?;
     let packed = fast_ops::PackedRight::new(&root_centers)?;
     let assignments = matmul_argmax_batched(&leaf_centers, &packed, KMEANS_MATMUL_BATCH)?;
     let assignments = assignments.to_vec1::<u32>()?;
