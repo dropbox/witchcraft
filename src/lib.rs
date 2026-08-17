@@ -3164,33 +3164,6 @@ fn rowwise_cosine_min(a: &Tensor, b: &Tensor) -> Result<f32> {
     Ok(cos.min_all()?.to_scalar::<f32>()?)
 }
 
-#[cfg(debug_assertions)]
-fn stretch_rows(a: &Tensor) -> Result<Tensor> {
-    let device = a.device();
-    let (m, n) = a.dims2()?;
-
-    let mut scaled_rows = Vec::with_capacity(m);
-
-    for i in 0..m {
-        let row = a.get(i)?;
-        let v = row.to_vec1::<f32>()?;
-
-        let mut max = f32::MIN;
-        for x in &v {
-            let a = (*x).abs();
-            max = if a > max { a } else { max };
-        }
-        let range = max + 1e-6;
-        let scale = 1.0 / range;
-
-        let v2: Vec<f32> = v.iter().map(|x| scale * x).collect();
-
-        scaled_rows.push(Tensor::from_vec(v2, n, device)?);
-    }
-
-    Ok(Tensor::stack(&scaled_rows, 0)?)
-}
-
 pub(crate) fn compute_cached_embeddings(
     embedder: &Embedder,
     body: &str,
@@ -3244,10 +3217,7 @@ pub(crate) fn compute_cached_embeddings(
         let t = Tensor::embeddings_from_packed(&bytes, cols, &Device::Cpu)?;
         let min_acc = rowwise_cosine_min(&embeddings, &t)?;
 
-        let n = bpe.ceil() as u32;
-        let qn = stretch_rows(&embeddings)?.quantize(n)?.dequantize(n)?;
-        let min_qn_acc = rowwise_cosine_min(&embeddings, &qn)?;
-        debug!("haar reconstruction accuracy={min_acc} compare at q{n}_acc={min_qn_acc}");
+        debug!("haar reconstruction accuracy={min_acc}");
     }
 
     Ok(CachedEmbeddings {
