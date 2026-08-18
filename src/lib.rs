@@ -4002,13 +4002,6 @@ fn build_index_generation(
     }))
 }
 
-pub(crate) fn index_buffered_embeddings(
-    index: &FileBackedIndex,
-    cache: &dyn EmbeddingCache,
-) -> Result<()> {
-    index_buffered_embeddings_with_options(index, cache, IndexOptions::default())
-}
-
 pub(crate) fn index_buffered_embeddings_with_options(
     index: &FileBackedIndex,
     cache: &dyn EmbeddingCache,
