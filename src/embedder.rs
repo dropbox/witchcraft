@@ -180,21 +180,4 @@ impl Embedder {
             tokens: filtered_tokens,
         })
     }
-
-    /*
-    pub fn embed(self: &Self, text: &str) -> Result<(Tensor, Vec<(usize, usize)>)> {
-        let now = std::time::Instant::now();
-        let enc = self.tokenizer.encode(text, true).map_err(E::msg).unwrap();
-        let offsets = enc.get_offsets().to_vec();
-        let tokens = enc.get_ids().to_vec();
-        let token_ids = Tensor::new(&tokens[..], self.model.device())
-            .unwrap()
-            .unsqueeze(0)
-            .unwrap();
-        let embeddings = self.model.forward(&token_ids).unwrap();
-        debug!("embedder took {} ms.", now.elapsed().as_millis());
-        let normalized = normalize_l2(&embeddings)?;
-        Ok((normalized, offsets))
-    }
-    */
 }
