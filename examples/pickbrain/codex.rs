@@ -2,7 +2,6 @@ use anyhow::Result;
 use regex::Regex;
 use serde::Deserialize;
 use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use once_cell::sync::Lazy;
@@ -384,38 +383,18 @@ fn write_ingest_format_version() {
     fs::write(path, INGEST_FORMAT_VERSION).ok();
 }
 
-fn session_file_is_guardian(path: &Path) -> bool {
-    let Ok(file) = fs::File::open(path) else {
-        return false;
+fn remove_existing_codex_docs(db: &mut DB) -> Result<()> {
+    let filter = SqlStatementInternal {
+        statement_type: SqlStatementType::Condition,
+        condition: Some(SqlConditionInternal {
+            key: "$.source".to_string(),
+            operator: SqlOperator::Equals,
+            value: Some(SqlValue::String("codex".to_string())),
+        }),
+        logic: None,
+        statements: None,
     };
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(entry) = serde_json::from_str::<Entry>(&line) else {
-            continue;
-        };
-        if entry.entry_type == "session_meta" {
-            return is_guardian_source(&entry.payload);
-        }
-    }
-    false
-}
-
-fn remove_existing_guardian_docs(db: &mut DB, session_files: &[PathBuf]) -> Result<()> {
-    for path in session_files {
-        if !session_file_is_guardian(path) {
-            continue;
-        }
-        let filter = SqlStatementInternal {
-            statement_type: SqlStatementType::Condition,
-            condition: Some(SqlConditionInternal {
-                key: "$.path".to_string(),
-                operator: SqlOperator::Equals,
-                value: Some(SqlValue::String(path.to_string_lossy().to_string())),
-            }),
-            logic: None,
-            statements: None,
-        };
-        db.delete_with_filter(&filter)?;
-    }
+    db.delete_with_filter(&filter)?;
     Ok(())
 }
 
@@ -473,12 +452,16 @@ pub fn ingest_codex(db: &mut DB, quiet: bool) -> Result<usize> {
     let session_files = collect_session_files(&sessions_dir);
     let format_changed = !ingest_format_is_current();
     if format_changed {
-        remove_existing_guardian_docs(db, &session_files)?;
+        remove_existing_codex_docs(db)?;
     }
 
     let session_names = load_session_index();
     let wm_path = watermark::codex_path();
-    let wm_ts = watermark::mtime_ms(&wm_path);
+    let wm_ts = if format_changed {
+        0
+    } else {
+        watermark::mtime_ms(&wm_path)
+    };
     let mut session_count = 0usize;
 
     for jsonl_path in session_files {
@@ -664,7 +647,6 @@ mod tests {
             assistant_msg_line("policy verdict", "2025-01-15T10:01:00Z"),
         );
         let f = write_tempfile(&content);
-        assert!(session_file_is_guardian(f.path()));
         let (meta, chunks) = parse_session_file(f.path());
         assert!(meta.is_guardian);
         assert_eq!(chunks.len(), 2);
@@ -678,7 +660,6 @@ mod tests {
             user_msg_line("ordinary user conversation", "2025-01-15T10:00:00Z"),
         );
         let f = write_tempfile(&content);
-        assert!(!session_file_is_guardian(f.path()));
         let (meta, _) = parse_session_file(f.path());
         assert!(!meta.is_guardian);
     }
