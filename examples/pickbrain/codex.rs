@@ -9,8 +9,13 @@ use uuid::Uuid;
 
 use witchcraft::DB;
 
+use witchcraft::types::{
+    SqlConditionInternal, SqlOperator, SqlStatementInternal, SqlStatementType, SqlValue,
+};
+
 const MIN_CHUNK_CODEPOINTS: usize = 5;
 const MAX_CHUNK_CODEPOINTS: usize = 4000;
+const INGEST_FORMAT_VERSION: &str = "2";
 
 const CODEX_NAMESPACE: Uuid = Uuid::from_bytes([
     0xb4, 0xe8, 0xd9, 0xe2, 0x7f, 0x3c, 0x5b, 0xa2, 0xc6, 0xe1, 0x90, 0x2f, 0x4d, 0x8b, 0xac,
@@ -121,15 +126,38 @@ fn extract_branch_from_output(payload: &serde_json::Value) -> Option<String> {
 struct SessionMeta {
     cwd: Option<String>,
     branch: Option<String>,
+    is_guardian: bool,
+}
+
+fn is_guardian_source(payload: &serde_json::Value) -> bool {
+    payload
+        .get("source")
+        .and_then(|source| source.get("subagent"))
+        .and_then(|subagent| subagent.get("other"))
+        .and_then(|other| other.as_str())
+        == Some("guardian")
 }
 
 fn parse_session_file(path: &Path) -> (SessionMeta, Vec<Chunk>) {
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
-        Err(_) => return (SessionMeta { cwd: None, branch: None }, vec![]),
+        Err(_) => {
+            return (
+                SessionMeta {
+                    cwd: None,
+                    branch: None,
+                    is_guardian: false,
+                },
+                vec![],
+            )
+        }
     };
 
-    let mut meta = SessionMeta { cwd: None, branch: None };
+    let mut meta = SessionMeta {
+        cwd: None,
+        branch: None,
+        is_guardian: false,
+    };
     let mut chunks = Vec::new();
     let mut offset: u64 = 0;
 
@@ -145,6 +173,7 @@ fn parse_session_file(path: &Path) -> (SessionMeta, Vec<Chunk>) {
         };
 
         if entry.entry_type == "session_meta" {
+            meta.is_guardian |= is_guardian_source(&entry.payload);
             if meta.cwd.is_none() {
                 meta.cwd = entry.payload.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
             }
@@ -243,7 +272,7 @@ fn ingest_session(
     session_name: Option<&str>,
 ) -> Result<usize> {
     let (meta, chunks) = parse_session_file(path);
-    if chunks.is_empty() {
+    if meta.is_guardian || chunks.is_empty() {
         return Ok(0);
     }
 
@@ -336,6 +365,39 @@ fn file_mtime_ms(path: &Path) -> Option<i64> {
 
 use crate::watermark;
 
+fn ingest_version_path() -> PathBuf {
+    crate::pickbrain_dir().join("codex.ingest_version")
+}
+
+fn ingest_format_is_current() -> bool {
+    fs::read_to_string(ingest_version_path())
+        .map(|s| s.trim() == INGEST_FORMAT_VERSION)
+        .unwrap_or(false)
+}
+
+fn write_ingest_format_version() {
+    let path = ingest_version_path();
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).ok();
+    }
+    fs::write(path, INGEST_FORMAT_VERSION).ok();
+}
+
+fn remove_existing_codex_docs(db: &mut DB) -> Result<()> {
+    let filter = SqlStatementInternal {
+        statement_type: SqlStatementType::Condition,
+        condition: Some(SqlConditionInternal {
+            key: "$.source".to_string(),
+            operator: SqlOperator::Equals,
+            value: Some(SqlValue::String("codex".to_string())),
+        }),
+        logic: None,
+        statements: None,
+    };
+    db.delete_with_filter(&filter)?;
+    Ok(())
+}
+
 /// Walk ~/.codex/sessions/ recursively for .jsonl files
 fn collect_session_files(base: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -387,12 +449,22 @@ pub fn ingest_codex(db: &mut DB, quiet: bool) -> Result<usize> {
         return Ok(0);
     }
 
+    let session_files = collect_session_files(&sessions_dir);
+    let format_changed = !ingest_format_is_current();
+    if format_changed {
+        remove_existing_codex_docs(db)?;
+    }
+
     let session_names = load_session_index();
     let wm_path = watermark::codex_path();
-    let wm_ts = watermark::mtime_ms(&wm_path);
+    let wm_ts = if format_changed {
+        0
+    } else {
+        watermark::mtime_ms(&wm_path)
+    };
     let mut session_count = 0usize;
 
-    for jsonl_path in collect_session_files(&sessions_dir) {
+    for jsonl_path in session_files {
         if !watermark::file_newer_than(&jsonl_path, wm_ts) {
             continue;
         }
@@ -409,6 +481,7 @@ pub fn ingest_codex(db: &mut DB, quiet: bool) -> Result<usize> {
     }
 
     watermark::touch(&wm_path);
+    write_ingest_format_version();
     Ok(session_count)
 }
 
@@ -417,6 +490,10 @@ pub fn has_work() -> bool {
     let sessions_dir = PathBuf::from(&home).join(".codex/sessions");
     if !sessions_dir.is_dir() {
         return false;
+    }
+
+    if !ingest_format_is_current() {
+        return true;
     }
 
     let wm_ts = watermark::mtime_ms(&watermark::codex_path());
@@ -481,6 +558,16 @@ mod tests {
             "payload": {
                 "cwd": cwd,
                 "git": { "branch": branch }
+            }
+        })).unwrap()
+    }
+
+    fn guardian_session_meta_line(cwd: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "cwd": cwd,
+                "source": { "subagent": { "other": "guardian" } }
             }
         })).unwrap()
     }
@@ -552,6 +639,32 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_identifies_guardian_session() {
+        let content = format!(
+            "{}\n{}\n{}\n",
+            guardian_session_meta_line("/Users/me/src/server"),
+            user_msg_line("copied conversation for policy review", "2025-01-15T10:00:00Z"),
+            assistant_msg_line("policy verdict", "2025-01-15T10:01:00Z"),
+        );
+        let f = write_tempfile(&content);
+        let (meta, chunks) = parse_session_file(f.path());
+        assert!(meta.is_guardian);
+        assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn test_codex_normal_session_is_not_guardian() {
+        let content = format!(
+            "{}\n{}\n",
+            session_meta_line("/Users/me/src/server", "main"),
+            user_msg_line("ordinary user conversation", "2025-01-15T10:00:00Z"),
+        );
+        let f = write_tempfile(&content);
+        let (meta, _) = parse_session_file(f.path());
+        assert!(!meta.is_guardian);
+    }
+
+    #[test]
     fn test_codex_parse_branch_switch_overrides() {
         let content = format!(
             "{}\n{}\n{}\n",
@@ -601,6 +714,7 @@ mod tests {
         let (meta, chunks) = parse_session_file(f.path());
         assert!(meta.branch.is_none());
         assert!(meta.cwd.is_none());
+        assert!(!meta.is_guardian);
         assert!(chunks.is_empty());
     }
 
