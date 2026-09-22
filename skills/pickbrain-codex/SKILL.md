@@ -1,6 +1,6 @@
 ---
 name: pickbrain
-description: Semantic search over past Pi, Claude Code, and Codex conversations and memories. Use when the user wants to recall, find, or reference something from a previous coding session — e.g. "what did we discuss about X", "find that conversation where we fixed Y", "search my history for Z".
+description: Semantic search over past Pi, Claude Code, and Codex conversations and memories, as well as Slack threads. Use when the user wants to recall, find, or reference something from a previous coding session — e.g. "what did we discuss about X", "find that conversation where we fixed Y", "search my history for Z".
 ---
 
 # Pickbrain — Semantic Search for AI Coding History
