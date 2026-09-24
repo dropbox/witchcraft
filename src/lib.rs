@@ -452,7 +452,7 @@ pub mod progress {
         }
 
         pub fn finish(&self) {
-            self.pb.finish();
+            self.pb.finish_and_clear();
         }
     }
 }

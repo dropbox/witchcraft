@@ -363,9 +363,8 @@ fn file_mtime_ms(path: &Path) -> Option<i64> {
 
 use crate::watermark;
 
-fn sessions_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".pi/agent/sessions")
+fn pi_dirs() -> Vec<PathBuf> {
+    watermark::source_dirs(".pi/agent", "EXTRA_PI_DIRS")
 }
 
 fn collect_session_files(base: &Path) -> Vec<PathBuf> {
@@ -403,50 +402,46 @@ fn matches_skip(path: &Path, skip_session: Option<&str>) -> bool {
 }
 
 pub fn ingest_pi(db: &mut DB, skip_session: Option<&str>, quiet: bool) -> Result<usize> {
-    let dir = sessions_dir();
-    if !dir.is_dir() {
-        return Ok(0);
-    }
-
+    let dirs = pi_dirs();
     let wm_path = watermark::pi_path();
-    let wm_ts = watermark::mtime_ms(&wm_path);
     let mut session_count = 0usize;
     let mut seen = HashSet::new();
 
-    for jsonl_path in collect_session_files(&dir) {
-        if !watermark::file_newer_than(&jsonl_path, wm_ts) {
-            continue;
-        }
-        if matches_skip(&jsonl_path, skip_session) {
-            continue;
-        }
-        if !seen.insert(jsonl_path.clone()) {
-            continue;
-        }
-        let mtime_ms = file_mtime_ms(&jsonl_path).unwrap_or(0);
-        crate::print_ingest_path(&jsonl_path, quiet);
-        match ingest_session(db, &jsonl_path, mtime_ms) {
-            Ok(n) => session_count += n,
-            Err(e) => {
-                log::warn!("failed to ingest pi {}: {e}", jsonl_path.display());
+    for dir in &dirs {
+        let wm_ts = watermark::mtime_for_dir("pi", &dirs, dir, &wm_path);
+        for jsonl_path in collect_session_files(&dir.join("sessions")) {
+            if !watermark::file_newer_than(&jsonl_path, wm_ts) {
+                continue;
+            }
+            if matches_skip(&jsonl_path, skip_session) {
+                continue;
+            }
+            if !seen.insert(jsonl_path.clone()) {
+                continue;
+            }
+            let mtime_ms = file_mtime_ms(&jsonl_path).unwrap_or(0);
+            crate::print_ingest_path(&jsonl_path, quiet);
+            match ingest_session(db, &jsonl_path, mtime_ms) {
+                Ok(n) => session_count += n,
+                Err(e) => {
+                    log::warn!("failed to ingest pi {}: {e}", jsonl_path.display());
+                }
             }
         }
     }
 
     watermark::touch(&wm_path);
+    watermark::record_dirs("pi", &dirs);
     Ok(session_count)
 }
 
 pub fn has_work(skip_session: Option<&str>) -> bool {
-    let dir = sessions_dir();
-    if !dir.is_dir() {
-        return false;
-    }
-
-    let wm_ts = watermark::mtime_ms(&watermark::pi_path());
-    collect_session_files(&dir)
-        .iter()
-        .any(|path| !matches_skip(path, skip_session) && watermark::file_newer_than(path, wm_ts))
+    let dirs = pi_dirs();
+    dirs.iter().any(|dir| {
+        let wm_ts = watermark::mtime_for_dir("pi", &dirs, dir, &watermark::pi_path());
+        collect_session_files(&dir.join("sessions"))
+            .iter().any(|path| !matches_skip(path, skip_session) && watermark::file_newer_than(path, wm_ts))
+    })
 }
 
 #[cfg(test)]

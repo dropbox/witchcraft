@@ -593,22 +593,24 @@ fn collect_project_configs(project_dir: &Path) -> Vec<PathBuf> {
 
 use crate::watermark;
 
+fn claude_dirs() -> Vec<PathBuf> {
+    watermark::source_dirs(".claude", "EXTRA_CLAUDE_DIRS")
+}
+
 pub fn has_work(skip_session: Option<&str>) -> Result<bool> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let projects_dir = PathBuf::from(&home).join(".claude/projects");
+    let dirs = claude_dirs();
 
-    if !projects_dir.is_dir() {
-        return Ok(false);
-    }
-
-    let wm_ts = watermark::mtime_ms(&watermark::claude_path());
-
-    let mut entries: Vec<_> = fs::read_dir(&projects_dir)?
-        .filter_map(|e| e.ok())
+    let mut entries: Vec<_> = dirs.iter()
+        .flat_map(|root| {
+            let wm_ts = watermark::mtime_for_dir("claude", &dirs, root, &watermark::claude_path());
+            fs::read_dir(root.join("projects")).ok().into_iter()
+                .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+                .map(move |entry| (entry, wm_ts))
+        })
         .collect();
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(|(entry, _)| entry.path());
 
-    for entry in entries {
+    for (entry, wm_ts) in entries {
         let dir_path = entry.path();
         if !dir_path.is_dir() {
             continue;
@@ -668,18 +670,8 @@ pub fn ingest_claude_code(
     skip_session: Option<&str>,
     quiet: bool,
 ) -> Result<(usize, usize, usize, usize)> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let projects_dir = PathBuf::from(&home).join(".claude/projects");
-
-    if !projects_dir.is_dir() {
-        if !quiet {
-            println!("no Claude Code projects found at {}", projects_dir.display());
-        }
-        return Ok((0, 0, 0, 0));
-    }
-
+    let dirs = claude_dirs();
     let wm_path = watermark::claude_path();
-    let wm_ts = watermark::mtime_ms(&wm_path);
 
     let mut session_count = 0usize;
     let mut memory_count = 0usize;
@@ -687,12 +679,17 @@ pub fn ingest_claude_code(
     let mut config_count = 0usize;
     let mut ingested_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
-    let mut entries: Vec<_> = fs::read_dir(&projects_dir)?
-        .filter_map(|e| e.ok())
+    let mut entries: Vec<_> = dirs.iter()
+        .flat_map(|root| {
+            let wm_ts = watermark::mtime_for_dir("claude", &dirs, root, &wm_path);
+            fs::read_dir(root.join("projects")).ok().into_iter()
+                .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+                .map(move |entry| (entry, wm_ts))
+        })
         .collect();
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(|(entry, _)| entry.path());
 
-    for entry in entries {
+    for (entry, wm_ts) in entries {
         let dir_path = entry.path();
         if !dir_path.is_dir() {
             continue;
@@ -804,6 +801,7 @@ pub fn ingest_claude_code(
     }
 
     watermark::touch(&wm_path);
+    watermark::record_dirs("claude", &dirs);
     Ok((session_count, memory_count, authored_count, config_count))
 }
 

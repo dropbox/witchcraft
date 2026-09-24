@@ -271,6 +271,7 @@ fn ingest_session(
     path: &Path,
     mtime_ms: i64,
     session_name: Option<&str>,
+    remote_host: Option<&str>,
 ) -> Result<usize> {
     let (meta, chunks) = parse_session_file(path);
     if meta.is_guardian || chunks.is_empty() {
@@ -343,6 +344,7 @@ fn ingest_session(
             "mtime_ms": mtime_ms,
             "turns": turns_meta,
             "branch": meta.branch,
+            "remote_host": remote_host,
         })
         .to_string();
 
@@ -441,21 +443,39 @@ fn collect_session_files(base: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn load_session_index() -> std::collections::HashMap<String, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let index_path = PathBuf::from(&home).join(".codex/session_index.jsonl");
+fn codex_dirs() -> Vec<PathBuf> {
+    watermark::source_dirs(".codex", "EXTRA_CODEX_DIRS")
+}
+
+pub fn remote_origin_for_path(path: &Path) -> Option<String> {
+    remote_origin_in_dirs(path, &codex_dirs())
+}
+
+fn remote_origin_in_dirs(path: &Path, dirs: &[PathBuf]) -> Option<String> {
+    for dir in dirs.iter().skip(1) {
+        if path.strip_prefix(dir).is_err() { continue; }
+        let Ok(host) = fs::read_to_string(dir.join("pickbrain.remote")) else { continue; };
+        let host = host.trim();
+        if !host.is_empty() {
+            return Some(host.to_string());
+        }
+    }
+    None
+}
+
+fn load_session_index(dirs: &[PathBuf]) -> std::collections::HashMap<String, String> {
     let mut names = std::collections::HashMap::new();
-    let raw = match fs::read_to_string(&index_path) {
-        Ok(s) => s,
-        Err(_) => return names,
-    };
-    for line in raw.lines() {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let (Some(id), Some(name)) = (
-                v.get("id").and_then(|i| i.as_str()),
-                v.get("thread_name").and_then(|n| n.as_str()),
-            ) {
-                names.insert(id.to_string(), name.to_string());
+    for dir in dirs {
+        if let Ok(raw) = fs::read_to_string(dir.join("session_index.jsonl")) {
+            for line in raw.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let (Some(id), Some(name)) = (
+                        v.get("id").and_then(|i| i.as_str()),
+                        v.get("thread_name").and_then(|n| n.as_str()),
+                    ) {
+                        names.insert(id.to_string(), name.to_string());
+                    }
+                }
             }
         }
     }
@@ -463,66 +483,77 @@ fn load_session_index() -> std::collections::HashMap<String, String> {
 }
 
 pub fn ingest_codex(db: &mut DB, quiet: bool) -> Result<usize> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let sessions_dir = PathBuf::from(&home).join(".codex/sessions");
-
-    if !sessions_dir.is_dir() {
-        return Ok(0);
-    }
-
-    let session_files = collect_session_files(&sessions_dir);
+    let dirs = codex_dirs();
+    let session_files: Vec<_> = dirs.iter().flat_map(|dir| collect_session_files(&dir.join("sessions"))).collect();
     let format_changed = !ingest_format_is_current();
     if format_changed {
         remove_existing_guardian_docs(db, &session_files)?;
     }
 
-    let session_names = load_session_index();
+    let session_names = load_session_index(&dirs);
     let wm_path = watermark::codex_path();
-    let wm_ts = watermark::mtime_ms(&wm_path);
     let mut session_count = 0usize;
 
-    for jsonl_path in session_files {
-        if !watermark::file_newer_than(&jsonl_path, wm_ts) {
-            continue;
-        }
-        let mtime_ms = file_mtime_ms(&jsonl_path).unwrap_or(0);
-        let sid = session_id_from_filename(&jsonl_path);
-        let name = session_names.get(&sid).map(|s| s.as_str());
-        crate::print_ingest_path(&jsonl_path, quiet);
-        match ingest_session(db, &jsonl_path, mtime_ms, name) {
-            Ok(n) => session_count += n,
-            Err(e) => {
-                log::warn!("failed to ingest codex {}: {e}", jsonl_path.display());
+    for dir in &dirs {
+        let wm_ts = watermark::mtime_for_dir("codex", &dirs, dir, &wm_path);
+        let remote_host = fs::read_to_string(dir.join("pickbrain.remote"))
+            .ok()
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty());
+        for jsonl_path in collect_session_files(&dir.join("sessions")) {
+            if !watermark::file_newer_than(&jsonl_path, wm_ts) {
+                continue;
+            }
+            let mtime_ms = file_mtime_ms(&jsonl_path).unwrap_or(0);
+            let sid = session_id_from_filename(&jsonl_path);
+            let name = session_names.get(&sid).map(|s| s.as_str());
+            crate::print_ingest_path(&jsonl_path, quiet);
+            match ingest_session(db, &jsonl_path, mtime_ms, name, remote_host.as_deref()) {
+                Ok(n) => session_count += n,
+                Err(e) => {
+                    log::warn!("failed to ingest codex {}: {e}", jsonl_path.display());
+                }
             }
         }
     }
 
     watermark::touch(&wm_path);
+    watermark::record_dirs("codex", &dirs);
     write_ingest_format_version();
     Ok(session_count)
 }
 
 pub fn has_work() -> bool {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let sessions_dir = PathBuf::from(&home).join(".codex/sessions");
-    if !sessions_dir.is_dir() {
-        return false;
-    }
+    let dirs = codex_dirs();
 
     if !ingest_format_is_current() {
         return true;
     }
 
-    let wm_ts = watermark::mtime_ms(&watermark::codex_path());
-    collect_session_files(&sessions_dir)
-        .iter()
-        .any(|path| watermark::file_newer_than(path, wm_ts))
+    dirs.iter().any(|dir| {
+        let wm_ts = watermark::mtime_for_dir("codex", &dirs, dir, &watermark::codex_path());
+        collect_session_files(&dir.join("sessions"))
+            .iter().any(|path| watermark::file_newer_than(path, wm_ts))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn remote_origin_is_recovered_from_session_path() {
+        let default = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        fs::write(remote.path().join("pickbrain.remote"), "remote.example\n").unwrap();
+        let dirs = vec![default.path().to_path_buf(), remote.path().to_path_buf()];
+        let path = remote.path().join("sessions/2026/rollout.jsonl");
+        assert_eq!(
+            remote_origin_in_dirs(&path, &dirs),
+            Some("remote.example".to_string())
+        );
+    }
 
     fn write_tempfile(content: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();

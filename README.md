@@ -71,6 +71,17 @@ make pickbrain
 ./pickbrain --dump <UUID>          # print full conversation
 ```
 
+Set `PRE_INGEST_COMMAND` to a shell command that runs before pickbrain checks for new sessions (for example, an `rsync` from another host). Set `EXTRA_CODEX_DIRS`, `EXTRA_CLAUDE_DIRS`, or `EXTRA_PI_DIRS` to colon-separated additional data directories. Each entry should have the same layout as `~/.codex`, `~/.claude`, or `~/.pi/agent`, respectively. Pickbrain scans these alongside the default directories.
+
+`scripts/sync_codex_sessions.sh` takes an SSH host and an absolute local directory. It copies only session `*.jsonl` files and writes the host to `pickbrain.remote`. Pickbrain labels those results as downloaded; press `r` in the browser to see the SSH command for that host.
+
+```bash
+PRE_INGEST_COMMAND="$PWD/scripts/sync_codex_sessions.sh your-ssh-alias $HOME/.pickbrain/remote-codex" \
+EXTRA_CODEX_DIRS="$HOME/.pickbrain/remote-codex" ./pickbrain auth middleware fix
+```
+
+For an existing extra Codex directory, put its SSH host name in `<extra-codex-dir>/pickbrain.remote` to tag those sessions.
+
 The source lives in `examples/pickbrain/` and demonstrates how to use
 Witchcraft as a library: document ingestion, embedding, indexing, and hybrid
 search. To install pickbrain as a skill/extension for Pi and as a skill for both Claude Code and Codex:

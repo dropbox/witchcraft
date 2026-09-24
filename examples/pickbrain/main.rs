@@ -38,7 +38,7 @@ fn pickbrain_dir_overridden() -> bool {
 
 pub(crate) fn print_ingest_path(path: &std::path::Path, quiet: bool) {
     if !quiet {
-        println!("{}", path.display());
+        eprintln!("{}", path.display());
     }
 }
 
@@ -163,6 +163,17 @@ fn process_is_running(_pid: u32) -> bool {
 
 fn wants_source(types: &[String], source: &str) -> bool {
     types.is_empty() || types.iter().any(|t| t == source)
+}
+
+fn run_pre_ingest_command() -> Result<()> {
+    let Ok(command) = env::var("PRE_INGEST_COMMAND") else { return Ok(()); };
+    if command.trim().is_empty() { return Ok(()); }
+    #[cfg(windows)]
+    let status = std::process::Command::new("cmd").args(["/C", &command]).status()?;
+    #[cfg(not(windows))]
+    let status = std::process::Command::new("sh").args(["-c", &command]).status()?;
+    anyhow::ensure!(status.success(), "PRE_INGEST_COMMAND exited with {status}");
+    Ok(())
 }
 
 fn needs_ingest(
@@ -339,6 +350,7 @@ fn embed_and_index(db: &DB, embedder: &Embedder, _device: &candle_core::Device) 
     let _embedded = witchcraft::embed_chunks(db, embedder, None)?;
     let options = witchcraft::IndexOptions::default().force_flush();
     witchcraft::index_chunks_with_options(db, None, false, options)?;
+    std::io::stderr().flush()?;
     Ok(())
 }
 
@@ -362,6 +374,7 @@ struct SearchResult {
     path: String,
     cwd: String,
     source: String,
+    remote_host: String,
     branch: String,
     conv_key: String,
     slack_open: Option<SlackOpenTarget>,
@@ -683,6 +696,7 @@ fn parse_search_results(
         .into_iter()
         .map(|(_score, metadata, bodies, sub_idx, date)| {
             let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
+            let remote_host = remote_host_from_metadata(&meta);
             let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
             let turns_arr: Vec<TurnMeta> = meta["turns"]
                 .as_array()
@@ -706,6 +720,7 @@ fn parse_search_results(
                 path: meta["path"].as_str().unwrap_or("").to_string(),
                 cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
                 source: meta["source"].as_str().unwrap_or("claude").to_string(),
+                remote_host,
                 branch: meta["branch"].as_str().unwrap_or("").to_string(),
                 conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
                 slack_open: slack_open_target_from_metadata(&meta),
@@ -715,6 +730,21 @@ fn parse_search_results(
             }
         })
         .collect()
+}
+
+fn remote_host_from_metadata(meta: &serde_json::Value) -> String {
+    let host = meta["remote_host"].as_str().unwrap_or("").to_string();
+    if !host.is_empty() {
+        return host;
+    }
+    if meta["source"].as_str() == Some("codex") {
+        if let Some(path) = meta["path"].as_str() {
+            if let Some(host) = codex::remote_origin_for_path(std::path::Path::new(path)) {
+                return host;
+            }
+        }
+    }
+    host
 }
 
 fn run_search(
@@ -940,6 +970,9 @@ fn search_tui(
                     View::Detail(_) if can_open_slack => {
                         "↑↓/jk scroll  r open slack  / search  esc back  q quit"
                     }
+                    View::Detail(_) if current_result.is_some_and(|r| !r.remote_host.is_empty()) => {
+                        "↑↓/jk scroll  r SSH instructions  / search  esc back  q quit"
+                    }
                     View::Detail(_) if can_resume => {
                         "↑↓/jk scroll  r resume  / search  esc back  q quit"
                     }
@@ -997,9 +1030,14 @@ fn search_tui(
                 let cwd = if !cr.cwd.is_empty() { &cr.cwd } else { "?" };
                 let sid = &cr.session_id;
                 let src = &cr.source;
+                let prompt = if cr.remote_host.is_empty() {
+                    format!(" Exit pickbrain and resume {src} session {sid} in {cwd}? ")
+                } else {
+                    format!(" Exit pickbrain and show SSH instructions for {src} session {sid} on {}? ", cr.remote_host)
+                };
                 let footer = Paragraph::new(Line::from(vec![
                     Span::styled(
-                        format!(" Exit pickbrain and resume {src} session {sid} in {cwd}? "),
+                        prompt,
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -1037,6 +1075,12 @@ fn search_tui(
                             let mut meta_spans = session_meta_spans(
                                 &ts, &r.project, &r.session_id, &r.session_name, &r.source, &r.branch, &r.conv_key,
                             );
+                            if !r.remote_host.is_empty() {
+                                meta_spans.push(Span::styled(
+                                    format!("  from {}", r.remote_host),
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                            }
                             if r.path.ends_with(".md") {
                                 meta_spans.push(Span::styled(
                                     format!("  {}", r.path),
@@ -1116,6 +1160,12 @@ fn search_tui(
                         if !r.branch.is_empty() {
                             session_spans.push(Span::styled(
                                 format!("  {}", r.branch),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
+                        if !r.remote_host.is_empty() {
+                            session_spans.push(Span::styled(
+                                format!("  downloaded from {}", r.remote_host),
                                 Style::default().fg(Color::Yellow),
                             ));
                         }
@@ -1360,6 +1410,8 @@ fn search_tui(
                             source: r.source.clone(),
                             branch: r.branch.clone(),
                             cwd,
+                            path: r.path.clone(),
+                            remote_host: r.remote_host.clone(),
                         });
                     }
                 }
@@ -1379,6 +1431,7 @@ fn search_tui(
 
     disable_raw_mode()?;
     crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    std::io::stdout().flush()?;
     if let Some(target) = slack_to_open {
         let url = open_slack_target(&target)?;
         eprintln!("opened {url}");
@@ -1458,6 +1511,17 @@ fn maybe_checkout_branch(branch: &str) {
 
 fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
     use std::os::unix::process::CommandExt;
+    let remote_host = if !s.remote_host.is_empty() {
+        Some(s.remote_host.clone())
+    } else if s.source == "codex" {
+        codex::remote_origin_for_path(std::path::Path::new(&s.path))
+    } else {
+        None
+    };
+    if let Some(host) = remote_host {
+        println!("\nSession {} is on {host}. SSH to that host to resume it:\n{}", s.session_id, remote_ssh_command(&host));
+        return Ok(());
+    }
     if !s.cwd.is_empty() {
         let _ = std::env::set_current_dir(&s.cwd);
     }
@@ -1484,6 +1548,14 @@ fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
             .exec();
         Err(err.into())
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn remote_ssh_command(host: &str) -> String {
+    format!("ssh {}", shell_quote(host))
 }
 
 fn parse_slack_conv_key(conv_key: &str) -> Option<(String, String, bool)> {
@@ -1773,6 +1845,10 @@ fn search_plain(
             String::new()
         };
         writeln!(buf, "{ts}  {}{filename}{session_info}{branch_info}", r.project)?;
+        if !r.remote_host.is_empty() {
+            writeln!(buf, "downloaded from {}", r.remote_host)?;
+            writeln!(buf, "SSH there to resume: {}", remote_ssh_command(&r.remote_host))?;
+        }
         if r.source == "slack" || r.turns.is_empty() || r.path.is_empty() {
             // Slack and .md files: use indexed bodies directly
             let idx = r.match_idx;
@@ -1882,6 +1958,8 @@ struct BranchSession {
     source: String,
     branch: String,
     cwd: String,
+    path: String,
+    remote_host: String,
 }
 
 
@@ -1926,6 +2004,7 @@ fn find_recent_sessions(db_name: &PathBuf, branch: Option<&str>) -> Result<Vec<S
     let mut results = Vec::new();
     for (metadata, body, date) in &rows {
         let meta: serde_json::Value = serde_json::from_str(metadata).unwrap_or_default();
+        let remote_host = remote_host_from_metadata(&meta);
         let turns_arr: Vec<TurnMeta> = meta["turns"]
             .as_array()
             .map(|arr| {
@@ -1948,6 +2027,7 @@ fn find_recent_sessions(db_name: &PathBuf, branch: Option<&str>) -> Result<Vec<S
             path: meta["path"].as_str().unwrap_or("").to_string(),
             cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
             source: meta["source"].as_str().unwrap_or("claude").to_string(),
+            remote_host,
             branch: meta["branch"].as_str().unwrap_or("").to_string(),
             conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
             slack_open: slack_open_target_from_metadata(&meta),
@@ -2225,6 +2305,10 @@ fn main() -> Result<()> {
                 eprintln!();
                 eprintln!("Environment:");
                 eprintln!("  PICKBRAIN_DIR        override the pickbrain DB and state directory");
+                eprintln!("  PRE_INGEST_COMMAND   shell command run before checking for new sessions");
+                eprintln!("  EXTRA_CODEX_DIRS    colon-separated additional .codex directories");
+                eprintln!("  EXTRA_CLAUDE_DIRS   colon-separated additional .claude directories");
+                eprintln!("  EXTRA_PI_DIRS       colon-separated additional .pi/agent directories");
                 std::process::exit(0);
             }
             "--quiet" | "-q" => {
@@ -2368,6 +2452,7 @@ fn main() -> Result<()> {
     // Skip the active session's JSONL if its watermark is fresh (<10 min).
     // If we can't detect the active session, nothing is skipped (eager by default).
     let stale_ms = 10 * 60 * 1000;
+    run_pre_ingest_command()?;
     if needs_ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter)? {
         match IngestLock::try_acquire(&db_name) {
             Ok(Some(_lock)) => {
@@ -2432,6 +2517,12 @@ mod tests {
     }
 
     #[test]
+    fn test_remote_ssh_command() {
+        assert_eq!(remote_ssh_command("remote.example"), "ssh 'remote.example'");
+        assert_eq!(remote_ssh_command("host's alias"), "ssh 'host'\"'\"'s alias'");
+    }
+
+    #[test]
     fn test_session_meta_spans_preserves_formatted_date() {
         let spans = session_meta_spans("May 12 10:09", "DM", "", "", "slack", "", "");
         assert_eq!(spans[0].content.as_ref(), "May 12 10:09 ");
@@ -2448,6 +2539,7 @@ mod tests {
             path: String::new(),
             cwd: String::new(),
             source: "claude".to_string(),
+            remote_host: String::new(),
             branch: String::new(),
             conv_key: String::new(),
             slack_open: None,
