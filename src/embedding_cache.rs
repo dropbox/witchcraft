@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +34,40 @@ impl CachedEmbeddings {
         out.extend_from_slice(self.counts.as_bytes());
         out.extend_from_slice(&self.embeddings);
         Ok(out)
+    }
+
+    pub fn from_cache_entry_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let mut magic = [0u8; MAGIC.len()];
+        cursor.read_exact(&mut magic)?;
+        anyhow::ensure!(magic == MAGIC, "bad embedding cache magic");
+
+        let model_len = read_u32(&mut cursor)? as usize;
+        let counts_len = read_u32(&mut cursor)? as usize;
+        let embedding_count = read_u64(&mut cursor)? as usize;
+        let embeddings_len = read_u64(&mut cursor)? as usize;
+
+        let mut model = vec![0u8; model_len];
+        cursor.read_exact(&mut model)?;
+        let model = String::from_utf8(model).context("model id is not UTF-8")?;
+
+        let mut counts = vec![0u8; counts_len];
+        cursor.read_exact(&mut counts)?;
+        let counts = String::from_utf8(counts).context("counts are not UTF-8")?;
+
+        let mut embeddings = vec![0u8; embeddings_len];
+        cursor.read_exact(&mut embeddings)?;
+        anyhow::ensure!(
+            cursor.position() == bytes.len() as u64,
+            "embedding cache entry has trailing bytes"
+        );
+
+        Ok(CachedEmbeddings {
+            model,
+            counts,
+            embedding_count,
+            embeddings,
+        })
     }
 }
 
@@ -88,42 +122,12 @@ impl EmbeddingCache for FileEmbeddingCache {
             }),
         };
 
-        let mut magic = [0u8; MAGIC.len()];
-        file.read_exact(&mut magic)
-            .with_context(|| format!("failed to read embedding cache header {}", path.display()))?;
-        anyhow::ensure!(
-            magic == MAGIC,
-            "bad embedding cache magic in {}",
-            path.display()
-        );
-
-        let model_len = read_u32(&mut file)? as usize;
-        let counts_len = read_u32(&mut file)? as usize;
-        let embedding_count = read_u64(&mut file)? as usize;
-        let embeddings_len = read_u64(&mut file)? as usize;
-
-        let mut model = vec![0u8; model_len];
-        file.read_exact(&mut model)
-            .with_context(|| format!("failed to read model id from {}", path.display()))?;
-        let model = String::from_utf8(model)
-            .with_context(|| format!("model id is not UTF-8 in {}", path.display()))?;
-
-        let mut counts = vec![0u8; counts_len];
-        file.read_exact(&mut counts)
-            .with_context(|| format!("failed to read counts from {}", path.display()))?;
-        let counts = String::from_utf8(counts)
-            .with_context(|| format!("counts are not UTF-8 in {}", path.display()))?;
-
-        let mut embeddings = vec![0u8; embeddings_len];
-        file.read_exact(&mut embeddings)
-            .with_context(|| format!("failed to read embeddings from {}", path.display()))?;
-
-        Ok(Some(CachedEmbeddings {
-            model,
-            counts,
-            embedding_count,
-            embeddings,
-        }))
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read embedding cache entry {}", path.display()))?;
+        CachedEmbeddings::from_cache_entry_bytes(&bytes)
+            .with_context(|| format!("failed to parse embedding cache entry {}", path.display()))
+            .map(Some)
     }
 
     fn put(&self, hash: &str, embeddings: &CachedEmbeddings) -> Result<()> {
@@ -200,6 +204,14 @@ mod tests {
             embedding_count: 6,
             embeddings: vec![1, 2, 3, 4],
         };
+
+        let bytes = value.to_cache_entry_bytes().unwrap();
+        assert_eq!(&bytes[..8], b"WEMB0001");
+        let decoded = CachedEmbeddings::from_cache_entry_bytes(&bytes).unwrap();
+        assert_eq!(decoded.model, value.model);
+        assert_eq!(decoded.counts, value.counts);
+        assert_eq!(decoded.embedding_count, value.embedding_count);
+        assert_eq!(decoded.embeddings, value.embeddings);
 
         cache.put(hash, &value).unwrap();
         let loaded = cache.get(hash).unwrap().unwrap();

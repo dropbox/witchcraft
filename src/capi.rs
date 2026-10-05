@@ -14,8 +14,6 @@ use std::ptr;
 use std::slice;
 use std::sync::Mutex;
 
-const EMBEDDING_BLOB_MAGIC: [u8; 8] = *b"WPKD0001";
-
 static GLOBAL_LAST_ERROR: Mutex<Option<CString>> = Mutex::new(None);
 
 pub type WitchcraftEmbeddingCallback = Option<
@@ -31,7 +29,7 @@ pub type WitchcraftEmbeddingCallback = Option<
 struct CApiState {
     index: FileBackedIndex,
     device: candle_core::Device,
-    embedder: Embedder,
+    embedder: Option<Embedder>,
     #[cfg(feature = "capi-embed-cache")]
     embedding_cache: FileEmbeddingCache,
     query_cache: EmbeddingsCache,
@@ -177,97 +175,11 @@ fn search_results_result(results: Vec<WitchcraftSearchHit>) -> WitchcraftSearchR
     }
 }
 
-fn write_u32(out: &mut Vec<u8>, value: usize) -> Result<()> {
-    out.extend_from_slice(&u32::try_from(value)?.to_le_bytes());
-    Ok(())
-}
-
-fn write_u64(out: &mut Vec<u8>, value: usize) -> Result<()> {
-    out.extend_from_slice(&u64::try_from(value)?.to_le_bytes());
-    Ok(())
-}
-
-fn read_u32(bytes: &[u8], offset: &mut usize) -> Result<u32> {
-    let end = offset
-        .checked_add(std::mem::size_of::<u32>())
-        .ok_or_else(|| anyhow!("embedding blob offset overflow"))?;
-    let chunk = bytes
-        .get(*offset..end)
-        .ok_or_else(|| anyhow!("truncated embedding blob"))?;
-    *offset = end;
-    Ok(u32::from_le_bytes(chunk.try_into()?))
-}
-
-fn read_u64(bytes: &[u8], offset: &mut usize) -> Result<u64> {
-    let end = offset
-        .checked_add(std::mem::size_of::<u64>())
-        .ok_or_else(|| anyhow!("embedding blob offset overflow"))?;
-    let chunk = bytes
-        .get(*offset..end)
-        .ok_or_else(|| anyhow!("truncated embedding blob"))?;
-    *offset = end;
-    Ok(u64::from_le_bytes(chunk.try_into()?))
-}
-
-fn read_bytes<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8]> {
-    let end = offset
-        .checked_add(len)
-        .ok_or_else(|| anyhow!("embedding blob offset overflow"))?;
-    let chunk = bytes
-        .get(*offset..end)
-        .ok_or_else(|| anyhow!("truncated embedding blob"))?;
-    *offset = end;
-    Ok(chunk)
-}
-
-fn encode_embedding_blob(embeddings: &CachedEmbeddings) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(
-        EMBEDDING_BLOB_MAGIC.len()
-            + 2 * std::mem::size_of::<u32>()
-            + 2 * std::mem::size_of::<u64>()
-            + embeddings.model.len()
-            + embeddings.counts.len()
-            + embeddings.embeddings.len(),
-    );
-    out.extend_from_slice(&EMBEDDING_BLOB_MAGIC);
-    write_u32(&mut out, embeddings.model.len())?;
-    write_u32(&mut out, embeddings.counts.len())?;
-    write_u64(&mut out, embeddings.embedding_count)?;
-    write_u64(&mut out, embeddings.embeddings.len())?;
-    out.extend_from_slice(embeddings.model.as_bytes());
-    out.extend_from_slice(embeddings.counts.as_bytes());
-    out.extend_from_slice(&embeddings.embeddings);
-    Ok(out)
-}
-
-fn decode_embedding_blob(bytes: &[u8]) -> Result<CachedEmbeddings> {
-    let mut offset = 0usize;
-    let magic = read_bytes(bytes, &mut offset, EMBEDDING_BLOB_MAGIC.len())?;
-    if magic != EMBEDDING_BLOB_MAGIC {
-        return Err(anyhow!("bad packed embedding blob magic"));
-    }
-
-    let model_len = read_u32(bytes, &mut offset)? as usize;
-    let counts_len = read_u32(bytes, &mut offset)? as usize;
-    let embedding_count = read_u64(bytes, &mut offset)? as usize;
-    let embeddings_len = read_u64(bytes, &mut offset)? as usize;
-
-    let model = String::from_utf8(read_bytes(bytes, &mut offset, model_len)?.to_vec())?;
-    let counts = String::from_utf8(read_bytes(bytes, &mut offset, counts_len)?.to_vec())?;
-    let embeddings = read_bytes(bytes, &mut offset, embeddings_len)?.to_vec();
-    if offset != bytes.len() {
-        return Err(anyhow!("packed embedding blob has trailing bytes"));
-    }
-
-    Ok(CachedEmbeddings {
-        model,
-        counts,
-        embedding_count,
-        embeddings,
-    })
-}
-
 fn embed_for_capi(state: &CApiState, body_text: &str, lens: &str) -> Result<CachedEmbeddings> {
+    let embedder = state
+        .embedder
+        .as_ref()
+        .ok_or_else(|| anyhow!("witchcraft handle was opened without embedding assets"))?;
     #[cfg(feature = "capi-embed-cache")]
     {
         let hash = crate::document_cache_hash(body_text, lens);
@@ -277,36 +189,14 @@ fn embed_for_capi(state: &CApiState, body_text: &str, lens: &str) -> Result<Cach
             &hash,
             body_text,
             lens,
-            &state.embedder,
+            embedder,
         )?;
         Ok(embeddings)
     }
     #[cfg(not(feature = "capi-embed-cache"))]
     {
-        crate::compute_cached_embeddings(&state.embedder, body_text, lens)
+        crate::compute_cached_embeddings(embedder, body_text, lens)
     }
-}
-
-fn embedding_blob_row_count(bytes: &[u8]) -> Result<u32> {
-    let mut offset = 0usize;
-    let magic = read_bytes(bytes, &mut offset, EMBEDDING_BLOB_MAGIC.len())?;
-    if magic != EMBEDDING_BLOB_MAGIC {
-        return Err(anyhow!("bad packed embedding blob magic"));
-    }
-
-    let model_len = read_u32(bytes, &mut offset)? as usize;
-    let counts_len = read_u32(bytes, &mut offset)? as usize;
-    let embedding_count = read_u64(bytes, &mut offset)?;
-    let embeddings_len = read_u64(bytes, &mut offset)? as usize;
-
-    read_bytes(bytes, &mut offset, model_len)?;
-    read_bytes(bytes, &mut offset, counts_len)?;
-    read_bytes(bytes, &mut offset, embeddings_len)?;
-    if offset != bytes.len() {
-        return Err(anyhow!("packed embedding blob has trailing bytes"));
-    }
-
-    Ok(embedding_count.try_into()?)
 }
 
 unsafe fn fetch_embedding_blob(
@@ -352,7 +242,7 @@ unsafe fn fetch_embedding_blob(
         ));
     }
 
-    decode_embedding_blob(&bytes)
+    CachedEmbeddings::from_cache_entry_bytes(&bytes)
 }
 
 struct CallbackEmbeddingSource {
@@ -400,7 +290,11 @@ pub unsafe extern "C" fn witchcraft_open(
         let db_path = string_from_ptr(db_path, "db_path")?;
         let assets_path = string_from_ptr(assets_path, "assets_path")?;
         let device = crate::make_device();
-        let embedder = Embedder::new(&device, &PathBuf::from(assets_path))?;
+        let embedder = if assets_path.is_empty() {
+            None
+        } else {
+            Some(Embedder::new(&device, &PathBuf::from(assets_path))?)
+        };
         #[cfg(feature = "capi-embed-cache")]
         let embedding_cache = embedding_cache_from_ptr(embedding_cache_path)?;
         #[cfg(not(feature = "capi-embed-cache"))]
@@ -465,7 +359,7 @@ pub unsafe extern "C" fn witchcraft_embed(
             .lock()
             .map_err(|_| anyhow!("witchcraft handle lock poisoned"))?;
         let embeddings = embed_for_capi(&state, &body_text, &lens)?;
-        encode_embedding_blob(&embeddings)
+        embeddings.to_cache_entry_bytes()
     }));
 
     match result {
@@ -501,7 +395,9 @@ pub unsafe extern "C" fn witchcraft_add(
 
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
         let embedding_blob = bytes_from_ptr(embedding_blob, embedding_blob_len, "embedding_blob")?;
-        let rows = embedding_blob_row_count(embedding_blob)?;
+        let rows = CachedEmbeddings::from_cache_entry_bytes(embedding_blob)?
+            .embedding_count
+            .try_into()?;
         let state = handle
             .state
             .lock()
@@ -588,25 +484,34 @@ pub unsafe extern "C" fn witchcraft_search(
             query_cache,
             ..
         } = &mut *state;
+        let embedder = embedder
+            .as_ref()
+            .ok_or_else(|| anyhow!("witchcraft handle was opened without embedding assets"))?;
         let q = query.split_whitespace().collect::<Vec<_>>().join(" ");
         if q.len() <= 3 {
             return Ok(vec![]);
         }
-        let qe = match query_cache.get(&q) {
-            Some(existing) => existing,
-            None => {
-                let (qe, _) = embedder.embed(&q)?;
-                let qe = qe.get(0)?;
-                query_cache.put(&q, &qe);
-                qe
-            }
+        let (qe, query_weights) = if crate::query_token_salience_enabled() {
+            let qe = crate::embed_query_for_search(embedder, &q)?;
+            (qe.embeddings, qe.weights)
+        } else {
+            let qe = match query_cache.get(&q) {
+                Some(existing) => existing,
+                None => {
+                    let (qe, _) = embedder.embed(&q)?;
+                    let qe = qe.get(0)?;
+                    query_cache.put(&q, &qe);
+                    qe
+                }
+            };
+            (qe, None)
         };
         let generation_files = index.generation_files()?;
         let active = index.active_rowids()?;
         let scored = match_centroids_raw(
             &generation_files,
             &qe.to_device(device)?,
-            None,
+            query_weights.as_deref(),
             &[],
             threshold,
             top_k,
