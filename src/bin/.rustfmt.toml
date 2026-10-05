@@ -1,0 +1,27 @@
+# NOTE: imports_granularity, group_imports, and imports_layout below are UNSTABLE rustfmt
+# options. They take effect ONLY with `rustfmt --unstable-features` (nightly). Bare
+# `cargo fmt` / stable rustfmt silently ignores them, so formatting without the flag churns
+# imports against CI. Format at the crate's `--edition`.
+comment_width = 120
+max_width = 120
+
+# Some lines are just over 120 chars... deal with it.
+error_on_line_overflow = false
+
+# Always format imports like this:
+# use foo::{
+#     Bar,
+#     Baz,
+# };
+imports_indent = "Block"
+imports_layout = "Vertical"
+reorder_imports = true
+
+match_block_trailing_comma = true
+
+# We prefer it already so just do it here
+use_try_shorthand = true
+use_field_init_shorthand = true
+
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"

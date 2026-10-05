@@ -69,6 +69,18 @@ EXTRA_FEATURES :=
 comma := ,
 export RUSTFLAGS += $(RUSTFLAGS_EXTRA)
 BEIR_CACHE ?= .cache/beir
+RUSTFMT_RS_FILES := $(shell git ls-files '*.rs' \
+	':!build.rs' \
+	':!src/main.rs' \
+	':!src/db.rs' \
+	':!src/histogram.rs' \
+	':!src/openvino_t5.rs' \
+	':!src/napi.rs' \
+	':!src/python.rs' \
+	':!src/sql*.rs' \
+	':!examples/**' \
+	':!tools/**' \
+	':!crates/**') tools/quantize/src/main.rs
 
 VENV_DIR := $(abspath env)
 PYTHON_BIN := $(VENV_DIR)/bin/python
@@ -156,6 +168,9 @@ ovdownload: prereqs assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr-
 
 # === Build targets ===
 
+fmt:
+	rustup run nightly rustfmt --color=never --unstable-features --skip-children --edition=2021 -- $(RUSTFMT_RS_FILES)
+
 build: warp-cli dylib
 
 buildemb: EXTRA_FEATURES += embed-assets
@@ -204,7 +219,8 @@ module: prereqs
 
 test: prereqs download
 	RUST_LOG=debug cargo llvm-cov nextest --release --features napi,$(CLI_FEATURES) --lcov --output-path lcov.info
-	genhtml lcov.info
+
+#genhtml lcov.info
 
 bench: prereqs
 	cargo run -p t5-bench --release --features hybrid-dequant,ov,fbgemm
