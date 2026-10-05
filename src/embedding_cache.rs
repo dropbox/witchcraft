@@ -15,6 +15,28 @@ pub struct CachedEmbeddings {
     pub embeddings: Vec<u8>,
 }
 
+impl CachedEmbeddings {
+    pub fn to_cache_entry_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(
+            MAGIC.len()
+                + std::mem::size_of::<u32>() * 2
+                + std::mem::size_of::<u64>() * 2
+                + self.model.len()
+                + self.counts.len()
+                + self.embeddings.len(),
+        );
+        out.extend_from_slice(&MAGIC);
+        write_u32(&mut out, self.model.len())?;
+        write_u32(&mut out, self.counts.len())?;
+        write_u64(&mut out, self.embedding_count)?;
+        write_u64(&mut out, self.embeddings.len())?;
+        out.extend_from_slice(self.model.as_bytes());
+        out.extend_from_slice(self.counts.as_bytes());
+        out.extend_from_slice(&self.embeddings);
+        Ok(out)
+    }
+}
+
 pub trait EmbeddingCache {
     fn get(&self, hash: &str) -> Result<Option<CachedEmbeddings>>;
     fn get_for_document(&self, _rowid: u64, hash: &str) -> Result<Option<CachedEmbeddings>> {

@@ -125,13 +125,31 @@ fn build_rope_cache(
     Ok((freqs.cos()?, freqs.sin()?))
 }
 
+fn build_key_padding_mask(
+    lengths: &[usize],
+    seq_len: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mut mask = Vec::with_capacity(lengths.len() * seq_len);
+    for &len in lengths {
+        for pos in 0..seq_len {
+            mask.push(if pos < len { 0.0 } else { f32::NEG_INFINITY });
+        }
+    }
+    Tensor::new(mask.as_slice(), device)?
+        .reshape((lengths.len(), 1, 1, seq_len))?
+        .to_dtype(dtype)
+}
+
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     // x: (batch, heads, seq, head_dim), cos/sin: (seq, half_dim)
+    let dtype = x.dtype();
     let half = x.dim(3)? / 2;
     let x1 = x.narrow(3, 0, half)?.contiguous()?;
     let x2 = x.narrow(3, half, half)?.contiguous()?;
-    let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
-    let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
+    let cos = cos.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?;
+    let sin = sin.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?;
     let r1 = x1
         .broadcast_mul(&cos)?
         .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
@@ -168,6 +186,7 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         local_window: Option<usize>,
+        key_padding_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b, s, _) = xs.dims3()?;
         let qkv = self.wqkv.forward(xs)?;
@@ -220,9 +239,14 @@ impl Attention {
                         })
                     })
                     .collect();
-                let mask = Tensor::new(mask.as_slice(), attn.device())?.reshape((1, 1, s, s))?;
+                let mask = Tensor::new(mask.as_slice(), attn.device())?
+                    .reshape((1, 1, s, s))?
+                    .to_dtype(attn.dtype())?;
                 attn = attn.broadcast_add(&mask)?;
             }
+        }
+        if let Some(mask) = key_padding_mask {
+            attn = attn.broadcast_add(mask)?;
         }
 
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
@@ -321,14 +345,20 @@ impl Layer {
         cos: &Tensor,
         sin: &Tensor,
         local_window: Option<usize>,
+        key_padding_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let normed = match &self.attn_norm {
             Some(norm) => norm.forward(xs)?,
             None => xs.clone(),
         };
-        let xs = (xs + self.attn.forward(&normed, cos, sin, local_window)?)?;
+        let attn = self
+            .attn
+            .forward(&normed, cos, sin, local_window, key_padding_mask)?
+            .to_dtype(xs.dtype())?;
+        let xs = (xs + attn)?;
         let normed = self.mlp_norm.forward(&xs)?;
-        xs + self.mlp.forward(&normed)?
+        let mlp = self.mlp.forward(&normed)?.to_dtype(xs.dtype())?;
+        xs + mlp
     }
 }
 
@@ -388,11 +418,14 @@ impl Encoder {
         })
     }
 
-    fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+    fn forward(&self, input_ids: &Tensor, lengths: Option<&[usize]>) -> Result<Tensor> {
         let seq_len = input_ids.dim(D::Minus1)?;
         let mut xs = self
             .embedding_norm
             .forward(&self.embedding.forward(input_ids)?)?;
+        let key_padding_mask = lengths
+            .map(|lengths| build_key_padding_mask(lengths, seq_len, xs.device(), xs.dtype()))
+            .transpose()?;
         let local_cos = self.local_rope_cos.narrow(0, 0, seq_len)?;
         let local_sin = self.local_rope_sin.narrow(0, 0, seq_len)?;
         let global_cos = self.global_rope_cos.narrow(0, 0, seq_len)?;
@@ -404,7 +437,7 @@ impl Encoder {
             } else {
                 (&local_cos, &local_sin, Some(self.local_attention))
             };
-            xs = layer.forward(&xs, cos, sin, local_window)?;
+            xs = layer.forward(&xs, cos, sin, local_window, key_padding_mask.as_ref())?;
         }
         self.final_norm.forward(&xs)
     }
@@ -453,11 +486,26 @@ pub struct T5EncoderModel {
 
 impl T5EncoderModel {
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.projection.forward(&self.encoder.forward(input_ids)?)
+        self.projection.forward(&self.encoder.forward(input_ids, None)?)
     }
 
     pub fn forward_with_gate(&self, input_ids: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
-        let encoder_output = self.encoder.forward(input_ids)?;
+        let encoder_output = self.encoder.forward(input_ids, None)?;
+        let gate = self
+            .token_gate
+            .as_ref()
+            .map(|gate| gate.forward(&encoder_output))
+            .transpose()?;
+        let output = self.projection.forward(&encoder_output)?;
+        Ok((output, gate))
+    }
+
+    pub fn forward_with_gate_for_lengths(
+        &self,
+        input_ids: &Tensor,
+        lengths: &[usize],
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let encoder_output = self.encoder.forward(input_ids, Some(lengths))?;
         let gate = self
             .token_gate
             .as_ref()
@@ -501,7 +549,7 @@ impl T5ModelBuilder {
             .map_err(|_| Error::other("failed to read modernbert.safetensors"))?;
         let vb = candle_nn::VarBuilder::from_buffered_safetensors(
             model_bytes.to_vec(),
-            DType::F32,
+            model_dtype(device)?,
             device,
         )?;
         let projection = if let Some(mid) = self.config.projection_mlp {
@@ -528,5 +576,25 @@ impl T5ModelBuilder {
             token_gate,
             device: device.clone(),
         })
+    }
+}
+
+fn model_dtype(device: &Device) -> candle_core::Result<DType> {
+    let default = if matches!(device, Device::Cpu) {
+        "f32"
+    } else {
+        "f16"
+    };
+    match std::env::var("WITCHCRAFT_MODEL_DTYPE")
+        .unwrap_or_else(|_| default.to_owned())
+        .to_lowercase()
+        .as_str()
+    {
+        "f32" | "fp32" | "float32" => Ok(DType::F32),
+        "f16" | "fp16" | "float16" => Ok(DType::F16),
+        "bf16" | "bfloat16" => Ok(DType::BF16),
+        other => candle_core::bail!(
+            "unsupported WITCHCRAFT_MODEL_DTYPE {other:?}; expected f32, f16, or bf16"
+        ),
     }
 }

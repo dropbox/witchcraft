@@ -80,13 +80,16 @@ fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
 
 #[cfg(feature = "hybrid-dequant")]
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
+    let ws = vb.get((out_d, in_d), "weight")?;
+    if !matches!(vb.device(), Device::Cpu) {
+        return Ok(QMatMul::from_tensor(ws.dequantize(vb.device())?));
+    }
     #[cfg(feature = "fbgemm")]
     {
-        new_qmm_dequant(in_d, out_d, vb)
+        Ok(QMatMul::from_tensor(ws.dequantize(vb.device())?))
     }
     #[cfg(not(feature = "fbgemm"))]
     {
-        let ws = vb.get((out_d, in_d), "weight")?;
         Ok(QMatMul::from_qtensor(ws))
     }
 }
@@ -150,12 +153,7 @@ impl LayerNormWithBias {
     }
 }
 
-fn build_rope_cache(
-    max_len: usize,
-    head_dim: usize,
-    theta: f64,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
+fn build_rope_cache(max_len: usize, head_dim: usize, theta: f64, device: &Device) -> Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let inv_freq: Vec<f32> = (0..half)
         .map(|i| 1.0 / theta.powf(i as f64 * 2.0 / head_dim as f64) as f32)
@@ -167,18 +165,26 @@ fn build_rope_cache(
     Ok((freqs.cos()?, freqs.sin()?))
 }
 
+fn build_key_padding_mask(lengths: &[usize], seq_len: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+    let mut mask = Vec::with_capacity(lengths.len() * seq_len);
+    for &len in lengths {
+        for pos in 0..seq_len {
+            mask.push(if pos < len { 0.0 } else { f32::NEG_INFINITY });
+        }
+    }
+    Tensor::new(mask.as_slice(), device)?
+        .reshape((lengths.len(), 1, 1, seq_len))?
+        .to_dtype(dtype)
+}
+
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let half = x.dim(3)? / 2;
     let x1 = x.narrow(3, 0, half)?.contiguous()?;
     let x2 = x.narrow(3, half, half)?.contiguous()?;
     let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
     let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
-    let r1 = x1
-        .broadcast_mul(&cos)?
-        .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
-    let r2 = x2
-        .broadcast_mul(&cos)?
-        .broadcast_add(&x1.broadcast_mul(&sin)?)?;
+    let r1 = x1.broadcast_mul(&cos)?.broadcast_sub(&x2.broadcast_mul(&sin)?)?;
+    let r2 = x2.broadcast_mul(&cos)?.broadcast_add(&x1.broadcast_mul(&sin)?)?;
     Tensor::cat(&[&r1, &r2], 3)?.contiguous()
 }
 
@@ -246,9 +252,7 @@ fn profile_take(seq_len: usize) -> bool {
         AtomicUsize::new(limit)
     });
     remaining
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            value.checked_sub(1)
-        })
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1))
         .is_ok()
 }
 
@@ -262,10 +266,7 @@ impl ForwardProfile {
     }
 
     fn print(&self) {
-        let total = self
-            .started
-            .map(|started| started.elapsed())
-            .unwrap_or_default();
+        let total = self.started.map(|started| started.elapsed()).unwrap_or_default();
         let mut attn_norm = Duration::default();
         let mut qkv = Duration::default();
         let mut rope = Duration::default();
@@ -356,9 +357,7 @@ fn ms(duration: Duration) -> f64 {
 fn attention_kind(seq_len: usize, local_window: Option<usize>) -> &'static str {
     match local_window {
         None => "global",
-        Some(window) if crate::fast_ops::should_use_modernbert_local_attention(seq_len, window) => {
-            "local-fused"
-        }
+        Some(window) if crate::fast_ops::should_use_modernbert_local_attention(seq_len, window) => "local-fused",
         Some(_) => "local-full",
     }
 }
@@ -393,6 +392,7 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         local_window: Option<usize>,
+        key_padding_mask: Option<&Tensor>,
         mut profile: Option<&mut LayerProfile>,
     ) -> Result<Tensor> {
         let attention_started = Instant::now();
@@ -426,6 +426,7 @@ impl Attention {
         if let Some(w) = local_window {
             if crate::fast_ops::should_use_modernbert_local_attention(s, w)
                 && matches!(q.device(), Device::Cpu)
+                && key_padding_mask.is_none()
             {
                 let started = Instant::now();
                 let out = crate::fast_ops::modernbert_local_attention(&q, &k, &v, scale as f32, w)?;
@@ -434,11 +435,10 @@ impl Attention {
                 }
 
                 let started = Instant::now();
-                let out = out.transpose(1, 2)?.contiguous()?.reshape((
-                    b,
-                    s,
-                    self.n_heads * self.head_dim,
-                ))?;
+                let out = out
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b, s, self.n_heads * self.head_dim))?;
                 let out = self.wo.forward(&out)?;
                 if let Some(profile) = profile {
                     profile.output_projection = started.elapsed();
@@ -476,6 +476,9 @@ impl Attention {
                 }
             }
         }
+        if let Some(mask) = key_padding_mask {
+            attn = attn.broadcast_add(mask)?;
+        }
 
         let started = Instant::now();
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
@@ -485,10 +488,10 @@ impl Attention {
 
         let started = Instant::now();
         let out = attn.matmul(&v)?;
-        let out =
-            out.transpose(1, 2)?
-                .contiguous()?
-                .reshape((b, s, self.n_heads * self.head_dim))?;
+        let out = out
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, s, self.n_heads * self.head_dim))?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.value = started.elapsed();
         }
@@ -520,14 +523,8 @@ impl Mlp {
         #[cfg(not(feature = "hybrid-dequant"))]
         let wo = new_qmm(cfg.intermediate_size, cfg.hidden_size, vb.pp("Wo"))?;
         let (activation, fast_activation) = match cfg.hidden_activation.as_str() {
-            "silu" | "swish" => (
-                Activation::Silu,
-                crate::fast_ops::ModernBertActivation::Silu,
-            ),
-            _ => (
-                Activation::Gelu,
-                crate::fast_ops::ModernBertActivation::Gelu,
-            ),
+            "silu" | "swish" => (Activation::Silu, crate::fast_ops::ModernBertActivation::Silu),
+            _ => (Activation::Gelu, crate::fast_ops::ModernBertActivation::Gelu),
         };
         Ok(Self {
             wi,
@@ -548,11 +545,7 @@ impl Mlp {
 
         let started = Instant::now();
         let h = if matches!(h.device(), Device::Cpu) {
-            crate::fast_ops::modernbert_gated_activation(
-                &h,
-                self.intermediate_size,
-                self.fast_activation,
-            )?
+            crate::fast_ops::modernbert_gated_activation(&h, self.intermediate_size, self.fast_activation)?
         } else {
             let gate = h.narrow(D::Minus1, 0, self.intermediate_size)?;
             let up = h.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
@@ -608,6 +601,7 @@ impl Layer {
         cos: &Tensor,
         sin: &Tensor,
         local_window: Option<usize>,
+        key_padding_mask: Option<&Tensor>,
         profile: Option<&mut LayerProfile>,
     ) -> Result<Tensor> {
         let layer_started = Instant::now();
@@ -622,9 +616,14 @@ impl Layer {
         }
 
         let xs = (xs
-            + self
-                .attn
-                .forward(&normed, cos, sin, local_window, profile.as_deref_mut())?)?;
+            + self.attn.forward(
+                &normed,
+                cos,
+                sin,
+                local_window,
+                key_padding_mask,
+                profile.as_deref_mut(),
+            )?)?;
 
         let started = Instant::now();
         let normed = candle_core::Module::forward(&self.mlp_norm, &xs)?;
@@ -662,21 +661,15 @@ impl Encoder {
             cfg.hidden_size,
             vb_enc.pp("embeddings").pp("tok_embeddings"),
         )?;
-        let embedding_norm = LayerNormNoBias::load(
-            cfg.hidden_size,
-            cfg.norm_eps,
-            vb_enc.pp("embeddings").pp("norm"),
-        )?;
+        let embedding_norm = LayerNormNoBias::load(cfg.hidden_size, cfg.norm_eps, vb_enc.pp("embeddings").pp("norm"))?;
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| Layer::load(i, vb_enc.pp("layers").pp(i.to_string()), cfg))
             .collect::<Result<Vec<_>>>()?;
-        let final_norm =
-            LayerNormNoBias::load(cfg.hidden_size, cfg.norm_eps, vb_enc.pp("final_norm"))?;
+        let final_norm = LayerNormNoBias::load(cfg.hidden_size, cfg.norm_eps, vb_enc.pp("final_norm"))?;
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let local_theta = cfg.rope_theta;
         let global_theta = cfg.global_rope_theta.unwrap_or(local_theta);
-        let (local_rope_cos, local_rope_sin) =
-            build_rope_cache(8192, head_dim, local_theta, device)?;
+        let (local_rope_cos, local_rope_sin) = build_rope_cache(8192, head_dim, local_theta, device)?;
         let (global_rope_cos, global_rope_sin) = if global_theta == local_theta {
             (local_rope_cos.clone(), local_rope_sin.clone())
         } else {
@@ -696,14 +689,19 @@ impl Encoder {
         })
     }
 
-    fn forward(&self, input_ids: &Tensor, profile: Option<&mut ForwardProfile>) -> Result<Tensor> {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        lengths: Option<&[usize]>,
+        profile: Option<&mut ForwardProfile>,
+    ) -> Result<Tensor> {
         let mut profile = profile;
         let seq_len = input_ids.dim(D::Minus1)?;
         let started = Instant::now();
-        let mut xs = candle_core::Module::forward(
-            &self.embedding_norm,
-            &self.embedding.forward(input_ids)?,
-        )?;
+        let mut xs = candle_core::Module::forward(&self.embedding_norm, &self.embedding.forward(input_ids)?)?;
+        let key_padding_mask = lengths
+            .map(|lengths| build_key_padding_mask(lengths, seq_len, xs.device(), xs.dtype()))
+            .transpose()?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.embedding = started.elapsed();
         }
@@ -725,10 +723,17 @@ impl Encoder {
                     attention_kind: attention_kind(seq_len, local_window),
                     ..LayerProfile::default()
                 };
-                xs = layer.forward(&xs, cos, sin, local_window, Some(&mut layer_profile))?;
+                xs = layer.forward(
+                    &xs,
+                    cos,
+                    sin,
+                    local_window,
+                    key_padding_mask.as_ref(),
+                    Some(&mut layer_profile),
+                )?;
                 profile.layers.push(layer_profile);
             } else {
-                xs = layer.forward(&xs, cos, sin, local_window, None)?;
+                xs = layer.forward(&xs, cos, sin, local_window, key_padding_mask.as_ref(), None)?;
             }
         }
         let started = Instant::now();
@@ -764,7 +769,7 @@ impl Projection {
                 let h = fc1.forward(xs)?.broadcast_add(fc1_bias)?;
                 let h = Activation::Gelu.forward(&h)?;
                 fc2.forward(&h)?.broadcast_add(fc2_bias)
-            }
+            },
         }
     }
 }
@@ -804,7 +809,7 @@ impl T5EncoderModel {
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let seq_len = input_ids.dim(D::Minus1)?;
         let mut profile = profile_take(seq_len).then(|| ForwardProfile::new(seq_len));
-        let encoder_output = self.encoder.forward(input_ids, profile.as_mut())?;
+        let encoder_output = self.encoder.forward(input_ids, None, profile.as_mut())?;
         let started = Instant::now();
         let output = self.projection.forward(&encoder_output)?;
         if let Some(mut profile) = profile {
@@ -817,7 +822,29 @@ impl T5EncoderModel {
     pub fn forward_with_gate(&self, input_ids: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
         let seq_len = input_ids.dim(D::Minus1)?;
         let mut profile = profile_take(seq_len).then(|| ForwardProfile::new(seq_len));
-        let encoder_output = self.encoder.forward(input_ids, profile.as_mut())?;
+        let encoder_output = self.encoder.forward(input_ids, None, profile.as_mut())?;
+        let gate = self
+            .token_gate
+            .as_ref()
+            .map(|gate| gate.forward(&encoder_output))
+            .transpose()?;
+        let started = Instant::now();
+        let output = self.projection.forward(&encoder_output)?;
+        if let Some(mut profile) = profile {
+            profile.projection = started.elapsed();
+            profile.print();
+        }
+        Ok((output, gate))
+    }
+
+    pub fn forward_with_gate_for_lengths(
+        &self,
+        input_ids: &Tensor,
+        lengths: &[usize],
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let seq_len = input_ids.dim(D::Minus1)?;
+        let mut profile = profile_take(seq_len).then(|| ForwardProfile::new(seq_len));
+        let encoder_output = self.encoder.forward(input_ids, Some(lengths), profile.as_mut())?;
         let gate = self
             .token_gate
             .as_ref()
@@ -846,21 +873,17 @@ impl T5ModelBuilder {
         let cfg_bytes = CONFIG
             .bytes(assets)
             .map_err(|_| Error::other("failed to read modernbert-config.json"))?;
-        let config: Config = serde_json::from_slice(cfg_bytes)
-            .map_err(|e| Error::other(format!("failed to parse config: {e}")))?;
+        let config: Config =
+            serde_json::from_slice(cfg_bytes).map_err(|e| Error::other(format!("failed to parse config: {e}")))?;
         let tok_bytes = TOKENIZER
             .bytes(assets)
             .map_err(|_| Error::other("failed to read modernbert-tokenizer.json"))?;
-        let tokenizer = Tokenizer::from_bytes(tok_bytes)
-            .map_err(|e| Error::other(format!("failed to parse tokenizer: {e}")))?;
+        let tokenizer =
+            Tokenizer::from_bytes(tok_bytes).map_err(|e| Error::other(format!("failed to parse tokenizer: {e}")))?;
         Ok((Self { config }, tokenizer))
     }
 
-    pub fn build_encoder(
-        &self,
-        device: &Device,
-        assets: &std::path::Path,
-    ) -> candle_core::Result<T5EncoderModel> {
+    pub fn build_encoder(&self, device: &Device, assets: &std::path::Path) -> candle_core::Result<T5EncoderModel> {
         let model_bytes = MODEL
             .bytes(assets)
             .map_err(|_| Error::other("failed to read modernbert.gguf"))?;
@@ -869,11 +892,7 @@ impl T5ModelBuilder {
         let projection = if let Some(mid) = self.config.projection_mlp {
             let fc1 = new_qmm(self.config.hidden_size, mid, vb.pp("linear").pp("0"))
                 .map_err(|e| Error::other(format!("projection fc1: {e}")))?;
-            let fc1_bias = vb
-                .pp("linear")
-                .pp("0")
-                .get(mid, "bias")?
-                .dequantize(device)?;
+            let fc1_bias = vb.pp("linear").pp("0").get(mid, "bias")?.dequantize(device)?;
             let fc2 = new_qmm(mid, self.config.projection_dim, vb.pp("linear").pp("2"))
                 .map_err(|e| Error::other(format!("projection fc2: {e}")))?;
             let fc2_bias = vb
@@ -888,12 +907,8 @@ impl T5ModelBuilder {
                 fc2_bias,
             }
         } else {
-            let w = new_qmm(
-                self.config.hidden_size,
-                self.config.projection_dim,
-                vb.pp("linear"),
-            )
-            .map_err(|e| Error::other(format!("projection linear: {e}")))?;
+            let w = new_qmm(self.config.hidden_size, self.config.projection_dim, vb.pp("linear"))
+                .map_err(|e| Error::other(format!("projection linear: {e}")))?;
             let bias = vb
                 .pp("linear")
                 .get(self.config.projection_dim, "bias")?

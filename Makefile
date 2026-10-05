@@ -4,8 +4,12 @@ SHELL := /bin/bash
 # Auto-detect platform and architecture
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S),Linux)
+  NVCC := $(or $(shell which nvcc 2>/dev/null),$(wildcard /usr/local/cuda/bin/nvcc),$(wildcard /opt/cuda/bin/nvcc))
+endif
 
 ENCODER ?= modernbert-quantized
+#ENCODER ?= modernbert
 #ENCODER ?= t5-quantized
 
 # Determine features and flags based on platform
@@ -29,12 +33,11 @@ ifeq ($(UNAME_S),Darwin)
   endif
   PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
 else ifeq ($(UNAME_S),Linux)
-  NVCC := $(or $(shell which nvcc 2>/dev/null),$(wildcard /usr/local/cuda/bin/nvcc),$(wildcard /opt/cuda/bin/nvcc))
   ifneq ($(NVCC),)
-    CLI_FEATURES := $(ENCODER),cuda,progress,sqlite
-    CAPI_FEATURES := $(ENCODER),cuda,capi-embed-cache
-    NAPI_FEATURES := $(ENCODER),cuda,napi
-    PYTHON_FEATURES := $(ENCODER),cuda,python
+    CLI_FEATURES := $(ENCODER),cuda,hybrid-dequant,progress,sqlite
+    CAPI_FEATURES := $(ENCODER),cuda,hybrid-dequant,capi-embed-cache
+    NAPI_FEATURES := $(ENCODER),cuda,hybrid-dequant,napi
+    PYTHON_FEATURES := $(ENCODER),cuda,hybrid-dequant,python
   else ifeq ($(UNAME_M),aarch64)
     # Linux ARM (Graviton, Pi, Ampere): fbgemm/hybrid-dequant are x86-only
     CLI_FEATURES := $(ENCODER),progress

@@ -69,7 +69,7 @@ mod embedding_cache;
 pub use embedding_cache::{CachedEmbeddings, EmbeddingCache, FileEmbeddingCache};
 
 mod embedder;
-pub use embedder::Embedder;
+pub use embedder::{Embedder, EmbeddingOutput};
 
 pub mod assets;
 
@@ -3165,14 +3165,46 @@ fn rowwise_cosine_min(a: &Tensor, b: &Tensor) -> Result<f32> {
     Ok(cos.min_all()?.to_scalar::<f32>()?)
 }
 
-pub(crate) fn compute_cached_embeddings(
+pub fn compute_cached_embeddings(
     embedder: &Embedder,
     body: &str,
     lens: &str,
 ) -> Result<CachedEmbeddings> {
-    let now = std::time::Instant::now();
     let output = embedder.embed_with_gate_scores_and_tokens(body)?;
-    let embeddings = output.embeddings.squeeze(0)?.to_device(&Device::Cpu)?;
+    cached_embeddings_from_output(body, lens, output)
+}
+
+pub fn compute_cached_embeddings_many(
+    embedder: &Embedder,
+    bodies: &[String],
+    lens: &[String],
+) -> Result<Vec<CachedEmbeddings>> {
+    anyhow::ensure!(
+        bodies.len() == lens.len(),
+        "cached embedding batch has {} bodies and {} lens entries",
+        bodies.len(),
+        lens.len()
+    );
+    let outputs = embedder.embed_batch_with_gate_scores_and_tokens(bodies)?;
+    bodies
+        .iter()
+        .zip(lens)
+        .zip(outputs)
+        .map(|((body, lens), output)| cached_embeddings_from_output(body, lens, output))
+        .collect()
+}
+
+pub fn cached_embeddings_from_output(
+    body: &str,
+    lens: &str,
+    output: EmbeddingOutput,
+) -> Result<CachedEmbeddings> {
+    let now = std::time::Instant::now();
+    let embeddings = output
+        .embeddings
+        .squeeze(0)?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?;
     let counts = token_counts_for_lens(body, lens, &output.offsets)?;
     let gate_scores = output.gate_scores.as_ref().ok_or_else(|| {
         anyhow::anyhow!("document token pruning requires token_gate tensors in ModernBERT assets")
