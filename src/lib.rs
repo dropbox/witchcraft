@@ -21,6 +21,14 @@ use quantized_t5 as t5_encoder;
 pub mod fast_ops;
 #[cfg(feature = "hybrid-dequant")]
 pub mod fused_matmul;
+#[cfg(all(feature = "neso-metal", feature = "modernbert-quantized", target_os = "macos"))]
+pub mod neso_metal_kernels;
+#[cfg(all(feature = "neso-metal", feature = "modernbert-quantized", target_os = "macos"))]
+mod gpu_modernbert_metal;
+#[cfg(all(feature = "neso-d3d12", feature = "modernbert-quantized", target_os = "windows"))]
+pub mod neso_d3d12_kernels;
+#[cfg(all(feature = "neso-d3d12", feature = "modernbert-quantized", target_os = "windows"))]
+mod gpu_modernbert_d3d12;
 
 #[cfg(feature = "t5-openvino")]
 mod openvino_t5;
@@ -397,7 +405,7 @@ fn load_cached_embeddings(
 }
 
 pub fn make_device() -> Device {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    if cfg!(target_os = "macos") && (cfg!(target_arch = "aarch64") || cfg!(feature = "neso-metal")) {
         let previous_panic_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let metal_device = std::panic::catch_unwind(|| Device::new_metal(0));

@@ -8,8 +8,8 @@ use crate::fused_matmul::MatMul as QMatMul;
 #[cfg(not(feature = "hybrid-dequant"))]
 use candle_core::quantized::QMatMul;
 use candle_core::{
+    D, DType, Device, Module, Result, Tensor,
     quantized::{GgmlDType, QTensor},
-    DType, Device, Module, Result, Tensor, D,
 };
 use candle_nn::Activation;
 use candle_transformers::quantized_var_builder::VarBuilder;
@@ -17,8 +17,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Error;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex, OnceLock,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
@@ -30,24 +30,24 @@ embed_asset!(pub TOKENIZER, "modernbert-tokenizer.json");
 embed_asset!(pub MODEL,     "modernbert.gguf");
 
 #[derive(Debug, Deserialize)]
-struct Config {
-    hidden_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    intermediate_size: usize,
+pub(crate) struct Config {
+    pub(crate) hidden_size: usize,
+    pub(crate) num_hidden_layers: usize,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) intermediate_size: usize,
     vocab_size: usize,
-    rope_theta: f64,
+    pub(crate) rope_theta: f64,
     #[serde(default)]
-    global_rope_theta: Option<f64>,
-    norm_eps: f64,
+    pub(crate) global_rope_theta: Option<f64>,
+    pub(crate) norm_eps: f64,
     #[serde(default)]
     projection_mlp: Option<usize>,
     #[serde(default = "default_projection_dim")]
     projection_dim: usize,
     #[serde(default = "default_local_attention")]
-    local_attention: usize,
+    pub(crate) local_attention: usize,
     #[serde(default = "default_global_attn_every_n")]
-    global_attn_every_n_layers: usize,
+    pub(crate) global_attn_every_n_layers: usize,
     #[serde(default = "default_activation")]
     hidden_activation: String,
     #[serde(default)]
@@ -191,12 +191,7 @@ fn build_key_padding_mask(lengths: &[usize], seq_len: usize, device: &Device, dt
         .to_dtype(dtype)
 }
 
-fn build_local_attention_mask(
-    seq_len: usize,
-    local_window: usize,
-    device: &Device,
-    dtype: DType,
-) -> Result<Tensor> {
+fn build_local_attention_mask(seq_len: usize, local_window: usize, device: &Device, dtype: DType) -> Result<Tensor> {
     let half_window = local_window / 2;
     let mut mask = Vec::with_capacity(seq_len * seq_len);
     for i in 0..seq_len {
@@ -472,17 +467,14 @@ impl Attention {
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         if let Some(w) = local_window {
-            let fused_local_supported = matches!(q.device(), Device::Cpu)
-                || (matches!(q.device(), Device::Cuda(_)) && q.dtype() == DType::F16);
+            let fused_local_supported =
+                matches!(q.device(), Device::Cpu) || (matches!(q.device(), Device::Cuda(_)) && q.dtype() == DType::F16);
             let use_fused_local = if matches!(q.device(), Device::Cuda(_)) {
                 s >= w.saturating_mul(8)
             } else {
                 crate::fast_ops::should_use_modernbert_local_attention(s, w)
             };
-            if use_fused_local
-                && fused_local_supported
-                && key_padding_mask.is_none()
-            {
+            if use_fused_local && fused_local_supported && key_padding_mask.is_none() {
                 let started = Instant::now();
                 let out = crate::fast_ops::modernbert_local_attention(&q, &k, &v, scale as f32, w)?;
                 if let Some(profile) = profile.as_deref_mut() {
@@ -788,9 +780,7 @@ impl Encoder {
         let mut masks = self
             .local_attention_masks
             .lock()
-            .map_err(|_| {
-                candle_core::Error::Msg("local attention mask cache lock poisoned".into())
-            })?;
+            .map_err(|_| candle_core::Error::Msg("local attention mask cache lock poisoned".into()))?;
         if let Some(mask) = masks.get(&seq_len) {
             return Ok(Some(mask.clone()));
         }
@@ -813,8 +803,7 @@ impl Encoder {
         let key_padding_mask = lengths
             .map(|lengths| build_key_padding_mask(lengths, seq_len, xs.device(), xs.dtype()))
             .transpose()?;
-        let local_attention_mask =
-            self.local_attention_mask(seq_len, xs.device(), xs.dtype(), lengths)?;
+        let local_attention_mask = self.local_attention_mask(seq_len, xs.device(), xs.dtype(), lengths)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.embedding = started.elapsed();
         }
@@ -880,19 +869,26 @@ enum Projection {
     },
 }
 
+fn qmm_forward_batched(linear: &QMatMul, xs: &Tensor) -> Result<Tensor> {
+    let (batch, seq_len, hidden) = xs.dims3()?;
+    let output = linear.forward(&xs.reshape((batch * seq_len, hidden))?)?;
+    let output_dim = output.dim(D::Minus1)?;
+    output.reshape((batch, seq_len, output_dim))
+}
+
 impl Projection {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Linear(l, bias) => l.forward(xs)?.broadcast_add(bias),
+            Self::Linear(l, bias) => qmm_forward_batched(l, xs)?.broadcast_add(bias),
             Self::Mlp {
                 fc1,
                 fc1_bias,
                 fc2,
                 fc2_bias,
             } => {
-                let h = fc1.forward(xs)?.broadcast_add(fc1_bias)?;
+                let h = qmm_forward_batched(fc1, xs)?.broadcast_add(fc1_bias)?;
                 let h = Activation::Gelu.forward(&h)?;
-                fc2.forward(&h)?.broadcast_add(fc2_bias)
+                qmm_forward_batched(fc2, &h)?.broadcast_add(fc2_bias)
             },
         }
     }
@@ -909,34 +905,88 @@ impl TokenGate {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let norm = LayerNormWithBias::load(cfg.hidden_size, cfg.norm_eps, vb.pp("token_gate_norm"))?;
         let linear = new_qmm(cfg.hidden_size, 1, vb.pp("token_gate"))?;
-        let bias = dequantize_for_model(
-            vb.pp("token_gate").get(1, "bias")?,
-            vb.device(),
-        )?;
+        let bias = dequantize_for_model(vb.pp("token_gate").get(1, "bias")?, vb.device())?;
         Ok(Self { norm, linear, bias })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.linear
-            .forward(&self.norm.forward(xs)?)?
+        qmm_forward_batched(&self.linear, &self.norm.forward(xs)?)?
             .broadcast_add(&self.bias)?
             .squeeze(D::Minus1)
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct T5EncoderModel {
     encoder: Encoder,
     projection: Projection,
     token_gate: Option<TokenGate>,
     device: Device,
+    #[cfg(all(feature = "neso-metal", target_os = "macos"))]
+    gpu_encoder: Option<crate::gpu_modernbert_metal::GpuModernBertMetal>,
+    #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+    gpu_encoder: Option<crate::gpu_modernbert_d3d12::GpuModernBertD3D12>,
 }
 
 impl T5EncoderModel {
+    fn encoder_output(
+        &self,
+        input_ids: &Tensor,
+        lengths: Option<&[usize]>,
+        profile: Option<&mut ForwardProfile>,
+    ) -> Result<Tensor> {
+        #[cfg(all(feature = "neso-metal", target_os = "macos"))]
+        if let Some(gpu) = &self.gpu_encoder {
+            let (batch, seq_len) = input_ids.dims2()?;
+            let all_lengths = lengths.map_or_else(|| vec![seq_len; batch], |values| values.to_vec());
+            let gpu_batch_size = gpu.max_batch_size(seq_len);
+            let mut outputs = Vec::with_capacity(batch.div_ceil(gpu_batch_size));
+            for start in (0..batch).step_by(gpu_batch_size) {
+                let chunk = (batch - start).min(gpu_batch_size);
+                let ids = input_ids.narrow(0, start, chunk)?;
+                let embeddings = self.encoder.embedding.forward(&ids)?;
+                let embeddings = Module::forward(&self.encoder.embedding_norm, &embeddings)?;
+                match gpu.forward(&embeddings, &all_lengths[start..start + chunk]) {
+                    Ok(output) => {
+                        outputs.push(output);
+                    },
+                    Err(error) => {
+                        log::warn!("Neso Metal forward failed; using Candle: {error}");
+                        return self.encoder.forward(input_ids, lengths, profile);
+                    },
+                }
+            }
+            return Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 0)?.to_device(&self.device);
+        }
+        #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+        if let Some(gpu) = &self.gpu_encoder {
+            let (batch, seq_len) = input_ids.dims2()?;
+            let all_lengths = lengths.map_or_else(|| vec![seq_len; batch], |values| values.to_vec());
+            let gpu_batch_size = gpu.max_batch_size(seq_len);
+            let mut outputs = Vec::with_capacity(batch.div_ceil(gpu_batch_size));
+            for start in (0..batch).step_by(gpu_batch_size) {
+                let chunk = (batch - start).min(gpu_batch_size);
+                let ids = input_ids.narrow(0, start, chunk)?;
+                let embeddings = self.encoder.embedding.forward(&ids)?;
+                let embeddings = Module::forward(&self.encoder.embedding_norm, &embeddings)?;
+                match gpu.forward(&embeddings, &all_lengths[start..start + chunk]) {
+                    Ok(output) => {
+                        outputs.push(output);
+                    },
+                    Err(error) => {
+                        log::warn!("Neso D3D12 forward failed; using Candle: {error}");
+                        return self.encoder.forward(input_ids, lengths, profile);
+                    },
+                }
+            }
+            return Tensor::cat(&outputs.iter().collect::<Vec<_>>(), 0)?.to_device(&self.device);
+        }
+        self.encoder.forward(input_ids, lengths, profile)
+    }
+
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
         let seq_len = input_ids.dim(D::Minus1)?;
         let mut profile = profile_take(seq_len).then(|| ForwardProfile::new(seq_len));
-        let encoder_output = self.encoder.forward(input_ids, None, profile.as_mut())?;
+        let encoder_output = self.encoder_output(input_ids, None, profile.as_mut())?;
         let started = Instant::now();
         let output = self.projection.forward(&encoder_output)?;
         if let Some(mut profile) = profile {
@@ -949,7 +999,7 @@ impl T5EncoderModel {
     pub fn forward_with_gate(&self, input_ids: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
         let seq_len = input_ids.dim(D::Minus1)?;
         let mut profile = profile_take(seq_len).then(|| ForwardProfile::new(seq_len));
-        let encoder_output = self.encoder.forward(input_ids, None, profile.as_mut())?;
+        let encoder_output = self.encoder_output(input_ids, None, profile.as_mut())?;
         let gate = self
             .token_gate
             .as_ref()
@@ -971,7 +1021,7 @@ impl T5EncoderModel {
     ) -> Result<(Tensor, Option<Tensor>)> {
         let seq_len = input_ids.dim(D::Minus1)?;
         let mut profile = profile_take(seq_len).then(|| ForwardProfile::new(seq_len));
-        let encoder_output = self.encoder.forward(input_ids, Some(lengths), profile.as_mut())?;
+        let encoder_output = self.encoder_output(input_ids, Some(lengths), profile.as_mut())?;
         let gate = self
             .token_gate
             .as_ref()
@@ -1052,6 +1102,25 @@ impl T5ModelBuilder {
         } else {
             None
         };
+        #[cfg(all(feature = "neso-metal", target_os = "macos"))]
+        let gpu_encoder = match device {
+            Device::Metal(metal_device) => {
+                crate::gpu_modernbert_metal::GpuModernBertMetal::new(metal_device, &self.config, vb.clone(), 2048)
+                    .map(Some)
+                    .unwrap_or_else(|error| {
+                        log::warn!("Neso Metal ModernBERT unavailable; using Candle: {error}");
+                        None
+                    })
+            },
+            _ => None,
+        };
+        #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+        let gpu_encoder = crate::gpu_modernbert_d3d12::GpuModernBertD3D12::new(&self.config, vb.clone(), 2048)
+            .map(Some)
+            .unwrap_or_else(|error| {
+                log::warn!("Neso D3D12 ModernBERT unavailable; using Candle: {error}");
+                None
+            });
         let encoder = Encoder::load(vb, &self.config, device)
             .map_err(|e| Error::other(format!("failed to load encoder: {e}")))?;
         Ok(T5EncoderModel {
@@ -1059,6 +1128,11 @@ impl T5ModelBuilder {
             projection,
             token_gate,
             device: device.clone(),
+            #[cfg(any(
+                all(feature = "neso-metal", target_os = "macos"),
+                all(feature = "neso-d3d12", target_os = "windows")
+            ))]
+            gpu_encoder,
         })
     }
 }

@@ -40,6 +40,22 @@ testset/treccovid/qrels.test.json
 testset/treccovid/questions.test.tsv
 .cache/
 
+# Neso AOT intermediates; keep only binaries embedded by the Rust loaders.
+kernels/out/*
+!kernels/out/generated/
+!kernels/out/metal_nosimd/
+!kernels/out/dxil/
+kernels/out/generated/*
+!kernels/out/generated/neso_metal_gen.rs
+!kernels/out/generated/neso_d3d12_gen.rs
+kernels/out/metal_nosimd/*
+!kernels/out/metal_nosimd/*.metallib
+kernels/out/dxil/*
+!kernels/out/dxil/*.dxil
+kernels/out/metal_nosimd/rope_inplace_1024.metallib
+kernels/out/dxil/rope_inplace_1024.dxil
+kernels/out/dxil/flash_attention_bias_32x32x64.dxil
+
 # Test/local data
 backup/
 scifact/

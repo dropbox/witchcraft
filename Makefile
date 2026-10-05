@@ -11,6 +11,8 @@ ifeq ($(UNAME_S),Linux)
 endif
 
 ENCODER ?= modernbert-quantized
+NESO_DIR ?= ../neso
+NESO_PYTHON ?= $(NESO_DIR)/env/bin/python
 #ENCODER ?= modernbert
 #ENCODER ?= t5-quantized
 
@@ -18,18 +20,18 @@ ENCODER ?= modernbert-quantized
 ifeq ($(UNAME_S),Darwin)
   ifeq ($(UNAME_M),arm64)
     # Apple Silicon: Metal GPU + Accelerate BLAS
-    CLI_FEATURES := $(ENCODER),metal,progress,sqlite
-    CAPI_FEATURES := $(ENCODER),metal,capi-embed-cache
-    NAPI_FEATURES := $(ENCODER),metal,napi
-    PYTHON_FEATURES := $(ENCODER),metal,python
+    CLI_FEATURES := $(ENCODER),neso-metal,progress,sqlite
+    CAPI_FEATURES := $(ENCODER),neso-metal,capi-embed-cache
+    NAPI_FEATURES := $(ENCODER),neso-metal,napi
+    PYTHON_FEATURES := $(ENCODER),neso-metal,python
     RUSTFLAGS_EXTRA :=
     TARGET := aarch64-apple-darwin
   else
-    # Intel Mac: CPU-only with FBGEMM + hybrid-dequant
-    CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress,sqlite
-    CAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,capi-embed-cache
-    NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
-    PYTHON_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,python
+    # Intel Mac: Neso-generated Metal kernels (scalar Metal 2.4 fallback)
+    CLI_FEATURES := $(ENCODER),neso-metal,progress,sqlite
+    CAPI_FEATURES := $(ENCODER),neso-metal,capi-embed-cache
+    NAPI_FEATURES := $(ENCODER),neso-metal,napi
+    PYTHON_FEATURES := $(ENCODER),neso-metal,python
     RUSTFLAGS_EXTRA := -C target-feature=+avx2,+fma
     TARGET := x86_64-apple-darwin
   endif
@@ -170,6 +172,15 @@ ovdownload: prereqs assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr-
 
 # === Build targets ===
 
+neso-kernels-metal:
+	NESO_DIR=$(abspath $(NESO_DIR)) $(NESO_PYTHON) kernels/build.py metal
+
+neso-kernels-metal-nosimd:
+	NESO_DIR=$(abspath $(NESO_DIR)) $(NESO_PYTHON) kernels/build.py metal_nosimd
+
+neso-kernels-hlsl:
+	NESO_DIR=$(abspath $(NESO_DIR)) $(NESO_PYTHON) kernels/build.py hlsl
+
 fmt:
 	rustup run nightly rustfmt --color=never --unstable-features --skip-children --edition=2021 -- $(RUSTFMT_RS_FILES)
 
@@ -199,11 +210,11 @@ pickbrain-install: pickbrain
 	cp skills/pickbrain-pi/SKILL.md ~/.pi/agent/skills/pickbrain/SKILL.md
 	cp extensions/pickbrain-pi/index.ts ~/.pi/agent/extensions/pickbrain/index.ts
 
-macintel: prereqs
-	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,progress
+macintel: prereqs neso-kernels-metal-nosimd download
+	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features $(ENCODER),neso-metal,progress,sqlite
 
-winintel: prereqs ovdownload
-	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features t5-openvino,fbgemm,progress,sqlite
+winintel: prereqs neso-kernels-hlsl download
+	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features $(ENCODER),neso-d3d12,progress,sqlite
 
 win: winintel
 
@@ -213,9 +224,9 @@ else
   LIB_BIN := target/release/libwitchcraft.dylib
 endif
 
-module: prereqs
-	cargo build --release --target aarch64-apple-darwin --features t5-quantized,metal,napi
-	cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,napi
+module: prereqs neso-kernels-metal neso-kernels-metal-nosimd download
+	cargo build --release --target aarch64-apple-darwin --features $(ENCODER),neso-metal,napi
+	cargo build --release --target x86_64-apple-darwin --features $(ENCODER),neso-metal,napi
 	lipo -create target/aarch64-apple-darwin/release/libwitchcraft.dylib target/x86_64-apple-darwin/release/libwitchcraft.dylib -output target/release/warp-macos-universal.node
 	ln -sf target/release/warp-macos-universal.node warp.node
 
@@ -336,6 +347,9 @@ distclean:
 	modernbert-assets \
 	modernbert-quantized-assets \
 	module \
+	neso-kernels-hlsl \
+	neso-kernels-metal \
+	neso-kernels-metal-nosimd \
 	nfcorpus \
 	nfcorpus-score \
 	ovdownload \
