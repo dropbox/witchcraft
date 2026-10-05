@@ -51,6 +51,7 @@ lz4_flex = "0.13.0"
 strsim = "0.11.1"
 libc = "0.2"
 rayon = { version = "1", optional = true }
+half = "2"
 fbgemm-rs = { git = "https://github.com/jacobgorm/fbgemm-rs", rev = "71595cd89ccd49aa272bfa9ae2a78b5f4e3048c1", optional = true, features = ["rayon"] }
 
 [dev-dependencies]

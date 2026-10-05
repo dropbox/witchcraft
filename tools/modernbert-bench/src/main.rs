@@ -39,7 +39,7 @@ fn bench_sizes() -> Result<Vec<usize>> {
                     .map_err(|e| anyhow::anyhow!("invalid WARP_BENCH_SIZES entry {size:?}: {e}"))
             })
             .collect(),
-        Err(_) => Ok(vec![32, 64, 128, 256, 512]),
+        Err(_) => Ok(vec![32, 64, 128, 256, 512, 1024, 2048]),
     }
 }
 

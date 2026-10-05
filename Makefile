@@ -1,4 +1,6 @@
 SHELL := /bin/bash
+PATH := $(HOME)/.cargo/bin:$(HOME)/.local/bin:/usr/local/cuda/bin:$(PATH)
+export PATH
 .DEFAULT_GOAL := build
 
 # Auto-detect platform and architecture
@@ -223,7 +225,7 @@ test: prereqs download
 #genhtml lcov.info
 
 bench: prereqs
-	cargo run -p t5-bench --release --features hybrid-dequant,ov,fbgemm
+	cargo run -p modernbert-bench --release --features hybrid-dequant,cuda
 
 %: %.zst
 	zstd -dk $<

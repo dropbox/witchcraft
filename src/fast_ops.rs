@@ -9,6 +9,8 @@ use candle_core::{
 };
 #[cfg(feature = "hybrid-dequant")]
 use rayon::prelude::*;
+#[cfg(feature = "cuda")]
+use std::sync::OnceLock;
 
 struct FastAddOp;
 
@@ -124,6 +126,118 @@ struct ModernBertLocalAttentionOp {
     local_window: usize,
 }
 
+#[cfg(feature = "cuda")]
+static MODERNBERT_LOCAL_ATTENTION_PTX: OnceLock<String> = OnceLock::new();
+
+#[cfg(feature = "cuda")]
+const MODERNBERT_LOCAL_ATTENTION_CUDA: &str = r#"
+#include <cuda_fp16.h>
+
+extern "C" __global__ void modernbert_local_attention_f16(
+    const half* q,
+    const half* k,
+    const half* v,
+    half* out,
+    int rows,
+    int seq_len,
+    int head_dim,
+    int half_window,
+    float scale
+) {
+    extern __shared__ float scores[];
+    int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int pos = row % seq_len;
+    int seq_base = row - pos;
+    int start = pos - half_window;
+    if (start < 0) {
+        start = 0;
+    }
+    int end = pos + half_window + 1;
+    if (end > seq_len) {
+        end = seq_len;
+    }
+    int window = end - start;
+    int q_base = row * head_dim;
+
+    if (tid < window) {
+        int k_base = (seq_base + start + tid) * head_dim;
+        float score = 0.0f;
+        for (int dim = 0; dim < head_dim; ++dim) {
+            score += __half2float(q[q_base + dim]) * __half2float(k[k_base + dim]);
+        }
+        scores[tid] = score * scale;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float max_score = scores[0];
+        for (int idx = 1; idx < window; ++idx) {
+            max_score = scores[idx] > max_score ? scores[idx] : max_score;
+        }
+
+        float sum = 0.0f;
+        for (int idx = 0; idx < window; ++idx) {
+            float value = __expf(scores[idx] - max_score);
+            scores[idx] = value;
+            sum += value;
+        }
+
+        float inv_sum = 1.0f / sum;
+        for (int idx = 0; idx < window; ++idx) {
+            scores[idx] *= inv_sum;
+        }
+    }
+    __syncthreads();
+
+    for (int dim = tid; dim < head_dim; dim += blockDim.x) {
+        float acc = 0.0f;
+        for (int idx = 0; idx < window; ++idx) {
+            int v_base = (seq_base + start + idx) * head_dim;
+            acc += scores[idx] * __half2float(v[v_base + dim]);
+        }
+        out[q_base + dim] = __float2half(acc);
+    }
+}
+"#;
+
+#[cfg(feature = "cuda")]
+fn modernbert_local_attention_ptx() -> Result<&'static str> {
+    if let Some(ptx) = MODERNBERT_LOCAL_ATTENTION_PTX.get() {
+        return Ok(ptx.as_str());
+    }
+
+    let ptx = {
+        use candle_core::cuda_backend::cudarc::nvrtc::{
+            safe::compile_ptx_with_opts, CompileOptions,
+        };
+        let opts = CompileOptions {
+            use_fast_math: Some(true),
+            include_paths: vec![format!(
+                "{}/include",
+                std::env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_owned())
+            )],
+            ..Default::default()
+        };
+        compile_ptx_with_opts(MODERNBERT_LOCAL_ATTENTION_CUDA, opts)
+            .map_err(|err| {
+                candle_core::Error::Cuda(
+                    format!("failed to compile modernbert local attention kernel: {err}").into(),
+                )
+            })?
+            .to_src()
+    };
+    let _ = MODERNBERT_LOCAL_ATTENTION_PTX.set(ptx);
+    Ok(MODERNBERT_LOCAL_ATTENTION_PTX
+        .get()
+        .expect("local attention PTX was just initialized")
+        .as_str())
+}
+
 struct ModernBertRopeQkvOp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +308,89 @@ impl CustomOp3 for ModernBertLocalAttentionOp {
         }
 
         Ok((CpuStorage::F32(out), shape))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        q_storage: &candle_core::CudaStorage,
+        q_layout: &Layout,
+        k_storage: &candle_core::CudaStorage,
+        k_layout: &Layout,
+        v_storage: &candle_core::CudaStorage,
+        v_layout: &Layout,
+    ) -> Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::WrapErr;
+        use half::f16;
+
+        if q_storage.dtype() != DType::F16
+            || k_storage.dtype() != DType::F16
+            || v_storage.dtype() != DType::F16
+        {
+            candle_core::bail!("modernbert CUDA local attention only supports f16")
+        }
+
+        let shape = q_layout.shape().clone();
+        if k_layout.shape() != &shape || v_layout.shape() != &shape {
+            candle_core::bail!("local attention expects q, k, v to have the same shape")
+        }
+        let dims = shape.dims();
+        let [b, h, s, d] = dims else {
+            candle_core::bail!(
+                "local attention expects [batch, heads, seq, head_dim], got {shape:?}"
+            )
+        };
+        if *s == 0 || *d == 0 {
+            let dev = q_storage.device().clone();
+            let dst = unsafe { dev.alloc::<f16>(0)? };
+            return Ok((candle_core::CudaStorage::wrap_cuda_slice(dst, dev), shape));
+        }
+        if self.local_window + 1 > 1024 {
+            candle_core::bail!("modernbert CUDA local attention only supports windows up to 1024")
+        }
+
+        let q = q_storage.as_cuda_slice::<f16>()?;
+        let q = match q_layout.contiguous_offsets() {
+            Some((o1, o2)) => q.slice(o1..o2),
+            None => candle_core::bail!("q must be contiguous"),
+        };
+        let k = k_storage.as_cuda_slice::<f16>()?;
+        let k = match k_layout.contiguous_offsets() {
+            Some((o1, o2)) => k.slice(o1..o2),
+            None => candle_core::bail!("k must be contiguous"),
+        };
+        let v = v_storage.as_cuda_slice::<f16>()?;
+        let v = match v_layout.contiguous_offsets() {
+            Some((o1, o2)) => v.slice(o1..o2),
+            None => candle_core::bail!("v must be contiguous"),
+        };
+
+        let dev = q_storage.device().clone();
+        let dst = unsafe { dev.alloc::<f16>(shape.elem_count())? };
+        let func = dev.get_or_load_custom_func(
+            "modernbert_local_attention_f16",
+            "witchcraft_modernbert_local_attention",
+            modernbert_local_attention_ptx()?,
+        )?;
+        let rows = (*b * *h * *s) as i32;
+        let seq_len = *s as i32;
+        let head_dim = *d as i32;
+        let half_window = (self.local_window / 2) as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: ((self.local_window + 1) * std::mem::size_of::<f32>()) as u32,
+        };
+        let mut builder = func.builder();
+        builder.arg(&q);
+        builder.arg(&k);
+        builder.arg(&v);
+        builder.arg(&dst);
+        candle_core::builder_arg!(builder, rows, seq_len, head_dim, half_window, self.scale);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        Ok((candle_core::CudaStorage::wrap_cuda_slice(dst, dev), shape))
     }
 }
 
@@ -660,8 +857,15 @@ pub fn modernbert_local_attention(
     scale: f32,
     local_window: usize,
 ) -> Result<Tensor> {
-    if !matches!(q.device(), Device::Cpu) || local_window + 1 > 1024 {
-        candle_core::bail!("modernbert_local_attention only supports CPU windows up to 1024")
+    #[cfg(feature = "cuda")]
+    let cuda_f16 = matches!(q.device(), Device::Cuda(_)) && q.dtype() == DType::F16;
+    #[cfg(not(feature = "cuda"))]
+    let cuda_f16 = false;
+
+    if (!matches!(q.device(), Device::Cpu) && !cuda_f16) || local_window + 1 > 1024 {
+        candle_core::bail!(
+            "modernbert_local_attention only supports CPU tensors or CUDA f16 tensors with windows up to 1024"
+        )
     }
     q.apply_op3_no_bwd(
         k,
@@ -750,6 +954,64 @@ mod tests {
         for (idx, (got, expected)) in got.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got - expected).abs() < 1e-5,
+                "mismatch at {idx}: got {got}, expected {expected}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn modernbert_local_attention_cuda_matches_full_attention_reference() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let (b, h, s, d) = (1usize, 2usize, 256usize, 64usize);
+        let shape = (b, h, s, d);
+        let q: Vec<f32> = (0..b * h * s * d)
+            .map(|i| ((i * 17 % 31) as f32 - 15.0) / 19.0)
+            .collect();
+        let k: Vec<f32> = (0..b * h * s * d)
+            .map(|i| ((i * 11 % 29) as f32 - 14.0) / 23.0)
+            .collect();
+        let v: Vec<f32> = (0..b * h * s * d)
+            .map(|i| ((i * 7 % 37) as f32 - 18.0) / 17.0)
+            .collect();
+        let scale = 0.125f32;
+        let local_window = 128usize;
+
+        let q_t = Tensor::from_vec(q, shape, &device)?.to_dtype(DType::F16)?;
+        let k_t = Tensor::from_vec(k, shape, &device)?.to_dtype(DType::F16)?;
+        let v_t = Tensor::from_vec(v, shape, &device)?.to_dtype(DType::F16)?;
+        let got = modernbert_local_attention(&q_t, &k_t, &v_t, scale, local_window)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        let half_window = local_window / 2;
+        let mask: Vec<f32> = (0..s)
+            .flat_map(|i| {
+                (0..s).map(move |j| {
+                    if (i as isize - j as isize).unsigned_abs() <= half_window {
+                        0.0
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+            })
+            .collect();
+        let mask = Tensor::new(mask.as_slice(), &device)?
+            .reshape((1, 1, s, s))?
+            .to_dtype(DType::F16)?;
+        let attn = (q_t.matmul(&k_t.t()?)? * scale as f64)?.broadcast_add(&mask)?;
+        let expected = candle_nn::ops::softmax_last_dim(&attn)?
+            .matmul(&v_t)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+
+        for (idx, (got, expected)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - expected).abs() < 3e-2,
                 "mismatch at {idx}: got {got}, expected {expected}"
             );
         }

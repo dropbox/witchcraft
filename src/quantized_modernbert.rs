@@ -7,14 +7,18 @@
 use crate::fused_matmul::MatMul as QMatMul;
 #[cfg(not(feature = "hybrid-dequant"))]
 use candle_core::quantized::QMatMul;
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::{
+    quantized::{GgmlDType, QTensor},
+    DType, Device, Module, Result, Tensor, D,
+};
 use candle_nn::Activation;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::Error;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    OnceLock,
+    Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
@@ -66,6 +70,16 @@ fn default_global_attn_every_n() -> usize {
     3
 }
 
+fn dequantize_for_model(ws: Arc<QTensor>, device: &Device) -> Result<Tensor> {
+    if !matches!(device, Device::Cuda(_)) {
+        ws.dequantize(device)
+    } else if matches!(ws.dtype(), GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16) {
+        ws.dequantize(device)?.to_dtype(DType::F16)
+    } else {
+        ws.dequantize_f16(device)
+    }
+}
+
 #[cfg(not(feature = "hybrid-dequant"))]
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     let device = vb.device();
@@ -82,11 +96,11 @@ fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     let ws = vb.get((out_d, in_d), "weight")?;
     if !matches!(vb.device(), Device::Cpu) {
-        return Ok(QMatMul::from_tensor(ws.dequantize(vb.device())?));
+        return Ok(QMatMul::from_tensor(dequantize_for_model(ws, vb.device())?));
     }
     #[cfg(feature = "fbgemm")]
     {
-        Ok(QMatMul::from_tensor(ws.dequantize(vb.device())?))
+        Ok(QMatMul::from_tensor(dequantize_for_model(ws, vb.device())?))
     }
     #[cfg(not(feature = "fbgemm"))]
     {
@@ -97,7 +111,7 @@ fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
 #[cfg(feature = "hybrid-dequant")]
 fn new_qmm_dequant(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     let ws = vb.get((out_d, in_d), "weight")?;
-    let tensor = ws.dequantize(vb.device())?;
+    let tensor = dequantize_for_model(ws, vb.device())?;
     Ok(QMatMul::from_tensor(tensor))
 }
 
@@ -109,7 +123,7 @@ struct LayerNormNoBias {
 
 impl LayerNormNoBias {
     fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(size, "weight")?.dequantize(vb.device())?;
+        let weight = dequantize_for_model(vb.get(size, "weight")?, vb.device())?;
         Ok(Self { weight, eps })
     }
 }
@@ -136,8 +150,8 @@ struct LayerNormWithBias {
 
 impl LayerNormWithBias {
     fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
-        let weight = vb.get(size, "weight")?.dequantize(vb.device())?;
-        let bias = vb.get(size, "bias")?.dequantize(vb.device())?;
+        let weight = dequantize_for_model(vb.get(size, "weight")?, vb.device())?;
+        let bias = dequantize_for_model(vb.get(size, "bias")?, vb.device())?;
         Ok(Self { weight, bias, eps })
     }
 
@@ -177,10 +191,43 @@ fn build_key_padding_mask(lengths: &[usize], seq_len: usize, device: &Device, dt
         .to_dtype(dtype)
 }
 
+fn build_local_attention_mask(
+    seq_len: usize,
+    local_window: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let half_window = local_window / 2;
+    let mut mask = Vec::with_capacity(seq_len * seq_len);
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            mask.push(if (i as isize - j as isize).unsigned_abs() <= half_window {
+                0.0
+            } else {
+                f32::NEG_INFINITY
+            });
+        }
+    }
+    Tensor::new(mask.as_slice(), device)?
+        .reshape((1, 1, seq_len, seq_len))?
+        .to_dtype(dtype)
+}
+
 fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let dtype = x.dtype();
     let half = x.dim(3)? / 2;
     let x1 = x.narrow(3, 0, half)?.contiguous()?;
     let x2 = x.narrow(3, half, half)?.contiguous()?;
+    let cos = if cos.dtype() == dtype {
+        cos.clone()
+    } else {
+        cos.to_dtype(dtype)?
+    };
+    let sin = if sin.dtype() == dtype {
+        sin.clone()
+    } else {
+        sin.to_dtype(dtype)?
+    };
     let cos = cos.unsqueeze(0)?.unsqueeze(0)?;
     let sin = sin.unsqueeze(0)?.unsqueeze(0)?;
     let r1 = x1.broadcast_mul(&cos)?.broadcast_sub(&x2.broadcast_mul(&sin)?)?;
@@ -392,6 +439,7 @@ impl Attention {
         cos: &Tensor,
         sin: &Tensor,
         local_window: Option<usize>,
+        local_attention_mask: Option<&Tensor>,
         key_padding_mask: Option<&Tensor>,
         mut profile: Option<&mut LayerProfile>,
     ) -> Result<Tensor> {
@@ -424,8 +472,15 @@ impl Attention {
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         if let Some(w) = local_window {
-            if crate::fast_ops::should_use_modernbert_local_attention(s, w)
-                && matches!(q.device(), Device::Cpu)
+            let fused_local_supported = matches!(q.device(), Device::Cpu)
+                || (matches!(q.device(), Device::Cuda(_)) && q.dtype() == DType::F16);
+            let use_fused_local = if matches!(q.device(), Device::Cuda(_)) {
+                s >= w.saturating_mul(8)
+            } else {
+                crate::fast_ops::should_use_modernbert_local_attention(s, w)
+            };
+            if use_fused_local
+                && fused_local_supported
                 && key_padding_mask.is_none()
             {
                 let started = Instant::now();
@@ -454,26 +509,11 @@ impl Attention {
             profile.full_scores = started.elapsed();
         }
 
-        if let Some(w) = local_window {
-            if s > w {
-                let started = Instant::now();
-                let half_w = w / 2;
-                let mask: Vec<f32> = (0..s)
-                    .flat_map(|i| {
-                        (0..s).map(move |j| {
-                            if (i as isize - j as isize).unsigned_abs() <= half_w {
-                                0.0
-                            } else {
-                                f32::NEG_INFINITY
-                            }
-                        })
-                    })
-                    .collect();
-                let mask = Tensor::new(mask.as_slice(), attn.device())?.reshape((1, 1, s, s))?;
-                attn = attn.broadcast_add(&mask)?;
-                if let Some(profile) = profile.as_deref_mut() {
-                    profile.mask = started.elapsed();
-                }
+        if let Some(mask) = local_attention_mask {
+            let started = Instant::now();
+            attn = attn.broadcast_add(mask)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.mask = started.elapsed();
             }
         }
         if let Some(mask) = key_padding_mask {
@@ -601,6 +641,7 @@ impl Layer {
         cos: &Tensor,
         sin: &Tensor,
         local_window: Option<usize>,
+        local_attention_mask: Option<&Tensor>,
         key_padding_mask: Option<&Tensor>,
         profile: Option<&mut LayerProfile>,
     ) -> Result<Tensor> {
@@ -621,6 +662,7 @@ impl Layer {
                 cos,
                 sin,
                 local_window,
+                local_attention_mask,
                 key_padding_mask,
                 profile.as_deref_mut(),
             )?)?;
@@ -640,8 +682,16 @@ impl Layer {
 }
 
 #[derive(Debug, Clone)]
+struct RopeSlices {
+    local_cos: Tensor,
+    local_sin: Tensor,
+    global_cos: Tensor,
+    global_sin: Tensor,
+}
+
+#[derive(Debug, Clone)]
 struct Encoder {
-    embedding: candle_transformers::quantized_nn::Embedding,
+    embedding: candle_nn::Embedding,
     embedding_norm: LayerNormNoBias,
     layers: Vec<Layer>,
     final_norm: LayerNormNoBias,
@@ -651,16 +701,21 @@ struct Encoder {
     global_rope_sin: Tensor,
     local_attention: usize,
     global_attn_every_n: usize,
+    local_attention_masks: Arc<Mutex<HashMap<usize, Tensor>>>,
+    rope_slices: Arc<Mutex<HashMap<(usize, DType), RopeSlices>>>,
 }
 
 impl Encoder {
     fn load(vb: VarBuilder, cfg: &Config, device: &Device) -> Result<Self> {
         let vb_enc = vb.pp("encoder");
-        let embedding = candle_transformers::quantized_nn::Embedding::new(
-            cfg.vocab_size,
-            cfg.hidden_size,
-            vb_enc.pp("embeddings").pp("tok_embeddings"),
+        let embedding_weight = dequantize_for_model(
+            vb_enc
+                .pp("embeddings")
+                .pp("tok_embeddings")
+                .get((cfg.vocab_size, cfg.hidden_size), "weight")?,
+            device,
         )?;
+        let embedding = candle_nn::Embedding::new(embedding_weight, cfg.hidden_size);
         let embedding_norm = LayerNormNoBias::load(cfg.hidden_size, cfg.norm_eps, vb_enc.pp("embeddings").pp("norm"))?;
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| Layer::load(i, vb_enc.pp("layers").pp(i.to_string()), cfg))
@@ -686,7 +741,63 @@ impl Encoder {
             global_rope_sin,
             local_attention: cfg.local_attention,
             global_attn_every_n: cfg.global_attn_every_n_layers,
+            local_attention_masks: Arc::new(Mutex::new(HashMap::new())),
+            rope_slices: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    fn rope_slices(&self, seq_len: usize, dtype: DType) -> Result<RopeSlices> {
+        let key = (seq_len, dtype);
+        let mut cache = self
+            .rope_slices
+            .lock()
+            .map_err(|_| candle_core::Error::Msg("rope slice cache lock poisoned".into()))?;
+        if let Some(slices) = cache.get(&key) {
+            return Ok(slices.clone());
+        }
+
+        let convert = |tensor: &Tensor| {
+            let tensor = tensor.narrow(0, 0, seq_len)?;
+            if tensor.dtype() == dtype {
+                Ok(tensor)
+            } else {
+                tensor.to_dtype(dtype)
+            }
+        };
+        let slices = RopeSlices {
+            local_cos: convert(&self.local_rope_cos)?,
+            local_sin: convert(&self.local_rope_sin)?,
+            global_cos: convert(&self.global_rope_cos)?,
+            global_sin: convert(&self.global_rope_sin)?,
+        };
+        cache.insert(key, slices.clone());
+        Ok(slices)
+    }
+
+    fn local_attention_mask(
+        &self,
+        seq_len: usize,
+        device: &Device,
+        dtype: DType,
+        lengths: Option<&[usize]>,
+    ) -> Result<Option<Tensor>> {
+        if seq_len <= self.local_attention || matches!(device, Device::Cpu) && lengths.is_none() {
+            return Ok(None);
+        }
+
+        let mut masks = self
+            .local_attention_masks
+            .lock()
+            .map_err(|_| {
+                candle_core::Error::Msg("local attention mask cache lock poisoned".into())
+            })?;
+        if let Some(mask) = masks.get(&seq_len) {
+            return Ok(Some(mask.clone()));
+        }
+
+        let mask = build_local_attention_mask(seq_len, self.local_attention, device, dtype)?;
+        masks.insert(seq_len, mask.clone());
+        Ok(Some(mask))
     }
 
     fn forward(
@@ -702,21 +813,25 @@ impl Encoder {
         let key_padding_mask = lengths
             .map(|lengths| build_key_padding_mask(lengths, seq_len, xs.device(), xs.dtype()))
             .transpose()?;
+        let local_attention_mask =
+            self.local_attention_mask(seq_len, xs.device(), xs.dtype(), lengths)?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.embedding = started.elapsed();
         }
 
-        let local_cos = self.local_rope_cos.narrow(0, 0, seq_len)?;
-        let local_sin = self.local_rope_sin.narrow(0, 0, seq_len)?;
-        let global_cos = self.global_rope_cos.narrow(0, 0, seq_len)?;
-        let global_sin = self.global_rope_sin.narrow(0, 0, seq_len)?;
+        let rope_slices = self.rope_slices(seq_len, xs.dtype())?;
         for (i, layer) in self.layers.iter().enumerate() {
             let is_global = self.global_attn_every_n > 0 && i % self.global_attn_every_n == 0;
             let (cos, sin, local_window) = if is_global {
-                (&global_cos, &global_sin, None)
+                (&rope_slices.global_cos, &rope_slices.global_sin, None)
             } else {
-                (&local_cos, &local_sin, Some(self.local_attention))
+                (
+                    &rope_slices.local_cos,
+                    &rope_slices.local_sin,
+                    Some(self.local_attention),
+                )
             };
+            let layer_local_attention_mask = local_window.and(local_attention_mask.as_ref());
             if let Some(profile) = profile.as_deref_mut() {
                 let mut layer_profile = LayerProfile {
                     index: i,
@@ -728,12 +843,21 @@ impl Encoder {
                     cos,
                     sin,
                     local_window,
+                    layer_local_attention_mask,
                     key_padding_mask.as_ref(),
                     Some(&mut layer_profile),
                 )?;
                 profile.layers.push(layer_profile);
             } else {
-                xs = layer.forward(&xs, cos, sin, local_window, key_padding_mask.as_ref(), None)?;
+                xs = layer.forward(
+                    &xs,
+                    cos,
+                    sin,
+                    local_window,
+                    layer_local_attention_mask,
+                    key_padding_mask.as_ref(),
+                    None,
+                )?;
             }
         }
         let started = Instant::now();
@@ -785,7 +909,10 @@ impl TokenGate {
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let norm = LayerNormWithBias::load(cfg.hidden_size, cfg.norm_eps, vb.pp("token_gate_norm"))?;
         let linear = new_qmm(cfg.hidden_size, 1, vb.pp("token_gate"))?;
-        let bias = vb.pp("token_gate").get(1, "bias")?.dequantize(vb.device())?;
+        let bias = dequantize_for_model(
+            vb.pp("token_gate").get(1, "bias")?,
+            vb.device(),
+        )?;
         Ok(Self { norm, linear, bias })
     }
 
@@ -892,14 +1019,18 @@ impl T5ModelBuilder {
         let projection = if let Some(mid) = self.config.projection_mlp {
             let fc1 = new_qmm(self.config.hidden_size, mid, vb.pp("linear").pp("0"))
                 .map_err(|e| Error::other(format!("projection fc1: {e}")))?;
-            let fc1_bias = vb.pp("linear").pp("0").get(mid, "bias")?.dequantize(device)?;
+            let fc1_bias = vb
+                .pp("linear")
+                .pp("0")
+                .get(mid, "bias")
+                .and_then(|bias| dequantize_for_model(bias, device))?;
             let fc2 = new_qmm(mid, self.config.projection_dim, vb.pp("linear").pp("2"))
                 .map_err(|e| Error::other(format!("projection fc2: {e}")))?;
             let fc2_bias = vb
                 .pp("linear")
                 .pp("2")
-                .get(self.config.projection_dim, "bias")?
-                .dequantize(device)?;
+                .get(self.config.projection_dim, "bias")
+                .and_then(|bias| dequantize_for_model(bias, device))?;
             Projection::Mlp {
                 fc1,
                 fc1_bias,
@@ -911,8 +1042,8 @@ impl T5ModelBuilder {
                 .map_err(|e| Error::other(format!("projection linear: {e}")))?;
             let bias = vb
                 .pp("linear")
-                .get(self.config.projection_dim, "bias")?
-                .dequantize(device)?;
+                .get(self.config.projection_dim, "bias")
+                .and_then(|bias| dequantize_for_model(bias, device))?;
             Projection::Linear(w, bias)
         };
 
