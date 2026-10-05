@@ -17,9 +17,14 @@ const ROWID_RECORD_BYTES: usize = std::mem::size_of::<u64>() + std::mem::size_of
 const ROWIDS_OFFSET_FIELD: usize = 8 * std::mem::size_of::<u32>();
 
 pub(crate) fn sync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(not(windows))]
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
+    // Windows does not allow opening directories through std::fs::File, and
+    // rename already provides the atomic publication guarantee needed here.
+    #[cfg(windows)]
+    let _ = path;
     Ok(())
 }
 
