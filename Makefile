@@ -78,7 +78,6 @@ RUSTFMT_RS_FILES := $(shell git ls-files '*.rs' \
 	':!src/main.rs' \
 	':!src/db.rs' \
 	':!src/histogram.rs' \
-	':!src/openvino_t5.rs' \
 	':!src/napi.rs' \
 	':!src/python.rs' \
 	':!src/sql*.rs' \
@@ -153,22 +152,15 @@ modernbert-assets: assets/modernbert-config.json assets/modernbert-tokenizer.jso
 
 modernbert-quantized-assets: assets/modernbert-config.json assets/modernbert-tokenizer.json assets/modernbert.gguf assets/LICENSE assets/LICENSE.granite assets/NOTICE assets/SHA256SUMS
 
-assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml: | prereqs
-	$(PYTHON_BIN) quantize-openvino.py
-
 ifeq ($(ENCODER),modernbert)
 DOWNLOAD_TARGETS := modernbert-assets
 else ifeq ($(ENCODER),modernbert-quantized)
 DOWNLOAD_TARGETS := modernbert-quantized-assets
-else ifeq ($(ENCODER),t5-openvino)
-DOWNLOAD_TARGETS := assets assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
 else
 DOWNLOAD_TARGETS := assets assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr.gguf
 endif
 
 download: prereqs $(DOWNLOAD_TARGETS)
-
-ovdownload: prereqs assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml
 
 # === Build targets ===
 
@@ -318,7 +310,7 @@ python-test: python-dev
 	$(PYTEST) $(PYTHON_TEST_ARGS)
 
 distclean:
-	rm -rf target env html xtr-base-en openvino_model
+	rm -rf target env html xtr-base-en
 	rm -f warp-cli warp.node pickbrain Cargo.lock lcov.info output.txt
 	rm -f *.sqlite *.sqlite-shm *.sqlite-wal
 	rm -f xtr.safetensors
@@ -352,7 +344,6 @@ distclean:
 	neso-kernels-metal-nosimd \
 	nfcorpus \
 	nfcorpus-score \
-	ovdownload \
 	pickbrain \
 	pickbrain-install \
 	prereqs \

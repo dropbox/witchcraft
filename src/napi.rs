@@ -60,18 +60,8 @@ static LOGFN: OnceCell<Box<dyn Fn(LogEvent) + Send + Sync>> = OnceCell::new();
 struct JsLogger;
 
 impl Log for JsLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        // SECURITY: Filter out openvino-finder logs below ERROR level to prevent PII leakage.
-        // openvino-finder (dependency of openvino crate) logs file paths at INFO level like:
-        // "Attempting to find library: libopenvino_c.so"
-        // "Found library at path: /Users/username/Library/..."
-        // These paths may contain usernames or other PII that must not be exposed via the
-        // logging callback. Only ERROR-level failures are allowed through.
-        if metadata.target().starts_with("openvino_finder") {
-            metadata.level() <= log::Level::Error
-        } else {
-            true
-        }
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
     }
 
     fn log(&self, record: &Record) {

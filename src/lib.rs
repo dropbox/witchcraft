@@ -30,11 +30,6 @@ pub mod neso_d3d12_kernels;
 #[cfg(all(feature = "neso-d3d12", feature = "modernbert-quantized", target_os = "windows"))]
 mod gpu_modernbert_d3d12;
 
-#[cfg(feature = "t5-openvino")]
-mod openvino_t5;
-#[cfg(feature = "t5-openvino")]
-use openvino_t5 as t5_encoder;
-
 #[cfg(feature = "modernbert")]
 pub mod modernbert;
 #[cfg(feature = "modernbert")]
@@ -48,18 +43,14 @@ use quantized_modernbert as t5_encoder;
 // Compile-time checks: exactly one encoder backend required.
 #[cfg(not(any(
     feature = "t5-quantized",
-    feature = "t5-openvino",
     feature = "modernbert",
     feature = "modernbert-quantized",
 )))]
-compile_error!("Must enable exactly one encoder backend: t5-quantized, t5-openvino, modernbert, or modernbert-quantized");
+compile_error!("Must enable exactly one encoder backend: t5-quantized, modernbert, or modernbert-quantized");
 
 #[cfg(any(
-    all(feature = "t5-quantized", feature = "t5-openvino"),
     all(feature = "t5-quantized", feature = "modernbert"),
     all(feature = "t5-quantized", feature = "modernbert-quantized"),
-    all(feature = "t5-openvino", feature = "modernbert"),
-    all(feature = "t5-openvino", feature = "modernbert-quantized"),
     all(feature = "modernbert", feature = "modernbert-quantized"),
 ))]
 compile_error!("Cannot enable multiple encoder backends simultaneously");
@@ -265,7 +256,7 @@ fn residual_bytes_for_dim(dim: usize, residual_quant_bits: u8) -> Result<usize> 
 }
 
 fn model_id_prefix() -> &'static str {
-    #[cfg(any(feature = "t5-quantized", feature = "t5-openvino"))]
+    #[cfg(feature = "t5-quantized")]
     {
         "xtr-base-en"
     }

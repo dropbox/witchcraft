@@ -125,12 +125,15 @@ global knowledge of all your projects:
 # More build info #
 ## Feature flags ##
 
-When building, exactly one T5 backend must be enabled:
-- `t5-quantized` -- GGUF quantized weights via candle (default)
-- `t5-openvino` -- OpenVINO inference backend
+When building, exactly one encoder backend must be enabled:
+- `t5-quantized` -- GGUF quantized weights via candle
+- `modernbert-quantized` -- GGUF ModernBERT weights (default)
+- `modernbert` -- full-precision ModernBERT weights
 
 Other flags:
-- `metal` -- macOS GPU acceleration (Apple Silicon only)
+- `metal` -- Candle Metal acceleration
+- `neso-metal` -- Neso-generated Metal kernels
+- `neso-d3d12` -- Neso-generated D3D12 kernels
 - `fbgemm` -- fbgemm-rs packed GEMM (bf16 weights, faster on x86)
 - `hybrid-dequant` -- F32 attention + Q4K FFN with fused gated-gelu (x86, requires `fbgemm`)
 - `napi` -- Node.js native module via napi-rs
@@ -139,12 +142,12 @@ Other flags:
 - `progress` -- progress bars for CLI
 
 Platform-specific recommended features (these are what `make` uses automatically):
-- **Apple Silicon**: `t5-quantized,metal`
-- **Intel Mac (x86_64)**: `t5-quantized,fbgemm,hybrid-dequant`
-- **Intel Windows (x86_64)**: `t5-openvino,fbgemm`
-- **Linux x86_64 (CPU)**: `t5-quantized,fbgemm,hybrid-dequant`
-- **Linux x86_64 (CUDA)**: `t5-quantized,cuda`
-- **Linux ARM (Graviton, Pi, Ampere)**: `t5-quantized` (`fbgemm`/`hybrid-dequant` are x86-only)
+- **Apple Silicon**: `modernbert-quantized,neso-metal`
+- **Intel Mac (x86_64)**: `modernbert-quantized,neso-metal`
+- **Intel Windows (x86_64)**: `modernbert-quantized,neso-d3d12`
+- **Linux x86_64 (CPU)**: `modernbert-quantized,fbgemm,hybrid-dequant`
+- **Linux x86_64 (CUDA)**: `modernbert-quantized,cuda`
+- **Linux ARM (Graviton, Pi, Ampere)**: `modernbert-quantized` (`fbgemm`/`hybrid-dequant` are x86-only)
 
 ## Using as a Python module ##
 

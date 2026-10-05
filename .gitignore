@@ -7,7 +7,6 @@ libwitchcraft.so
 witchcraft.dll
 .claude/
 
-# Uncompressed OpenVINO model files (large, not versioned)
 assets/*
 assets/*
 
@@ -59,6 +58,5 @@ kernels/out/dxil/flash_attention_bias_32x32x64.dxil
 # Test/local data
 backup/
 scifact/
-openvino_model/
 xtr-base-en/
 *.safetensors

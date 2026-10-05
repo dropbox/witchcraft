@@ -25,7 +25,7 @@ async function build(platform, arch) {
       console.error(`unsupported target ${platform} ${arch}`);
       return;
     }
-    await run(`cargo build --release --target ${target}-pc-windows-msvc --features t5-openvino,fbgemm,napi`);
+    await run(`cargo build --release --target ${target}-pc-windows-msvc --features modernbert-quantized,neso-d3d12,napi`);
     await run(`cp target/${target}-pc-windows-msvc/release/witchcraft.dll warp.node`);
   }
 }
