@@ -3,4 +3,3 @@ torch
 transformers
 huggingface_hub
 safetensors
-#pytrec_eval # for nfcorpus-score.sh, but breaks on Windows

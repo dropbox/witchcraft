@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 QUESTIONS = ROOT / "testset/nfcorpus/questions.test.tsv"
 COLLECTION_MAP = ROOT / "testset/nfcorpus/collection_map.json"
 QRELS = ROOT / "testset/nfcorpus/qrels.test.json"
-SCORE = ROOT / "score.py"
+SCORE = ROOT / "target/release" / ("trec-score.exe" if os.name == "nt" else "trec-score")
 DEFAULT_OUT_DIR = ROOT / "bench-results/nfcorpus-bucket-io"
 
 
@@ -48,7 +48,7 @@ def run_command(cmd, env=None):
 def ensure_inputs():
     missing = [
         path
-        for path in (QUESTIONS, COLLECTION_MAP, QRELS, SCORE)
+        for path in (QUESTIONS, COLLECTION_MAP, QRELS)
         if not path.exists()
     ]
     missing += [
@@ -62,16 +62,10 @@ def ensure_inputs():
         raise SystemExit("run `make nfcorpus` before this benchmark")
 
 
-def build_warp_cli(skip_build):
+def build_tools(skip_build):
     if skip_build:
         return
-    run_command(["make", "warp-cli", "EXTRA_FEATURES=deterministic"])
-
-
-def install_pytrec_eval(skip_install):
-    if skip_install:
-        return
-    run_command(["uv", "pip", "install", "pytrec-eval"])
+    run_command(["make", "warp-cli", "trec-score", "EXTRA_FEATURES=deterministic"])
 
 
 def cli_path():
@@ -96,10 +90,9 @@ def parse_latency(output):
     return int(embed.group(1)), int(total.group(1))
 
 
-def score_output(output_file, python):
+def score_output(output_file):
     output = run_command(
         [
-            python,
             str(SCORE),
             str(output_file),
             str(COLLECTION_MAP),
@@ -109,7 +102,7 @@ def score_output(output_file, python):
     return float(output.strip().splitlines()[-1])
 
 
-def run_one(repeat, out_dir, python):
+def run_one(repeat, out_dir):
     output_file = out_dir / f"default-run{repeat}.txt"
     output = run_command(
         [
@@ -120,7 +113,7 @@ def run_one(repeat, out_dir, python):
         ]
     )
     p95_embed_ms, p95_total_ms = parse_latency(output)
-    ndcg10 = score_output(output_file, python)
+    ndcg10 = score_output(output_file)
     return RunResult(
         repeat=repeat,
         p95_embed_ms=p95_embed_ms,
@@ -190,17 +183,7 @@ def parse_args():
     )
     parser.add_argument("--runs", type=int, default=3, help="runs; default: 3")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
-    parser.add_argument("--no-build", action="store_true", help="skip make warp-cli")
-    parser.add_argument(
-        "--skip-install",
-        action="store_true",
-        help="skip uv pip install pytrec-eval",
-    )
-    parser.add_argument(
-        "--python",
-        default=os.environ.get("PYTHON", "python"),
-        help="python executable for score.py; default: python",
-    )
+    parser.add_argument("--no-build", action="store_true", help="skip building warp-cli and trec-score")
     return parser.parse_args()
 
 
@@ -210,8 +193,9 @@ def main():
         raise SystemExit("--runs must be >= 1")
 
     ensure_inputs()
-    build_warp_cli(args.no_build)
-    install_pytrec_eval(args.skip_install)
+    build_tools(args.no_build)
+    if not SCORE.is_file():
+        raise SystemExit("missing trec-score; run `make trec-score`")
 
     out_dir = args.out_dir if args.out_dir.is_absolute() else ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -219,7 +203,7 @@ def main():
     results = []
     for repeat in range(1, args.runs + 1):
         print(f"running default run {repeat}/{args.runs}...")
-        results.append(run_one(repeat, out_dir, args.python))
+        results.append(run_one(repeat, out_dir))
 
     print_rows(results)
     print_summary(results)

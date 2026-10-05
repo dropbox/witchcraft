@@ -5,18 +5,18 @@ Benchmark Apple Spotlight on nfcorpus dataset using NDCG@10.
 This tool:
 1. Extracts nfcorpus documents to ~/Documents/nfcorpus-spotlight/
 2. Queries Spotlight using the same test queries as Warp
-3. Outputs results in the same format for score.py evaluation
+3. Outputs results in the same format for trec-score evaluation
 
 Usage:
     python spotlight-nfcorpus.py prepare              # Extract docs for Spotlight
     python spotlight-nfcorpus.py query output.txt     # Run benchmark, save to output.txt
-    python spotlight-nfcorpus.py score output.txt     # Score results using score.py
+    python spotlight-nfcorpus.py score output.txt     # Score results using trec-score
 
 Full workflow:
     python spotlight-nfcorpus.py prepare
     # Wait a few minutes for Spotlight to index
     python spotlight-nfcorpus.py query spotlight-results.txt
-    python score.py spotlight-results.txt ~/src/xtr-warp/beir/nfcorpus/collection_map.json ~/src/xtr-warp/beir/nfcorpus/qrels.test.json
+    cargo run --quiet --release -p trec-score -- spotlight-results.txt ~/src/xtr-warp/beir/nfcorpus/collection_map.json ~/src/xtr-warp/beir/nfcorpus/qrels.test.json
 """
 
 import subprocess
@@ -33,7 +33,7 @@ COLLECTION_MAP = BEIR_DIR / "collection_map.json"
 QRELS_FILE = BEIR_DIR / "qrels.test.json"
 
 OUTPUT_DIR = Path.home() / "Documents" / "nfcorpus-spotlight"
-SCORE_PY = Path(__file__).parent.parent / "score.py"
+ROOT = Path(__file__).resolve().parent.parent
 
 def prepare_corpus():
     """Extract nfcorpus documents to text files for Spotlight indexing."""
@@ -179,16 +179,12 @@ def run_benchmark(output_file):
     print(f"P95:    {p95_lat:.1f}ms")
     print(f"P99:    {p99_lat:.1f}ms")
     print(f"\nTo score:")
-    print(f"  python score.py {output_file} {COLLECTION_MAP} {QRELS_FILE}")
+    print(f"  cargo run --quiet --release -p trec-score -- {output_file} {COLLECTION_MAP} {QRELS_FILE}")
 
     return True
 
 def score_results(output_file):
-    """Score results using score.py."""
-    if not SCORE_PY.exists():
-        print(f"Error: {SCORE_PY} not found")
-        return False
-
+    """Score results using trec-score."""
     if not Path(output_file).exists():
         print(f"Error: {output_file} not found")
         return False
@@ -196,14 +192,13 @@ def score_results(output_file):
     print(f"\n=== Scoring Spotlight Results ===\n")
 
     cmd = [
-        "python3",
-        str(SCORE_PY),
-        output_file,
+        "cargo", "run", "--quiet", "--release", "-p", "trec-score", "--",
+        str(Path(output_file).resolve()),
         str(COLLECTION_MAP),
         str(QRELS_FILE)
     ]
 
-    result = subprocess.run(cmd, capture_output=False, text=True)
+    result = subprocess.run(cmd, cwd=ROOT, capture_output=False, text=True)
     return result.returncode == 0
 
 def main():

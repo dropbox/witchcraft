@@ -279,15 +279,16 @@ treccovid: prereqs datasets/treccovid.tsv
 	$(CLI_BIN) embed
 	$(CLI_BIN) index
 
-nfcorpus-score: prereqs env/pyvenv.cfg testset/nfcorpus/questions.test.tsv testset/nfcorpus/questions.test.tsv testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
+trec-score:
+	cargo build --release -p trec-score
+
+nfcorpus-score: prereqs trec-score testset/nfcorpus/questions.test.tsv testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
 	make warp-cli EXTRA_FEATURES=deterministic
-	echo ensuring presence of pytrec-eval...
-	uv pip install --python $(PYTHON_BIN) pytrec-eval 2>/dev/null
 	echo running queries...
 	rm -rf output.txt
 	$(CLI_BIN) querycsv testset/nfcorpus/questions.test.tsv output.txt
 	echo scoring...
-	$(PYTHON_BIN) score.py output.txt testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
+	target/release/trec-score output.txt testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
 
 treccovid-score: treccovid-testset
 	./treccovid-score.sh querycsv output-treccovid.txt
@@ -351,6 +352,7 @@ distclean:
 	neso-kernels-metal-nosimd \
 	nfcorpus \
 	nfcorpus-score \
+	trec-score \
 	pickbrain \
 	pickbrain-install \
 	prereqs \

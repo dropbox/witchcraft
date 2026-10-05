@@ -12,13 +12,10 @@ case "$mode" in
 		;;
 esac
 
-make warp-cli treccovid-testset EXTRA_FEATURES=deterministic
-
-echo ensuring presence of pytrec-eval...
-(source env/*/activate && uv pip install pytrec-eval >/dev/null)
+make warp-cli trec-score treccovid-testset EXTRA_FEATURES=deterministic
 
 echo running TRECCOVID queries with ${mode}...
 ./warp-cli "$mode" testset/treccovid/questions.test.tsv "$output"
 
 echo scoring TRECCOVID NDCG@10...
-(source env/*/activate && python score.py "$output" testset/treccovid/collection_map.json testset/treccovid/qrels.test.json)
+target/release/trec-score "$output" testset/treccovid/collection_map.json testset/treccovid/qrels.test.json

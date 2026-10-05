@@ -286,6 +286,21 @@ make treccovid-score
 `make treccovid-score` runs `treccovid-score.sh` against the test queries and
 prints NDCG@10.
 
+Scoring runs entirely in Rust, without Python or `pytrec_eval`:
+
+```
+make trec-score
+target/release/trec-score output.txt testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json
+```
+
+The tool reads `querycsv` results and prints mean NDCG@10 with trec_eval's
+linear relevance gains. An optional fourth argument changes the cutoff.
+Use a JSON `null` collection map when results already contain original document
+IDs. Like the previous scorer, it averages submitted queries that have qrels;
+empty results count as zero and missing or unjudged queries are excluded.
+The standalone workspace tool builds without encoder features, weights, or GPU
+dependencies. NFCorpus, TRECCOVID, SciFact, and Spotlight scoring use it.
+
 # License
 
 Unless otherwise noted:

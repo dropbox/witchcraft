@@ -84,11 +84,11 @@ echo "============================================"
 echo
 
 echo "=== Warp NDCG@10 ==="
-python3 score.py warp-results.txt "$BEIR_DIR/collection_map.json" "$BEIR_DIR/qrels.test.json"
+cargo run --quiet --release -p trec-score -- warp-results.txt "$BEIR_DIR/collection_map.json" "$BEIR_DIR/qrels.test.json"
 
 echo
 echo "=== Spotlight NDCG@10 ==="
-python3 score.py spotlight-results.txt "$BEIR_DIR/collection_map.json" "$BEIR_DIR/qrels.test.json"
+cargo run --quiet --release -p trec-score -- spotlight-results.txt "$BEIR_DIR/collection_map.json" "$BEIR_DIR/qrels.test.json"
 
 echo
 echo "============================================"
