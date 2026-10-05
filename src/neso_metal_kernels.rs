@@ -12,7 +12,7 @@ use dispatch2::DispatchData;
 use objc2_metal::MTLSize;
 
 // Auto-generated: kernel data and Neso pipeline loader.
-include!("../kernels/out/generated/neso_metal_gen.rs");
+include!(concat!(env!("OUT_DIR"), "/neso_metal_gen.rs"));
 
 fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b

@@ -19,6 +19,11 @@ pub mod quantized_t5;
 #[cfg(feature = "t5-quantized")]
 use quantized_t5 as t5_encoder;
 pub mod fast_ops;
+#[cfg(all(feature = "modernbert-quantized", any(
+    all(feature = "neso-metal", target_os = "macos"),
+    all(feature = "neso-d3d12", target_os = "windows"),
+)))]
+mod kernel_archive;
 #[cfg(feature = "hybrid-dequant")]
 pub mod fused_matmul;
 #[cfg(all(feature = "neso-metal", feature = "modernbert-quantized", target_os = "macos"))]

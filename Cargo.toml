@@ -47,6 +47,8 @@ text-splitter = { version = "0.30.1", features = ["markdown"] } # !Dash
 regex = "1"                # !Dash
 chrono = "0.4"             # !Dash
 lz4_flex = "0.13.0"
+tar = { version = "0.4", optional = true }
+zstd = { version = "0.13.3", optional = true }
 strsim = "0.11.1"
 libc = "0.2"
 rayon = { version = "1", optional = true }
@@ -87,6 +89,8 @@ candle-d3d12-kernels = { git = "https://github.com/jacobgorm/candle", rev = "2f8
 [build-dependencies]
 cbindgen = "0.29.3"
 napi-build = "2.2.3"
+tar = "0.4"
+zstd = "0.13.3"
 
 [features]
 #default = ["t5-quantized"]
@@ -99,8 +103,8 @@ modernbert-quantized = []
 embed-assets = []
 progress = ["dep:indicatif"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
-neso-metal = ["metal", "dep:dispatch2", "dep:objc2-metal"]
-neso-d3d12 = ["dep:candle-d3d12-kernels"]
+neso-metal = ["metal", "dep:dispatch2", "dep:objc2-metal", "dep:tar", "dep:zstd"]
+neso-d3d12 = ["dep:candle-d3d12-kernels", "dep:tar", "dep:zstd"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 hybrid-dequant = ["dep:rayon"]
 fbgemm = ["dep:fbgemm-rs"]

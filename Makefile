@@ -164,14 +164,21 @@ download: prereqs $(DOWNLOAD_TARGETS)
 
 # === Build targets ===
 
-neso-kernels-metal:
-	NESO_DIR=$(abspath $(NESO_DIR)) $(NESO_PYTHON) kernels/build.py metal
+neso-kernels-metal: neso-kernels-metal-nosimd
 
 neso-kernels-metal-nosimd:
-	NESO_DIR=$(abspath $(NESO_DIR)) $(NESO_PYTHON) kernels/build.py metal_nosimd
+	@if test -x "$(NESO_PYTHON)"; then \
+		NESO_DIR="$(abspath $(NESO_DIR))" "$(NESO_PYTHON)" kernels/build.py metal_nosimd; \
+	else \
+		test -s kernels/out/kernels_metal_nosimd.tar.zst && echo "Using cached Neso Metal kernels"; \
+	fi
 
 neso-kernels-hlsl:
-	NESO_DIR=$(abspath $(NESO_DIR)) $(NESO_PYTHON) kernels/build.py hlsl
+	@if test -x "$(NESO_PYTHON)"; then \
+		NESO_DIR="$(abspath $(NESO_DIR))" "$(NESO_PYTHON)" kernels/build.py hlsl; \
+	else \
+		test -s kernels/out/kernels_dxil.tar.zst && echo "Using cached Neso DXIL kernels"; \
+	fi
 
 fmt:
 	rustup run nightly rustfmt --color=never --unstable-features --skip-children --edition=2021 -- $(RUSTFMT_RS_FILES)

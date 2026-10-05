@@ -141,6 +141,14 @@ Other flags:
 - `embed-assets` -- bake weights into binary
 - `progress` -- progress bars for CLI
 
+Neso GPU kernels are cached as compressed archives in `kernels/out/` and embedded
+in the binary. Cargo rebuilds them when the Neso environment is available (at
+`../neso`, or `NESO_DIR`); otherwise it uses the checked-in caches, including their
+Rust loaders. This fallback needs no Python, Neso, or shader compiler. Metal uses
+the scalar kernels on both Mac architectures; Windows uses the DXIL cache.
+To refresh the caches after changing kernels, run `make neso-kernels-metal-nosimd`
+and `make neso-kernels-hlsl` with Neso installed. Cache generation also needs `zstd`.
+
 Platform-specific recommended features (these are what `make` uses automatically):
 - **Apple Silicon**: `modernbert-quantized,neso-metal`
 - **Intel Mac (x86_64)**: `modernbert-quantized,neso-metal`

@@ -10,6 +10,8 @@ Output: out/{metal,metal_nosimd}/*.metallib, out/hlsl/*.hlsl
     python build.py hlsl               # HLSL + DXIL only
     python build.py metal hlsl         # multiple platforms
 """
+import io
+import tarfile
 import json
 import os
 import shutil
@@ -249,6 +251,37 @@ def gen_rust():
     gen_rust_main()
 
 
+def pack_kernels(platform):
+    if platform == "metal":
+        return  # Runtime uses the scalar lowering on both Mac architectures.
+    from kernel_configs import METAL_KERNELS, get_hlsl_kernels
+    if platform == "metal_nosimd":
+        configs, directory, extension = METAL_KERNELS, "metal_nosimd", "metallib"
+        loader, filename = "neso_metal_gen.rs", "kernels_metal_nosimd.tar.zst"
+    else:
+        configs, directory, extension = get_hlsl_kernels(), "dxil", "dxil"
+        loader, filename = "neso_d3d12_gen.rs", "kernels_dxil.tar.zst"
+    paths = [OUT / directory / f"{name}.{extension}" for name in sorted({cfg[0] for cfg in configs})]
+    paths.append(OUT / "generated" / loader)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for path in paths:
+            data = path.read_bytes()
+            if not data:
+                raise ValueError(f"Empty kernel cache input: {path}")
+            info = tarfile.TarInfo(path.name)
+            info.size, info.mode = len(data), 0o644
+            archive.addfile(info, io.BytesIO(data))
+    compressed = subprocess.run(["zstd", "-19", "--stdout"], input=buffer.getvalue(),
+                                stdout=subprocess.PIPE, check=True).stdout
+    destination = OUT / filename
+    if not destination.exists() or destination.read_bytes() != compressed:
+        temporary = destination.with_suffix(".tmp")
+        temporary.write_bytes(compressed)
+        temporary.replace(destination)
+    print(f"Cached {len(paths) - 1} kernels in {filename} ({len(compressed)} bytes)")
+
+
 VALID_PLATFORMS = ("metal", "metal_nosimd", "hlsl")
 
 if __name__ == "__main__":
@@ -265,3 +298,5 @@ if __name__ == "__main__":
         if not run_ninja(p):
             sys.exit(1)
     gen_rust()
+    for p in platforms:
+        pack_kernels(p)

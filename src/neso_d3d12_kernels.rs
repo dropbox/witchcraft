@@ -12,7 +12,7 @@ fn cdiv(a: usize, b: usize) -> usize {
 }
 
 // Auto-generated: DXIL constants and Neso pipeline loader.
-include!("../kernels/out/generated/neso_d3d12_gen.rs");
+include!(concat!(env!("OUT_DIR"), "/neso_d3d12_gen.rs"));
 
 fn i32_as_u32(v: i32) -> u32 {
     v as u32
