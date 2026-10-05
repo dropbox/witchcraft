@@ -223,15 +223,29 @@ fn reset_ingest_watermarks() {
     slack::remove_watermark();
 }
 
-/// Walk up the process tree to find the calling Claude Code session ID.
-fn detect_active_session() -> Option<String> {
-    for key in ["PICKBRAIN_ACTIVE_SESSION_ID", "PI_SESSION_ID"] {
-        if let Ok(value) = env::var(key) {
+fn active_session_id_from_env(mut get_var: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    // Keep the explicit Pickbrain override first. Codex exports both names in
+    // current releases, while older releases may only export one of them.
+    for key in [
+        "PICKBRAIN_ACTIVE_SESSION_ID",
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "PI_SESSION_ID",
+    ] {
+        if let Some(value) = get_var(key) {
             let value = value.trim();
             if !value.is_empty() {
                 return Some(value.to_string());
             }
         }
+    }
+    None
+}
+
+/// Detect the calling Codex, Pi, or Claude Code session ID.
+fn detect_active_session() -> Option<String> {
+    if let Some(session_id) = active_session_id_from_env(|key| env::var(key).ok()) {
+        return Some(session_id);
     }
     for key in ["PICKBRAIN_ACTIVE_SESSION_FILE", "PI_SESSION_FILE"] {
         if let Ok(value) = env::var(key) {
@@ -2509,6 +2523,35 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_active_session_id_from_codex_env() {
+        let session_id = active_session_id_from_env(|key| match key {
+            "CODEX_SESSION_ID" => Some("  codex-session-id  ".to_string()),
+            _ => None,
+        });
+        assert_eq!(session_id.as_deref(), Some("codex-session-id"));
+    }
+
+    #[test]
+    fn test_active_session_id_supports_codex_thread_id_fallback() {
+        let session_id = active_session_id_from_env(|key| match key {
+            "CODEX_SESSION_ID" => Some("  ".to_string()),
+            "CODEX_THREAD_ID" => Some("codex-thread-id".to_string()),
+            _ => None,
+        });
+        assert_eq!(session_id.as_deref(), Some("codex-thread-id"));
+    }
+
+    #[test]
+    fn test_active_session_id_prefers_explicit_override() {
+        let session_id = active_session_id_from_env(|key| match key {
+            "PICKBRAIN_ACTIVE_SESSION_ID" => Some("override".to_string()),
+            "CODEX_SESSION_ID" => Some("codex-session-id".to_string()),
+            _ => None,
+        });
+        assert_eq!(session_id.as_deref(), Some("override"));
+    }
 
     #[test]
     fn test_format_date() {
