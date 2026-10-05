@@ -2,6 +2,7 @@ use super::t5_encoder;
 use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Tensor};
 use log::debug;
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::Tokenizer;
 
 const MAX_LEN: usize = 2048;
@@ -51,6 +52,7 @@ fn model_forward_with_gate_for_lengths(
 
 pub struct Embedder {
     tokenizer: Tokenizer,
+    query_tokenizer: Tokenizer,
     model: t5_encoder::T5EncoderModel,
 }
 
@@ -64,12 +66,18 @@ pub struct EmbeddingOutput {
 impl Embedder {
     pub fn new(device: &Device, assets: &std::path::Path) -> Result<Self> {
         let (builder, tokenizer) = t5_encoder::T5ModelBuilder::load(assets)?;
+        let query_tokenizer = tokenizer_for_queries(&tokenizer);
         let model = builder.build_encoder(device, assets)?;
-        Ok(Self { tokenizer, model })
+        Ok(Self { tokenizer, query_tokenizer, model })
     }
 
     pub fn embed(&self, text: &str) -> Result<(Tensor, Vec<(usize, usize)>)> {
         let output = self.embed_inner(text, false)?;
+        Ok((output.embeddings, output.offsets))
+    }
+
+    pub fn embed_query(&self, text: &str) -> Result<(Tensor, Vec<(usize, usize)>)> {
+        let output = self.embed_inner_with_tokenizer(text, false, &self.query_tokenizer)?;
         Ok((output.embeddings, output.offsets))
     }
 
@@ -80,6 +88,10 @@ impl Embedder {
 
     pub fn embed_with_gate_scores_and_tokens(&self, text: &str) -> Result<EmbeddingOutput> {
         self.embed_inner(text, true)
+    }
+
+    pub fn embed_query_with_gate_scores_and_tokens(&self, text: &str) -> Result<EmbeddingOutput> {
+        self.embed_inner_with_tokenizer(text, true, &self.query_tokenizer)
     }
 
     pub fn embed_batch_with_gate_scores_and_tokens(&self, texts: &[String]) -> Result<Vec<EmbeddingOutput>> {
@@ -192,11 +204,22 @@ impl Embedder {
     }
 
     fn embed_inner(&self, text: &str, collect_gate_scores: bool) -> Result<EmbeddingOutput> {
+        self.embed_inner_with_tokenizer(text, collect_gate_scores, &self.tokenizer)
+    }
+
+    fn embed_inner_with_tokenizer(
+        &self,
+        text: &str,
+        collect_gate_scores: bool,
+        tokenizer: &Tokenizer,
+    ) -> Result<EmbeddingOutput> {
         let now = std::time::Instant::now();
         let model = &self.model;
         let device = model.device();
 
-        let encoding = self.tokenizer.encode(text, true).unwrap();
+        let encoding = tokenizer
+            .encode(text, true)
+            .map_err(|err| anyhow!("tokenize text: {err}"))?;
         let ids = encoding.get_ids();
         let offsets = encoding.get_offsets().to_vec();
         let tokens = encoding.get_tokens().to_vec();
@@ -291,6 +314,48 @@ impl Embedder {
         Ok((normalized, offsets))
     }
     */
+}
+
+fn tokenizer_for_queries(tokenizer: &Tokenizer) -> Tokenizer {
+    let mut query_tokenizer = tokenizer.clone();
+    if let Some(PreTokenizerWrapper::ByteLevel(byte_level)) = tokenizer.get_pre_tokenizer() {
+        query_tokenizer.with_pre_tokenizer(Some(byte_level.clone().add_prefix_space(true)));
+    }
+    query_tokenizer
+}
+
+#[cfg(test)]
+mod query_tokenizer_tests {
+    use super::tokenizer_for_queries;
+    use tokenizers::Tokenizer;
+
+    #[test]
+    fn query_tokenizer_uses_the_space_prefixed_first_word_without_changing_offsets() {
+        let document_tokenizer = Tokenizer::from_bytes(
+            r#"{
+                "version":"1.0",
+                "truncation":null,
+                "padding":null,
+                "added_tokens":[],
+                "normalizer":null,
+                "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+                "post_processor":null,
+                "decoder":null,
+                "model":{"type":"WordLevel","vocab":{"<unk>":0,"winter":1,"Ġwinter":2},"unk_token":"<unk>"}
+            }"#
+                .as_bytes(),
+        )
+        .unwrap();
+        let query_tokenizer = tokenizer_for_queries(&document_tokenizer);
+
+        let query = query_tokenizer.encode("winter", false).unwrap();
+        let explicitly_spaced = document_tokenizer.encode(" winter", false).unwrap();
+        let unspaced_document = document_tokenizer.encode("winter", false).unwrap();
+
+        assert_eq!(query.get_ids(), explicitly_spaced.get_ids());
+        assert_ne!(query.get_ids(), unspaced_document.get_ids());
+        assert_eq!(query.get_offsets(), &[(0, 6)]);
+    }
 }
 
 fn finish_embedding(

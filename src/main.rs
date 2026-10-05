@@ -105,7 +105,7 @@ fn colorize_saliency_text(text: &str, spans: &[SaliencySpan]) -> String {
 }
 
 fn print_saliency(embedder: &witchcraft::Embedder, text: &str) -> Result<()> {
-    let output = embedder.embed_with_gate_scores_and_tokens(text)?;
+    let output = embedder.embed_query_with_gate_scores_and_tokens(text)?;
     let gate_scores = output.gate_scores.ok_or_else(|| {
         anyhow::anyhow!("encoder assets do not expose token gate scores")
     })?;
@@ -328,7 +328,7 @@ pub fn bulk_exact_search(
     for result in rdr.deserialize() {
         let record: (String, String) = result?;
         let now = std::time::Instant::now();
-        let (qe, _offsets) = embedder.embed(&record.1)?;
+        let (qe, _offsets) = embedder.embed_query(&record.1)?;
         let qe = qe.get(0)?;
         embedder_histogram.record(now.elapsed().as_millis() as u32);
         records.push(record);

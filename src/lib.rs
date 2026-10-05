@@ -324,7 +324,7 @@ pub struct QueryEmbeddings {
 
 pub fn embed_query_for_search(embedder: &Embedder, text: &str) -> Result<QueryEmbeddings> {
     if query_token_salience_enabled() {
-        let output = embedder.embed_with_gate_scores_and_tokens(text)?;
+        let output = embedder.embed_query_with_gate_scores_and_tokens(text)?;
         let weights = output
             .gate_scores
             .map(query_weights_from_gate_scores)
@@ -334,7 +334,7 @@ pub fn embed_query_for_search(embedder: &Embedder, text: &str) -> Result<QueryEm
             weights: Some(weights),
         })
     } else {
-        let (embeddings, _) = embedder.embed(text)?;
+        let (embeddings, _) = embedder.embed_query(text)?;
         Ok(QueryEmbeddings {
             embeddings: embeddings.get(0)?,
             weights: None,
@@ -4130,7 +4130,7 @@ pub fn score_query_sentences(
     let qe = match cache.get(q) {
         Some(existing) => existing,
         None => {
-            let (qe, _offsets) = embedder.embed(q)?;
+            let (qe, _offsets) = embedder.embed_query(q)?;
 
             qe.get(0)?
         }

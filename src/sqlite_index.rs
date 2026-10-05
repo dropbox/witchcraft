@@ -186,12 +186,13 @@ fn query_embeddings_for_search(
         return embed_query_for_search(embedder, q);
     }
 
-    let embeddings = match cache.get(&q.to_string()) {
+    let query = q.to_string();
+    let embeddings = match cache.get(&query) {
         Some(existing) => existing,
         None => {
-            let (embeddings, _) = embedder.embed(q)?;
+            let (embeddings, _) = embedder.embed_query(q)?;
             let embeddings = embeddings.get(0)?;
-            cache.put(&q.to_string(), &embeddings);
+            cache.put(&query, &embeddings);
             embeddings
         }
     };

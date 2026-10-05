@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DB, EmbeddingCache};
+    use crate::{
+        DB,
+        EmbeddingCache,
+    };
     use candle_core::{Device, Tensor};
     use std::path::PathBuf;
     use tempfile::tempdir;
