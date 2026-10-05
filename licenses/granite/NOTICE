@@ -1,0 +1,25 @@
+Witchcraft ModernBERT retrieval weights
+
+Copyright (c) 2026 Dropbox Inc.
+
+The Witchcraft fine-tuning and other modifications are copyrighted by
+Dropbox Inc. and licensed under the repository's Apache License, Version 2.0.
+See LICENSE in the distributed archive for the repository license.
+
+These weights are derived from ibm-granite/granite-embedding-english-r2,
+developed by the Granite Embedding Team at IBM and released under the
+Apache License, Version 2.0. See LICENSE.granite in the distributed archive
+for the full upstream license.
+
+Upstream model and tokenizer:
+https://huggingface.co/ibm-granite/granite-embedding-english-r2
+
+Upstream project and license:
+https://github.com/ibm-granite/granite-embedding-models
+https://github.com/ibm-granite/granite-embedding-models/blob/main/LICENSE
+
+Witchcraft modifications: fine-tuning for token-level retrieval, a learned
+96-dimensional projection, learned token gating, and export to F32 safetensors.
+The distributed weights are a modified derivative, not an official IBM release.
+
+This notice was added by Witchcraft to identify the upstream model and changes.

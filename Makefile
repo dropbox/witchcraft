@@ -118,17 +118,21 @@ assets/xtr-config.json assets/xtr-tokenizer.json xtr.safetensors: env/bin/transf
 assets/xtr.gguf: xtr.safetensors | assets prereqs
 	cargo run -p quantize xtr.safetensors assets/xtr.gguf
 
-modernbert-assets: | assets
-	@test -f assets/modernbert-config.json || (echo "missing assets/modernbert-config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
-	@test -f assets/modernbert-tokenizer.json || (echo "missing assets/modernbert-tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
-	@test -f assets/modernbert.safetensors || (echo "missing assets/modernbert.safetensors; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+MODERNBERT_RELEASE := https://github.com/dropbox/witchcraft/releases/download/modernbert-96d-gated-v1
+
+assets/modernbert-assets.tar.gz: | assets
+	curl --fail --location --output $@.tmp $(MODERNBERT_RELEASE)/$(notdir $@)
+	mv $@.tmp $@
+
+assets/modernbert-config.json assets/modernbert-tokenizer.json assets/modernbert.safetensors assets/LICENSE assets/LICENSE.granite assets/NOTICE assets/SHA256SUMS: | assets/modernbert-assets.tar.gz
+	tar -xzf assets/modernbert-assets.tar.gz -C assets $(notdir $@)
 
 assets/modernbert.gguf: assets/modernbert.safetensors | assets prereqs
 	cargo run -p quantize --release -- assets/modernbert.safetensors assets/modernbert.gguf
 
-modernbert-quantized-assets: assets/modernbert.gguf | assets
-	@test -f assets/modernbert-config.json || (echo "missing assets/modernbert-config.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
-	@test -f assets/modernbert-tokenizer.json || (echo "missing assets/modernbert-tokenizer.json; run scripts/export_modernbert.py <checkpoint> assets" >&2; exit 1)
+modernbert-assets: assets/modernbert-config.json assets/modernbert-tokenizer.json assets/modernbert.safetensors assets/LICENSE assets/LICENSE.granite assets/NOTICE assets/SHA256SUMS
+
+modernbert-quantized-assets: assets/modernbert-config.json assets/modernbert-tokenizer.json assets/modernbert.gguf assets/LICENSE assets/LICENSE.granite assets/NOTICE assets/SHA256SUMS
 
 assets/xtr-ov-int4.bin assets/xtr-ov-int4.xml: | prereqs
 	$(PYTHON_BIN) quantize-openvino.py

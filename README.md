@@ -18,12 +18,38 @@ original XTR-WARP on server-class hardware, at similar accuracy.)
 Needs uv, make, and the rust toolchain.
 
 # Building and Running #
-To run, you will need the XTR weights released by Google Deepmind, and
-this repo contains python scripts for downloading them from Huggingface
-and quantizing to GGUF format. We can cheat by doing everything with Make:
+The default build uses our ModernBERT retrieval model with 96-dimensional
+token embeddings and token gating. Make downloads a compressed archive of the
+safetensors weights, config, and tokenizer from the
+[versioned model release](https://github.com/dropbox/witchcraft/releases/tag/modernbert-96d-gated-v1)
+into `assets/` and derives the quantized GGUF model locally:
 ```
 make warp-cli
 ```
+
+Downloads use public URLs with `curl`; no GitHub account or GitHub CLI is required.
+
+The same weights support the unquantized backend
+(`make warp-cli ENCODER=modernbert`). The weights derive from IBM's
+[Granite Embedding English R2](https://huggingface.co/ibm-granite/granite-embedding-english-r2),
+licensed under Apache 2.0. Our fine-tuning and other modifications are
+Copyright (c) 2026 Dropbox Inc. and covered by the repository's Apache 2.0 license.
+The archive includes the repository `LICENSE`, the upstream `LICENSE.granite`,
+a `NOTICE` identifying our modifications, and `SHA256SUMS` for verifying downloads.
+Existing local assets are kept. To use your own checkpoint, export it with
+`env/bin/python scripts/export_modernbert.py <checkpoint> assets`, then quantize
+it with `cargo run -p quantize --release -- assets/modernbert.safetensors assets/modernbert.gguf`.
+
+For Google's original XTR model, run `make warp-cli ENCODER=t5-quantized`;
+the included Python scripts download its weights from Hugging Face and
+quantize them to GGUF.
+
+To publish the local ModernBERT assets, authenticate `gh` with write access to
+`dropbox/witchcraft`, then run `bash scripts/release_modernbert.sh`. The script
+packages the three model files and their checksums into `modernbert-assets.tar.gz`.
+For a new release, it uploads the archive as a draft and then publishes it.
+For an existing release, it replaces the archive, updates the download instructions,
+and removes the old individual assets after the archive upload succeeds.
 ## Creating an index: ##
 
 For testing, we used the BEIR download script from XTR-Warp to download
