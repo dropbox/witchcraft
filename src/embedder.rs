@@ -10,6 +10,14 @@ const MIN_NORM: f32 = 1.0;
 const DEFAULT_BATCH_SIZE: usize = 32;
 const PAD_BUCKET_WIDTH: usize = 64;
 
+pub(crate) fn embedding_batch_size() -> usize {
+    std::env::var("WITCHCRAFT_EMBED_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_BATCH_SIZE)
+}
+
 fn normalize_l2(v: &Tensor) -> Result<Tensor> {
     Ok(v.broadcast_div(&v.sqr()?.sum_keepdim(2)?.sqrt()?)?)
 }
@@ -76,11 +84,7 @@ impl Embedder {
 
     pub fn embed_batch_with_gate_scores_and_tokens(&self, texts: &[String]) -> Result<Vec<EmbeddingOutput>> {
         let now = std::time::Instant::now();
-        let batch_size = std::env::var("WITCHCRAFT_EMBED_BATCH_SIZE")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(DEFAULT_BATCH_SIZE);
+        let batch_size = embedding_batch_size();
         let encodings = texts
             .iter()
             .map(|text| {

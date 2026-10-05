@@ -3147,11 +3147,6 @@ fn prune_document_embeddings_by_gate_fraction(
     })
 }
 
-pub(crate) fn cached_embeddings_for_index(
-    cached: CachedEmbeddings,
-) -> Result<CachedEmbeddings> {
-    Ok(cached)
-}
 #[cfg(debug_assertions)]
 fn rowwise_cosine_min(a: &Tensor, b: &Tensor) -> Result<f32> {
     let (rows, cols) = a.dims2()?;

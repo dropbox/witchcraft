@@ -3,12 +3,12 @@ use crate::packops::TensorPackOps;
 use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
-    cached_embeddings_for_index, clear_generations_cache, dim_from_model_id, document_cache_hash,
-    embed_query_for_search, hybrid_reciprocal_rank_fusion, index_buffered_embeddings_with_options,
-    load_cached_embeddings, load_or_compute_cached_embeddings, match_centroids_raw,
-    model_id_for_dim, query_token_salience_enabled, split_by_codepoints, CachedEmbeddings, DocPtr,
-    Embedder, EmbeddingCache, EmbeddingsCache, IndexOptions, QueryEmbeddings, SqlStatementInternal,
-    DB,
+    clear_generations_cache, compute_cached_embeddings_many, dim_from_model_id,
+    document_cache_hash, embed_query_for_search, hybrid_reciprocal_rank_fusion,
+    index_buffered_embeddings_with_options, load_cached_embeddings,
+    load_or_compute_cached_embeddings, match_centroids_raw, model_id_for_dim,
+    query_token_salience_enabled, split_by_codepoints, CachedEmbeddings, DocPtr, Embedder,
+    EmbeddingCache, EmbeddingsCache, IndexOptions, QueryEmbeddings, SqlStatementInternal, DB,
 };
 use anyhow::Result;
 use candle_core::{Device, Tensor};
@@ -230,10 +230,6 @@ pub fn exact_match_centroids_bulk(
         let Some(cached) = cache.get_for_document(rowid_u64, hash.as_deref().unwrap_or(""))? else {
             continue;
         };
-        let cached = cached_embeddings_for_index(cached)?;
-        if cached.embedding_count == 0 {
-            continue;
-        }
         let docptrs = docptrs_for_cached_counts(rowid_u32, &cached.counts);
         anyhow::ensure!(
             docptrs.len() == cached.embedding_count,
@@ -1132,45 +1128,86 @@ pub fn embed_chunks_with_cache(
         ProgressReporter::new("embed", total)
     };
 
-    let sql = format!(
-        "SELECT
-        document.rowid,document.hash,document.body,document.lens
-        FROM document
-        WHERE length(document.body) > 0
-        ORDER BY rowid
-        {}",
-        match limit {
-            Some(limit) => format!("LIMIT {limit}"),
-            _ => String::new(),
-        }
-    );
-    let mut query = db.query(&sql)?;
-
-    let mut documents = query.query_map((), |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-
+    let batch_size = crate::embedder::embedding_batch_size();
+    // Do not hold one read transaction open while inserting all cache rows.
+    // In WAL mode that pins the initial snapshot and prevents checkpoints, so
+    // a large corpus makes the WAL grow for the full duration of embedding.
+    const DOCUMENT_PAGE_BATCHES: usize = 8;
+    let page_size = batch_size.saturating_mul(DOCUMENT_PAGE_BATCHES).max(1);
+    let mut pending_hashes = Vec::with_capacity(batch_size);
+    let mut pending_bodies = Vec::with_capacity(batch_size);
+    let mut pending_lens = Vec::with_capacity(batch_size);
     let mut count = 0;
-    for result in documents.by_ref() {
-        let (rowid, hash, body, lens) = result?;
-        let hash = hash.unwrap_or_else(|| document_cache_hash(&body, &lens));
-        let (_cached, computed) = load_or_compute_cached_embeddings(
-            cache,
-            rowid.try_into()?,
-            &hash,
-            &body,
-            &lens,
-            embedder,
-        )?;
-        if computed {
-            count += 1;
+    let mut last_rowid = 0i64;
+    let mut remaining = limit.unwrap_or(usize::MAX);
+    while remaining > 0 {
+        let fetch_count = page_size.min(remaining);
+        let documents = {
+            let mut query = db.query(
+                "SELECT document.rowid, document.hash, document.body, document.lens
+                 FROM document
+                 WHERE length(document.body) > 0 AND document.rowid > ?1
+                 ORDER BY document.rowid
+                 LIMIT ?2",
+            )?;
+            let rows = query.query_map((last_rowid, i64::try_from(fetch_count)?), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if documents.is_empty() {
+            break;
         }
-        progress.inc(1);
+        remaining = remaining.saturating_sub(documents.len());
+        last_rowid = documents.last().expect("non-empty page").0;
+
+        for (rowid, hash, body, lens) in documents {
+            let hash = hash.unwrap_or_else(|| document_cache_hash(&body, &lens));
+
+            if let Some(embeddings) = load_cached_embeddings(cache, rowid.try_into()?, &hash)? {
+                let chunk_count = lens.split(',').filter_map(|s| s.parse::<usize>().ok()).count();
+                if embeddings.counts.split(',').filter_map(|s| s.parse::<u32>().ok()).count() == chunk_count {
+                    progress.inc(1);
+                    continue;
+                }
+                log::warn!(
+                    "cached embeddings for document {rowid} have counts {:?}, incompatible with {chunk_count} document chunks; recomputing",
+                    embeddings.counts
+                );
+            }
+
+            pending_hashes.push(hash);
+            pending_bodies.push(body);
+            pending_lens.push(lens);
+            if pending_hashes.len() == batch_size {
+                let computed = flush_embedding_batch(
+                    cache,
+                    embedder,
+                    &mut pending_hashes,
+                    &mut pending_bodies,
+                    &mut pending_lens,
+                )?;
+                count += computed;
+                progress.inc(computed);
+            }
+        }
+    }
+
+    let computed = flush_embedding_batch(
+        cache,
+        embedder,
+        &mut pending_hashes,
+        &mut pending_bodies,
+        &mut pending_lens,
+    )?;
+    count += computed;
+    if computed > 0 {
+        progress.inc(computed);
     }
     progress.finish();
 
@@ -1178,6 +1215,39 @@ pub fn embed_chunks_with_cache(
     if count > 0 {
         db.checkpoint();
     }
+    Ok(count)
+}
+
+fn flush_embedding_batch(
+    cache: &dyn EmbeddingCache,
+    embedder: &Embedder,
+    hashes: &mut Vec<String>,
+    bodies: &mut Vec<String>,
+    lens: &mut Vec<String>,
+) -> Result<usize> {
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+    anyhow::ensure!(
+        hashes.len() == bodies.len() && bodies.len() == lens.len(),
+        "embedding batch metadata length mismatch"
+    );
+
+    let embeddings = compute_cached_embeddings_many(embedder, bodies, lens)?;
+    anyhow::ensure!(
+        embeddings.len() == hashes.len(),
+        "embedder returned {} cache entries for {} documents",
+        embeddings.len(),
+        hashes.len()
+    );
+    for (hash, embeddings) in hashes.iter().zip(&embeddings) {
+        cache.put(hash, embeddings)?;
+    }
+
+    let count = hashes.len();
+    hashes.clear();
+    bodies.clear();
+    lens.clear();
     Ok(count)
 }
 
