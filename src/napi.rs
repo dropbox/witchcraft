@@ -60,18 +60,8 @@ static LOGFN: OnceCell<Box<dyn Fn(LogEvent) + Send + Sync>> = OnceCell::new();
 struct JsLogger;
 
 impl Log for JsLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        // SECURITY: Filter out openvino-finder logs below ERROR level to prevent PII leakage.
-        // openvino-finder (dependency of openvino crate) logs file paths at INFO level like:
-        // "Attempting to find library: libopenvino_c.so"
-        // "Found library at path: /Users/username/Library/..."
-        // These paths may contain usernames or other PII that must not be exposed via the
-        // logging callback. Only ERROR-level failures are allowed through.
-        if metadata.target().starts_with("openvino_finder") {
-            metadata.level() <= log::Level::Error
-        } else {
-            true
-        }
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        true
     }
 
     fn log(&self, record: &Record) {
@@ -244,6 +234,7 @@ pub fn progress_update(progress: f64, phase: &str) {
 
 enum Job {
     Add {
+        rowid: Option<u64>,
         uuid: Uuid,
         date: Option<Timestamp>,
         metadata: String,
@@ -332,15 +323,19 @@ impl Indexer {
                 if let Some(db) = db.as_mut() {
                     match job {
                         Job::Add {
+                            rowid,
                             uuid,
                             date,
                             metadata,
                             body,
                             lengths,
-                        } => match db.add_doc(&uuid, date, &metadata, &body, lengths) {
-                            Ok(()) => {}
-                            Err(v) => {
-                                warn!("add_doc failed! {}", v);
+                        } => {
+                            let result = db.add_doc(rowid, &uuid, date, &metadata, &body, lengths);
+                            match result {
+                                Ok(()) => {}
+                                Err(v) => {
+                                    warn!("add_doc failed! {}", v);
+                                }
                             }
                         },
                         Job::Remove { uuid } => match db.remove_doc(&uuid) {
@@ -375,7 +370,7 @@ impl Indexer {
                             }
                             if crate::count_unindexed_embeddings(&db).unwrap_or(0) > 1024 {
                                 let now = std::time::Instant::now();
-                                match crate::index_chunks(&db, &device) {
+                                match crate::index_chunks(&db, None, false) {
                                     Ok(()) => {}
                                     Err(v) => {
                                         warn!("index_chunks failed! {}", v);
@@ -413,6 +408,7 @@ impl Indexer {
 
     pub fn add(
         &self,
+        rowid: Option<u64>,
         uuid: Uuid,
         date: Option<Timestamp>,
         metadata: String,
@@ -421,6 +417,7 @@ impl Indexer {
     ) {
         if accepting_commands() {
             let _ = self.tx.send(Job::Add {
+                rowid,
                 uuid,
                 date,
                 metadata,
@@ -506,9 +503,9 @@ impl WitchcraftInner {
                 },
                 |(embedder, db)| {
                     let now = std::time::Instant::now();
-                    let results = crate::search(
+                    let results = crate::search_with_fulltext_prefix_wildcard(
                         db,
-                        embedder,
+                        Some(embedder),
                         &mut self.cache,
                         &q,
                         threshold,
@@ -619,6 +616,22 @@ pub struct Witchcraft {
     indexer: &'static Indexer,
 }
 
+fn parse_rowid(rowid: &str) -> Result<u64> {
+    let rowid = rowid.parse::<u64>().map_err(|_| {
+        Error::new(
+            Status::InvalidArg,
+            "rowid must be a positive SQLite rowid string",
+        )
+    })?;
+    if rowid == 0 || rowid > i64::MAX as u64 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "rowid must be a positive SQLite rowid string",
+        ));
+    }
+    Ok(rowid)
+}
+
 #[napi]
 impl Witchcraft {
     #[napi(constructor)]
@@ -665,7 +678,11 @@ impl Witchcraft {
         metadata: String,
         body: String,
         lengths: Vec<u32>,
-    ) {
+        rowid: Option<String>,
+    ) -> Result<()> {
+        let rowid = rowid
+            .map(|rowid| parse_rowid(&rowid))
+            .transpose()?;
         let uuid = Uuid::parse_str(&uuid).unwrap();
         let date = Timestamp::parse(date.as_str());
 
@@ -675,7 +692,8 @@ impl Witchcraft {
             None
         };
 
-        self.indexer.add(uuid, date, metadata, body, lengths);
+        self.indexer.add(rowid, uuid, date, metadata, body, lengths);
+        Ok(())
     }
 
     #[napi]

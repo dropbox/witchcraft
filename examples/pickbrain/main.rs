@@ -30,6 +30,12 @@ impl log::Log for SimpleLogger {
 static LOGGER: SimpleLogger = SimpleLogger;
 const PICKBRAIN_DIR_ENV: &str = "PICKBRAIN_DIR";
 
+pub(crate) fn home_dir() -> PathBuf {
+    env::var_os("HOME").filter(|home| !home.is_empty())
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from).unwrap_or_default()
+}
+
 fn pickbrain_dir_overridden() -> bool {
     env::var(PICKBRAIN_DIR_ENV)
         .map(|dir| !dir.trim().is_empty())
@@ -38,7 +44,7 @@ fn pickbrain_dir_overridden() -> bool {
 
 pub(crate) fn print_ingest_path(path: &std::path::Path, quiet: bool) {
     if !quiet {
-        println!("{}", path.display());
+        eprintln!("{}", path.display());
     }
 }
 
@@ -50,8 +56,7 @@ pub(crate) fn pickbrain_dir() -> PathBuf {
             return dir;
         }
     }
-    let home = env::var("HOME").unwrap_or_default();
-    let dir = PathBuf::from(home).join(".pickbrain");
+    let dir = home_dir().join(".pickbrain");
     std::fs::create_dir_all(&dir).ok();
     dir
 }
@@ -156,13 +161,40 @@ fn process_is_running(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    unsafe {
+        match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            Ok(handle) => {
+                let exited = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+                let _ = CloseHandle(handle);
+                !exited
+            },
+            Err(error) => error.code() != windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn process_is_running(_pid: u32) -> bool {
     true
 }
 
 fn wants_source(types: &[String], source: &str) -> bool {
     types.is_empty() || types.iter().any(|t| t == source)
+}
+
+fn run_pre_ingest_command() -> Result<()> {
+    let Ok(command) = env::var("PRE_INGEST_COMMAND") else { return Ok(()); };
+    if command.trim().is_empty() { return Ok(()); }
+    #[cfg(windows)]
+    let status = std::process::Command::new("cmd").args(["/C", &command]).status()?;
+    #[cfg(not(windows))]
+    let status = std::process::Command::new("sh").args(["-c", &command]).status()?;
+    anyhow::ensure!(status.success(), "PRE_INGEST_COMMAND exited with {status}");
+    Ok(())
 }
 
 fn needs_ingest(
@@ -212,15 +244,29 @@ fn reset_ingest_watermarks() {
     slack::remove_watermark();
 }
 
-/// Walk up the process tree to find the calling Claude Code session ID.
-fn detect_active_session() -> Option<String> {
-    for key in ["PICKBRAIN_ACTIVE_SESSION_ID", "PI_SESSION_ID"] {
-        if let Ok(value) = env::var(key) {
+fn active_session_id_from_env(mut get_var: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    // Keep the explicit Pickbrain override first. Codex exports both names in
+    // current releases, while older releases may only export one of them.
+    for key in [
+        "PICKBRAIN_ACTIVE_SESSION_ID",
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "PI_SESSION_ID",
+    ] {
+        if let Some(value) = get_var(key) {
             let value = value.trim();
             if !value.is_empty() {
                 return Some(value.to_string());
             }
         }
+    }
+    None
+}
+
+/// Detect the calling Codex, Pi, or Claude Code session ID.
+fn detect_active_session() -> Option<String> {
+    if let Some(session_id) = active_session_id_from_env(|key| env::var(key).ok()) {
+        return Some(session_id);
     }
     for key in ["PICKBRAIN_ACTIVE_SESSION_FILE", "PI_SESSION_FILE"] {
         if let Ok(value) = env::var(key) {
@@ -231,8 +277,7 @@ fn detect_active_session() -> Option<String> {
         }
     }
 
-    let home = env::var("HOME").ok()?;
-    let sessions_dir = PathBuf::from(&home).join(".claude/sessions");
+    let sessions_dir = home_dir().join(".claude/sessions");
     let mut pid = std::process::id() as i32;
     while pid > 1 {
         let session_file = sessions_dir.join(format!("{pid}.json"));
@@ -284,7 +329,7 @@ fn ingest(
     stale_ms: i64,
     types: &[String],
     quiet: bool,
-) -> Result<bool> {
+) -> Result<usize> {
     let mut db = DB::new(db_name.clone()).unwrap();
 
     let want = |src: &str| types.is_empty() || types.iter().any(|t| t == src);
@@ -325,21 +370,21 @@ fn ingest(
         if !quiet {
             eprintln!("No new sessions to ingest.");
         }
-        return Ok(false);
+        return Ok(0);
     }
     if !quiet {
         eprintln!(
             "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {pi_sessions} pi sessions, {slack_conversations} slack conversations, {memories} memory files, {authored} authored files, {configs} config files"
         );
     }
-    Ok(true)
+    Ok(total)
 }
 
-fn embed_and_index(db: &DB, embedder: &Embedder, device: &candle_core::Device) -> Result<()> {
-    let embedded = witchcraft::embed_chunks(db, embedder, None)?;
-    if embedded > 0 {
-        witchcraft::index_chunks(db, device)?;
-    }
+fn embed_and_index(db: &DB, embedder: &Embedder, _device: &candle_core::Device) -> Result<()> {
+    let _embedded = witchcraft::embed_chunks(db, embedder, None)?;
+    let options = witchcraft::IndexOptions::default().force_flush();
+    witchcraft::index_chunks_with_options(db, None, false, options)?;
+    std::io::stderr().flush()?;
     Ok(())
 }
 
@@ -363,6 +408,7 @@ struct SearchResult {
     path: String,
     cwd: String,
     source: String,
+    remote_host: String,
     branch: String,
     conv_key: String,
     slack_open: Option<SlackOpenTarget>,
@@ -684,6 +730,7 @@ fn parse_search_results(
         .into_iter()
         .map(|(_score, metadata, bodies, sub_idx, date)| {
             let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
+            let remote_host = remote_host_from_metadata(&meta);
             let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
             let turns_arr: Vec<TurnMeta> = meta["turns"]
                 .as_array()
@@ -707,6 +754,7 @@ fn parse_search_results(
                 path: meta["path"].as_str().unwrap_or("").to_string(),
                 cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
                 source: meta["source"].as_str().unwrap_or("claude").to_string(),
+                remote_host,
                 branch: meta["branch"].as_str().unwrap_or("").to_string(),
                 conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
                 slack_open: slack_open_target_from_metadata(&meta),
@@ -716,6 +764,21 @@ fn parse_search_results(
             }
         })
         .collect()
+}
+
+fn remote_host_from_metadata(meta: &serde_json::Value) -> String {
+    let host = meta["remote_host"].as_str().unwrap_or("").to_string();
+    if !host.is_empty() {
+        return host;
+    }
+    if meta["source"].as_str() == Some("codex") {
+        if let Some(path) = meta["path"].as_str() {
+            if let Some(host) = codex::remote_origin_for_path(std::path::Path::new(path)) {
+                return host;
+            }
+        }
+    }
+    host
 }
 
 fn run_search(
@@ -778,7 +841,7 @@ fn run_search(
     } else {
         witchcraft::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut witchcraft::EmbeddingsCache::new(1),
             q,
             0.5,
@@ -809,7 +872,7 @@ fn run_search_with(
     let now = std::time::Instant::now();
     let results = witchcraft::search(
         db,
-        embedder,
+        Some(embedder),
         &mut cache,
         q,
         0.5,
@@ -941,6 +1004,9 @@ fn search_tui(
                     View::Detail(_) if can_open_slack => {
                         "↑↓/jk scroll  r open slack  / search  esc back  q quit"
                     }
+                    View::Detail(_) if current_result.is_some_and(|r| !r.remote_host.is_empty()) => {
+                        "↑↓/jk scroll  r SSH instructions  / search  esc back  q quit"
+                    }
                     View::Detail(_) if can_resume => {
                         "↑↓/jk scroll  r resume  / search  esc back  q quit"
                     }
@@ -998,9 +1064,14 @@ fn search_tui(
                 let cwd = if !cr.cwd.is_empty() { &cr.cwd } else { "?" };
                 let sid = &cr.session_id;
                 let src = &cr.source;
+                let prompt = if cr.remote_host.is_empty() {
+                    format!(" Exit pickbrain and resume {src} session {sid} in {cwd}? ")
+                } else {
+                    format!(" Exit pickbrain and show SSH instructions for {src} session {sid} on {}? ", cr.remote_host)
+                };
                 let footer = Paragraph::new(Line::from(vec![
                     Span::styled(
-                        format!(" Exit pickbrain and resume {src} session {sid} in {cwd}? "),
+                        prompt,
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -1038,6 +1109,12 @@ fn search_tui(
                             let mut meta_spans = session_meta_spans(
                                 &ts, &r.project, &r.session_id, &r.session_name, &r.source, &r.branch, &r.conv_key,
                             );
+                            if !r.remote_host.is_empty() {
+                                meta_spans.push(Span::styled(
+                                    format!("  from {}", r.remote_host),
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                            }
                             if r.path.ends_with(".md") {
                                 meta_spans.push(Span::styled(
                                     format!("  {}", r.path),
@@ -1117,6 +1194,12 @@ fn search_tui(
                         if !r.branch.is_empty() {
                             session_spans.push(Span::styled(
                                 format!("  {}", r.branch),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
+                        if !r.remote_host.is_empty() {
+                            session_spans.push(Span::styled(
+                                format!("  downloaded from {}", r.remote_host),
                                 Style::default().fg(Color::Yellow),
                             ));
                         }
@@ -1278,6 +1361,7 @@ fn search_tui(
                     search_filter.clear();
                     saved_search = Some((active_query.clone(), results.clone(), search_ms));
                 }
+                #[cfg(unix)]
                 (_, KeyCode::Char('z'), KeyModifiers::CONTROL) => {
                     disable_raw_mode()?;
                     crossterm::execute!(
@@ -1361,6 +1445,8 @@ fn search_tui(
                             source: r.source.clone(),
                             branch: r.branch.clone(),
                             cwd,
+                            path: r.path.clone(),
+                            remote_host: r.remote_host.clone(),
                         });
                     }
                 }
@@ -1380,6 +1466,7 @@ fn search_tui(
 
     disable_raw_mode()?;
     crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    std::io::stdout().flush()?;
     if let Some(target) = slack_to_open {
         let url = open_slack_target(&target)?;
         eprintln!("opened {url}");
@@ -1458,7 +1545,19 @@ fn maybe_checkout_branch(branch: &str) {
 }
 
 fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
+    let remote_host = if !s.remote_host.is_empty() {
+        Some(s.remote_host.clone())
+    } else if s.source == "codex" {
+        codex::remote_origin_for_path(std::path::Path::new(&s.path))
+    } else {
+        None
+    };
+    if let Some(host) = remote_host {
+        println!("\nSession {} is on {host}. SSH to that host to resume it:\n{}", s.session_id, remote_ssh_command(&host));
+        return Ok(());
+    }
     if !s.cwd.is_empty() {
         let _ = std::env::set_current_dir(&s.cwd);
     }
@@ -1466,25 +1565,34 @@ fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
         maybe_checkout_branch(&s.branch);
     }
     let session_id = &s.session_id;
-    if s.source == "codex" {
-        eprintln!("Resuming codex session {session_id}...");
-        let err = std::process::Command::new("codex")
-            .args(["resume", session_id])
-            .exec();
-        Err(err.into())
+    let (program, args) = if s.source == "codex" {
+        ("codex", ["resume", session_id.as_str()])
     } else if s.source == "pi" {
-        eprintln!("Resuming pi session {session_id}...");
-        let err = std::process::Command::new("pi")
-            .args(["--session", session_id])
-            .exec();
-        Err(err.into())
+        ("pi", ["--session", session_id.as_str()])
     } else {
-        eprintln!("Resuming claude session {session_id}...");
-        let err = std::process::Command::new("claude")
-            .args(["--resume", session_id])
-            .exec();
-        Err(err.into())
+        ("claude", ["--resume", session_id.as_str()])
+    };
+    eprintln!("Resuming {program} session {session_id}...");
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    #[cfg(unix)]
+    {
+        Err(command.exec().into())
     }
+    #[cfg(not(unix))]
+    {
+        let status = command.status()?;
+        anyhow::ensure!(status.success(), "{program} exited with {status}");
+        Ok(())
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn remote_ssh_command(host: &str) -> String {
+    format!("ssh {}", shell_quote(host))
 }
 
 fn parse_slack_conv_key(conv_key: &str) -> Option<(String, String, bool)> {
@@ -1774,6 +1882,10 @@ fn search_plain(
             String::new()
         };
         writeln!(buf, "{ts}  {}{filename}{session_info}{branch_info}", r.project)?;
+        if !r.remote_host.is_empty() {
+            writeln!(buf, "downloaded from {}", r.remote_host)?;
+            writeln!(buf, "SSH there to resume: {}", remote_ssh_command(&r.remote_host))?;
+        }
         if r.source == "slack" || r.turns.is_empty() || r.path.is_empty() {
             // Slack and .md files: use indexed bodies directly
             let idx = r.match_idx;
@@ -1883,6 +1995,8 @@ struct BranchSession {
     source: String,
     branch: String,
     cwd: String,
+    path: String,
+    remote_host: String,
 }
 
 
@@ -1927,6 +2041,7 @@ fn find_recent_sessions(db_name: &PathBuf, branch: Option<&str>) -> Result<Vec<S
     let mut results = Vec::new();
     for (metadata, body, date) in &rows {
         let meta: serde_json::Value = serde_json::from_str(metadata).unwrap_or_default();
+        let remote_host = remote_host_from_metadata(&meta);
         let turns_arr: Vec<TurnMeta> = meta["turns"]
             .as_array()
             .map(|arr| {
@@ -1949,6 +2064,7 @@ fn find_recent_sessions(db_name: &PathBuf, branch: Option<&str>) -> Result<Vec<S
             path: meta["path"].as_str().unwrap_or("").to_string(),
             cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
             source: meta["source"].as_str().unwrap_or("claude").to_string(),
+            remote_host,
             branch: meta["branch"].as_str().unwrap_or("").to_string(),
             conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
             slack_open: slack_open_target_from_metadata(&meta),
@@ -2182,6 +2298,12 @@ fn main() -> Result<()> {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Warn));
 
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--register") {
+        return pickbrain_watch::register(args.into_iter().map(std::ffi::OsString::from));
+    }
+    if args.iter().any(|arg| arg == "--watch") {
+        return pickbrain_watch::watch(args.into_iter().map(std::ffi::OsString::from));
+    }
     let mut session_filter: Option<String> = None;
     let mut branch_filter: Option<String> = None;
     let mut exclude_sessions: Vec<String> = Vec::new();
@@ -2196,6 +2318,7 @@ fn main() -> Result<()> {
     let mut current = false;
     let mut exclude_current = false;
     let mut quiet = false;
+    let mut ingest_only = false;
     let mut query_args: Vec<&str> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -2205,6 +2328,9 @@ fn main() -> Result<()> {
                 eprintln!("  pickbrain [options] [query]");
                 eprintln!("  pickbrain --dump <session-id|channel|thr:ts> [--turns N-M] [--since T]");
                 eprintln!("  pickbrain --nuke");
+                eprintln!("  pickbrain --ingest-only [--quiet]");
+                eprintln!("  pickbrain --watch [--delay SECONDS] [--max-delay SECONDS]");
+                eprintln!("  pickbrain --register [--delay SECONDS] [--max-delay SECONDS]");
                 eprintln!();
                 eprintln!("With no arguments, opens an interactive session browser.");
                 eprintln!();
@@ -2217,6 +2343,7 @@ fn main() -> Result<()> {
                 eprintln!("  --since 24h|7d|2w    only search recent history");
                 eprintln!("  --type claude,codex,pi,slack  filter by source");
                 eprintln!("  -q, --quiet          suppress ingest progress output");
+                eprintln!("  --ingest-only        ingest and index, then exit without searching");
                 eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
                 eprintln!("  --dm                 only DMs (Slack)");
                 eprintln!("  --no-dm              exclude DMs (Slack)");
@@ -2226,10 +2353,17 @@ fn main() -> Result<()> {
                 eprintln!();
                 eprintln!("Environment:");
                 eprintln!("  PICKBRAIN_DIR        override the pickbrain DB and state directory");
+                eprintln!("  PRE_INGEST_COMMAND   shell command run before checking for new sessions");
+                eprintln!("  EXTRA_CODEX_DIRS    colon-separated additional .codex directories");
+                eprintln!("  EXTRA_CLAUDE_DIRS   colon-separated additional .claude directories");
+                eprintln!("  EXTRA_PI_DIRS       colon-separated additional .pi/agent directories");
                 std::process::exit(0);
             }
             "--quiet" | "-q" => {
                 quiet = true;
+            }
+            "--ingest-only" => {
+                ingest_only = true;
             }
             "--nuke" => {
                 let db_name = db_path();
@@ -2328,7 +2462,7 @@ fn main() -> Result<()> {
     }
 
     use std::io::IsTerminal;
-    if std::io::stderr().is_terminal() {
+    if !quiet && std::io::stderr().is_terminal() {
         eprintln!("pickbrain {} — Copyright (c) 2026 Dropbox Inc.", env!("CARGO_PKG_VERSION"));
     }
 
@@ -2337,8 +2471,7 @@ fn main() -> Result<()> {
 
     // Migrate DB from old location (~/.claude/pickbrain.db)
     if !pickbrain_dir_overridden() && !db_name.exists() {
-        let home = env::var("HOME").unwrap_or_default();
-        let old_db = PathBuf::from(home).join(".claude/pickbrain.db");
+        let old_db = home_dir().join(".claude/pickbrain.db");
         if old_db.exists() {
             eprintln!("migrating database from {} to {}", old_db.display(), db_name.display());
             std::fs::rename(&old_db, &db_name).ok();
@@ -2346,7 +2479,7 @@ fn main() -> Result<()> {
     }
 
     // Detect the calling session once — used for both ingest-skip and --current filter.
-    let active_session = detect_active_session();
+    let active_session = if ingest_only { None } else { detect_active_session() };
 
     if current || exclude_current {
         match &active_session {
@@ -2369,31 +2502,62 @@ fn main() -> Result<()> {
     // Skip the active session's JSONL if its watermark is fresh (<10 min).
     // If we can't detect the active session, nothing is skipped (eager by default).
     let stale_ms = 10 * 60 * 1000;
-    if needs_ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter)? {
+    run_pre_ingest_command()?;
+    let pending = pickbrain_dir().join("ingest.pending");
+    let resume_pending = ingest_only && pending.exists();
+    let mut ingested = 0;
+    let mut indexed = false;
+    if resume_pending || needs_ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter)? {
         match IngestLock::try_acquire(&db_name) {
             Ok(Some(_lock)) => {
+                // Watermarks can advance before embedding finishes. Retain a retry marker on failure.
+                if ingest_only {
+                    std::fs::write(&pending, "")?;
+                }
                 match ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter, quiet) {
-                    Ok(have_changes) => {
-                        if have_changes {
+                    Ok(count) => {
+                        ingested = count;
+                        if count > 0 || resume_pending {
                             let db_rw = DB::new(db_name.clone()).unwrap();
                             let device = witchcraft::make_device();
                             let embedder = witchcraft::Embedder::new(&device, &assets)?;
                             embed_and_index(&db_rw, &embedder, &device)?;
+                            indexed = true;
                         }
                     },
                     Err(e) => {
-                        eprintln!("warning: ingest failed: {e}");
-                        std::process::exit(1);
+                        return Err(e).context("ingest sessions");
                     }
+                }
+                if ingest_only {
+                    std::fs::remove_file(&pending)?;
                 }
             },
             Ok(None) => {
+                if ingest_only {
+                    anyhow::bail!("another pickbrain process is ingesting");
+                }
                 warn_lookup_only("another pickbrain process is ingesting");
             }
             Err(e) => {
+                if ingest_only {
+                    return Err(e).context("acquire ingestion lock");
+                }
                 warn_lookup_only(format!("the ingest lock could not be acquired: {e}"));
             }
         }
+    }
+
+    if ingest_only {
+        if ingested > 0 {
+            let suffix = if ingested == 1 { "" } else { "s" };
+            eprintln!("pickbrain: ingested and indexed {ingested} document{suffix}");
+        } else if indexed {
+            eprintln!("pickbrain: completed pending indexing");
+        } else {
+            eprintln!("pickbrain: no changes");
+        }
+        return Ok(());
     }
 
     let has_branch = branch_filter.is_some();
@@ -2427,9 +2591,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_active_session_id_from_codex_env() {
+        let session_id = active_session_id_from_env(|key| match key {
+            "CODEX_SESSION_ID" => Some("  codex-session-id  ".to_string()),
+            _ => None,
+        });
+        assert_eq!(session_id.as_deref(), Some("codex-session-id"));
+    }
+
+    #[test]
+    fn test_active_session_id_supports_codex_thread_id_fallback() {
+        let session_id = active_session_id_from_env(|key| match key {
+            "CODEX_SESSION_ID" => Some("  ".to_string()),
+            "CODEX_THREAD_ID" => Some("codex-thread-id".to_string()),
+            _ => None,
+        });
+        assert_eq!(session_id.as_deref(), Some("codex-thread-id"));
+    }
+
+    #[test]
+    fn test_active_session_id_prefers_explicit_override() {
+        let session_id = active_session_id_from_env(|key| match key {
+            "PICKBRAIN_ACTIVE_SESSION_ID" => Some("override".to_string()),
+            "CODEX_SESSION_ID" => Some("codex-session-id".to_string()),
+            _ => None,
+        });
+        assert_eq!(session_id.as_deref(), Some("override"));
+    }
+
+    #[test]
     fn test_format_date() {
         assert_eq!(format_date("2025-01-15T10:30:00Z"), "Jan 15 10:30");
         assert_eq!(format_date("bad"), "??? ?? ??:??");
+    }
+
+    #[test]
+    fn test_remote_ssh_command() {
+        assert_eq!(remote_ssh_command("remote.example"), "ssh 'remote.example'");
+        assert_eq!(remote_ssh_command("host's alias"), "ssh 'host'\"'\"'s alias'");
     }
 
     #[test]
@@ -2449,6 +2648,7 @@ mod tests {
             path: String::new(),
             cwd: String::new(),
             source: "claude".to_string(),
+            remote_host: String::new(),
             branch: String::new(),
             conv_key: String::new(),
             slack_open: None,

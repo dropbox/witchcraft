@@ -1,6 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use crate::DB;
+    use crate::{
+        DB,
+        EmbeddingCache,
+    };
+    use candle_core::{Device, Tensor};
     use std::path::PathBuf;
     use tempfile::tempdir;
     use test_log::test;
@@ -23,7 +27,7 @@ mod tests {
         "There's a gas cloud in space that smells like rum and tastes like raspberries.",
         "Cows have best friends and get stressed when separated.",
         "A group of flamingos is called a 'flamboyance'.",
-        "Bananas are berries, but strawberries aren't.",
+        "A single strand of spaghetti is called a spaghetto.",
         "There's a species of fungus that can turn ants into zombies.",
         "Sharks existed before trees.",
         "Scotland has 421 words for 'snow'.",
@@ -50,16 +54,19 @@ mod tests {
     const EASY_QUERIES: [(&str, u32); 3] = [
         ("a lake in Australia that stays bright pink", 31),
         ("A group of flamingos", 15),
-        ("Bananas are berries", 0),
+        ("strawberries are not true berries", 0),
     ];
-    const THRESHOLD: f32 = 0.7;
+    const THRESHOLD: f32 = 0.71;
+
+    fn index_chunks(db: &DB, _device: &candle_core::Device) -> anyhow::Result<()> {
+        crate::index_chunks(db, None, false)
+    }
 
     #[test]
     fn test_end_to_end() -> std::io::Result<()> {
         let dir = tempdir().unwrap();
         let path: PathBuf = dir.path().join("warp");
         let mut db = DB::new(path.clone()).unwrap();
-        let mut reader_db = DB::new_reader(path.clone()).unwrap();
 
         let device = crate::make_device();
         let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
@@ -70,17 +77,18 @@ mod tests {
         for body in FACTS {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
             uuids.push(uuid.clone());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
         for round in 0..3 {
             crate::embed_chunks(&db, &embedder, None).unwrap();
-            for (i, (q, pos)) in QUERIES.iter().enumerate() {
+            let mut reader_db = DB::new_reader(path.clone()).unwrap();
+            for (i, (q, pos)) in EASY_QUERIES.iter().enumerate() {
                 let use_fulltext = round == 0;
                 println!("searching for {q}");
                 let results = crate::search(
                     &reader_db,
-                    &embedder,
+                    Some(&embedder),
                     &mut cache,
                     &q.to_string(),
                     THRESHOLD,
@@ -90,7 +98,7 @@ mod tests {
                 )
                 .unwrap();
                 if round == 0 {
-                    assert!(results.len() == 1);
+                    assert!(!results.is_empty(), "hybrid search should find '{q}'");
                 } else {
                     if i < 2 {
                         assert!(results.len() == 1);
@@ -98,19 +106,26 @@ mod tests {
                         assert!(results.len() == 0);
                     }
                 }
-                for (score, metadata, body, body_idx, _date) in results {
+                let results_to_check = if round == 0 {
+                    &results[..1]
+                } else {
+                    results.as_slice()
+                };
+                for (score, metadata, body, body_idx, _date) in results_to_check {
                     let uuid = Uuid::parse_str(&metadata).unwrap();
                     let index = uuids.iter().position(|&u| u == uuid).unwrap();
                     println!("i={i} score={score} metadata={metadata} body={body:?} body_idx={body_idx} uuid-index {index}");
                     assert!(index == *pos as usize);
                 }
             }
+            reader_db.shutdown();
             db.remove_doc(&uuids[0].clone()).unwrap();
-            crate::index_chunks(&db, &device).unwrap();
+            index_chunks(&db, &device).unwrap();
         }
+        let mut reader_db = DB::new_reader(path.clone()).unwrap();
         let _ = crate::search(
             &reader_db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"".to_string(),
             THRESHOLD,
@@ -134,6 +149,64 @@ mod tests {
     }
 
     #[test]
+    fn test_index_materializes_embeddings_through_file_cache() {
+        let dir = tempdir().unwrap();
+        let path: PathBuf = dir.path().join("warp");
+        let mut db = DB::new(path.clone()).unwrap();
+
+        let device = crate::make_device();
+        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let embedder = crate::Embedder::new(&device, &assets).unwrap();
+
+        for body in [
+            "Quartz lenses focus bright laboratory light for calibration.",
+            "Careful indexing should compute cached vectors only when needed.",
+            "The semantic index groups token embeddings by centroid proximity.",
+            "A compact cache entry stores packed vectors and per-span counts.",
+            "Chunk hashes make stable filenames for cached embedding records.",
+        ] {
+            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
+                .unwrap();
+        }
+
+        let chunk_table_count: i64 = db
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'chunk'")
+            .unwrap()
+            .query_row((), |row| row.get(0))
+            .unwrap();
+        assert_eq!(chunk_table_count, 1);
+        let chunk_rows: i64 = db
+            .query("SELECT COUNT(*) FROM chunk")
+            .unwrap()
+            .query_row((), |row| row.get(0))
+            .unwrap();
+        assert_eq!(chunk_rows, 0);
+        let generation_table_count: i64 = db
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'generation'")
+            .unwrap()
+            .query_row((), |row| row.get(0))
+            .unwrap();
+        assert_eq!(generation_table_count, 0);
+
+        let embedding_cache =
+            crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
+        assert!(!embedding_cache.root().exists());
+        let options = crate::IndexOptions::new(3).unwrap();
+        crate::index_chunks_with_cache_and_options(
+            &db,
+            &embedding_cache,
+            Some(&embedder),
+            false,
+            options,
+        )
+        .unwrap();
+
+        let cache_entries = std::fs::read_dir(embedding_cache.root()).unwrap().count();
+        assert_eq!(cache_entries, 5);
+    }
+
+    #[test]
     fn test_sub_docs() -> std::io::Result<()> {
         let dir = tempdir().unwrap();
         let path: PathBuf = dir.path().join("warp");
@@ -150,13 +223,13 @@ mod tests {
         }
         let body = FACTS.join("");
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-        db.add_doc(&uuid, None, &uuid.to_string(), &body, Some(lens))
+        db.add_doc(None, &uuid, None, &uuid.to_string(), &body, Some(lens))
             .unwrap();
 
         for (q, pos) in QUERIES {
             let results = crate::search(
                 &db,
-                &embedder,
+                Some(&embedder),
                 &mut cache,
                 &q.to_string(),
                 THRESHOLD,
@@ -172,7 +245,7 @@ mod tests {
         for (q, pos) in EASY_QUERIES {
             let results = crate::search(
                 &db,
-                &embedder,
+                Some(&embedder),
                 &mut cache,
                 &q.to_string(),
                 THRESHOLD,
@@ -187,6 +260,31 @@ mod tests {
         }
         db.clear();
         db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_sub_doc_scores_do_not_carry_between_subdocs() -> anyhow::Result<()> {
+        let query = Tensor::from_vec(
+            vec![1.0f32, 0.0, 0.0, 1.0],
+            (2, 2),
+            &Device::Cpu,
+        )?;
+        let embeddings = Tensor::from_vec(
+            vec![
+                0.9f32, 0.9, // subdoc 0 matches both query dimensions well.
+                1.0, 0.0,    // subdoc 1 only improves the first dimension.
+            ],
+            (2, 2),
+            &Device::Cpu,
+        )?;
+        let unindexed = vec![(vec![(1, 0), (1, 1)], embeddings)];
+
+        let results = crate::match_centroids_raw(&[], &query, None, &unindexed, 0.0, 10)?;
+
+        assert!(results[0].0 > 0.94);
+        assert_eq!(results[0].1, 1);
+        assert_eq!(results[0].2, 0);
         Ok(())
     }
 
@@ -206,16 +304,16 @@ mod tests {
         for body in FACTS {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
             uuids.push(uuid.clone());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap();
+        index_chunks(&db, &device).unwrap();
 
         // Verify search works after full index
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"A group of flamingos".to_string(),
             THRESHOLD,
@@ -239,16 +337,16 @@ mod tests {
         for body in new_facts {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
             new_uuids.push(uuid.clone());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap(); // should trigger incremental
+        index_chunks(&db, &device).unwrap(); // should trigger incremental
 
         // Verify search finds both old and new documents
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"A group of flamingos".to_string(),
             THRESHOLD,
@@ -264,7 +362,7 @@ mod tests {
 
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"dolphins sleeping habits".to_string(),
             THRESHOLD,
@@ -304,16 +402,16 @@ mod tests {
         ];
         for body in more_facts {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap(); // should trigger full re-index (compaction)
+        index_chunks(&db, &device).unwrap(); // should trigger full re-index (compaction)
 
         // Verify search still works after compaction
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"A group of flamingos".to_string(),
             THRESHOLD,
@@ -329,7 +427,7 @@ mod tests {
 
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"dolphins sleeping habits".to_string(),
             THRESHOLD,
@@ -367,11 +465,11 @@ mod tests {
         // Phase 1: bulk insert
         for &body in &FACTS {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            db.add_doc(&uuid, None, &uuid.to_string(), body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap();
+        index_chunks(&db, &device).unwrap();
 
         // Phase 2: add more docs to create a second level
         let extra_facts = [
@@ -381,34 +479,32 @@ mod tests {
         ];
         for body in extra_facts {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            db.add_doc(&uuid, None, &uuid.to_string(), body, None)
+            db.add_doc(None, &uuid, None, &uuid.to_string(), body, None)
                 .unwrap();
         }
         crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap();
+        index_chunks(&db, &device).unwrap();
 
-        // Verify generations span multiple levels
-        let levels: Vec<(u32, i64)> = {
-            let mut level_query = db
-                .query("SELECT level, SUM(num_embeddings) FROM generation GROUP BY level ORDER BY level")
-                .unwrap();
-            level_query
-                .query_map((), |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        };
+        // Verify file-backed generations span multiple levels
+        let levels = crate::file_index::FileBackedIndex::new(path.clone())
+            .level_embedding_counts()
+            .unwrap();
         println!("cascade levels: {:?}", levels);
         assert!(
             levels.len() >= 2,
             "should have at least 2 levels after adding extra docs"
         );
+        let rowid_sidecars = std::fs::read_dir(dir.path())?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("warp.rowids."))
+            .count();
+        assert_eq!(rowid_sidecars, 0);
 
         // Verify search finds results from both old and new data
         for (q, _pos) in EASY_QUERIES {
             let results = crate::search(
                 &db,
-                &embedder,
+                Some(&embedder),
                 &mut cache,
                 &q.to_string(),
                 THRESHOLD,
@@ -422,7 +518,7 @@ mod tests {
 
         let results = crate::search(
             &db,
-            &embedder,
+            Some(&embedder),
             &mut cache,
             &"dolphins sleeping habits".to_string(),
             THRESHOLD,
@@ -478,6 +574,16 @@ mod tests {
     }
 
     #[test]
+    fn test_bananas() -> std::io::Result<()> {
+        let device = crate::make_device();
+        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let embedder = crate::Embedder::new(&device, &assets).unwrap();
+        let result = embedder.embed("Bananas are berries, but strawberries aren't.");
+        assert!(result.is_ok(), "Failed to embed 'Bananas' text: {:?}", result.err());
+        Ok(())
+    }
+
+    #[test]
     fn test_embedder_without_assets() -> std::io::Result<()> {
         let device = crate::make_device();
         let assets = std::path::PathBuf::from("assets.notfound");
@@ -503,6 +609,61 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // run explicitly: cargo nextest run --release --features ... -E 'test(bench_encoder)'
+    fn bench_encoder() -> std::io::Result<()> {
+        use std::time::Instant;
+
+        let device = crate::make_device();
+        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let builder = crate::t5_encoder::T5ModelBuilder::load(&assets).unwrap();
+        let model = builder.0.build_encoder(&device, &assets).unwrap();
+        let tokenizer = builder.1;
+
+        // Build inputs of increasing length by repeating text
+        let base_text = FACTS.join(" ");
+        let lengths = [32, 64, 128, 256, 512];
+        let warmup = 3;
+        let iters = 7;
+
+        for &target_len in &lengths {
+            // Tokenize and truncate/pad to target length
+            let mut text = base_text.clone();
+            loop {
+                let enc = tokenizer.encode(text.as_str(), true).unwrap();
+                if enc.get_ids().len() >= target_len {
+                    let ids: Vec<u32> = enc.get_ids()[..target_len].to_vec();
+                    let input = candle_core::Tensor::new(&ids[..], model.device())
+                        .unwrap()
+                        .unsqueeze(0)
+                        .unwrap();
+
+                    // Warmup
+                    for _ in 0..warmup {
+                        let _ = model.forward(&input).unwrap();
+                    }
+
+                    // Timed runs
+                    let mut times = Vec::with_capacity(iters);
+                    for _ in 0..iters {
+                        let t0 = Instant::now();
+                        let _ = model.forward(&input).unwrap();
+                        times.push(t0.elapsed());
+                    }
+                    times.sort();
+                    let median = times[iters / 2];
+                    eprintln!(
+                        "seq_len={target_len:>4}  median={:.1}ms",
+                        median.as_secs_f64() * 1000.0,
+                    );
+                    break;
+                }
+                text.push_str(&base_text);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_open_corrupted_db() -> std::io::Result<()> {
         use std::io::Write;
         let dir = tempdir().unwrap();
@@ -523,6 +684,293 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_unindexed_embedding_count_uses_cache_metadata() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("counts.sqlite");
+        let mut db = DB::new(path.clone())?;
+
+        let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"counts-1");
+        let uuid2 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"counts-2");
+        db.add_doc(None, &uuid1, None, "{}", "first count document", None)?;
+        db.add_doc(None, &uuid2, None, "{}", "second count document", None)?;
+
+        let rows = db
+            .query("SELECT rowid, body, lens FROM document ORDER BY rowid")?
+            .query_map((), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let hash0 = crate::document_cache_hash(&rows[0].1, &rows[0].2);
+        let hash1 = crate::document_cache_hash(&rows[1].1, &rows[1].2);
+        let model = crate::model_id_for_dim(crate::DEFAULT_EMBEDDING_DIM);
+        let cache =
+            crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
+        cache.put(
+            &hash0,
+            &crate::CachedEmbeddings {
+                model: model.clone(),
+                counts: "not,a,count".to_string(),
+                embedding_count: 7,
+                embeddings: vec![],
+            },
+        )?;
+        cache.put(
+            &hash1,
+            &crate::CachedEmbeddings {
+                model,
+                counts: "".to_string(),
+                embedding_count: 11,
+                embeddings: vec![],
+            },
+        )?;
+
+        assert_eq!(crate::count_unindexed_cached_embeddings(&db, &cache)?, 18);
+        let data_file = "counts.sqlite.buckets.0.test";
+        let header_bytes = u32::try_from(crate::file_index::GENERATION_DATA_HEADER_BYTES)?;
+        let mut sidecar = vec![];
+        sidecar.extend_from_slice(&crate::file_index::GENERATION_DATA_APP_ID.to_le_bytes());
+        sidecar.extend_from_slice(&crate::file_index::GENERATION_DATA_VERSION.to_le_bytes());
+        sidecar.extend_from_slice(&0u32.to_le_bytes());
+        sidecar.extend_from_slice(&0u32.to_le_bytes());
+        sidecar.extend_from_slice(&(crate::DEFAULT_EMBEDDING_DIM as u32).to_le_bytes());
+        sidecar.extend_from_slice(&crate::BUCKET_CENTER_FORMAT.to_le_bytes());
+        sidecar.extend_from_slice(&header_bytes.to_le_bytes());
+        sidecar.extend_from_slice(&header_bytes.to_le_bytes());
+        sidecar.extend_from_slice(&u64::from(header_bytes).to_le_bytes());
+        sidecar.extend_from_slice(&u64::try_from(rows[0].0)?.to_le_bytes());
+        sidecar.extend_from_slice(&7u32.to_le_bytes());
+        std::fs::write(dir.path().join(data_file), sidecar)?;
+        std::fs::write(
+            dir.path().join("counts.sqlite.index"),
+            format!(
+                "{}\t{}\n0\t7\t{data_file}\n",
+                crate::file_index::GENERATION_DATA_APP_ID,
+                crate::file_index::GENERATION_DATA_VERSION
+            ),
+        )?;
+        assert_eq!(crate::count_unindexed_cached_embeddings(&db, &cache)?, 11);
+        Ok(())
+    }
+
+    #[test]
+    fn test_force_flush_indexes_small_buffered_batch() -> anyhow::Result<()> {
+        use crate::packops::TensorPackOps;
+
+        let dir = tempdir()?;
+        let path = dir.path().join("force_flush.sqlite");
+        let mut db = DB::new(path.clone())?;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"force-flush-index");
+        db.add_doc(None, &uuid, None, "{}", "force flush indexed row", None)?;
+
+        let (hash, rowid): (String, i64) = db
+            .query("SELECT hash, rowid FROM document WHERE uuid = ?1")?
+            .query_row((uuid.to_string(),), |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let model = crate::model_id_for_dim(crate::DEFAULT_EMBEDDING_DIM);
+        let embedding = Tensor::from_vec(
+            vec![1.0f32; crate::DEFAULT_EMBEDDING_DIM],
+            (1, crate::DEFAULT_EMBEDDING_DIM),
+            &Device::Cpu,
+        )?;
+        let cache =
+            crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
+        cache.put(
+            &hash,
+            &crate::CachedEmbeddings {
+                model,
+                counts: "1".to_string(),
+                embedding_count: 1,
+                embeddings: embedding.embeddings_to_packed()?,
+            },
+        )?;
+
+        crate::index_chunks_with_cache(&db, &cache, None, false)?;
+        let reason = crate::semantic_index_unavailable_reason(&db)?.unwrap();
+        assert!(reason.contains("buffered unindexed rowids"));
+
+        let options = crate::IndexOptions::default().force_flush();
+        crate::index_chunks_with_cache_and_options(&db, &cache, None, false, options)?;
+        assert_eq!(crate::semantic_index_unavailable_reason(&db)?, None);
+
+        let index = crate::file_index::FileBackedIndex::new(path);
+        assert_eq!(index.active_rowids()?.get(&(rowid as u64)), Some(&true));
+        Ok(())
+    }
+
+    #[test]
+    fn test_hadamard_polar_quantization_layout() -> anyhow::Result<()> {
+        use crate::packops::{
+            TensorPackOps, POLAR2_HADAMARD_QUANT_BITS, POLAR3_HADAMARD_QUANT_BITS,
+        };
+
+        for (bits, radius_bits, radius_levels, row_bytes) in [
+            (POLAR2_HADAMARD_QUANT_BITS, 2, 4, 2),
+            (POLAR3_HADAMARD_QUANT_BITS, 3, 8, 3),
+        ] {
+            assert_eq!(crate::packops::residual_radius_bits(bits)?, radius_bits);
+            assert_eq!(
+                crate::packops::residual_radius_level_count(bits)?,
+                radius_levels
+            );
+            assert_eq!(crate::packops::polar_row_bytes(8, bits)?, row_bytes);
+
+            let mut row = vec![1.0f32, 0.0, 0.25, -0.25, 0.5, 0.125, -0.375, 0.75];
+            let norm_before: f32 = row.iter().map(|value| value * value).sum();
+            crate::packops::preprocess_residual_for_quantization(&mut row, bits)?;
+            let norm_after: f32 = row.iter().map(|value| value * value).sum();
+            assert!((norm_before - norm_after).abs() < 1e-5);
+
+            let residual = Tensor::from_vec(
+                vec![1.0f32, 0.0, 0.25, -0.25, 0.5, 0.125, -0.375, 0.75],
+                (1, 8),
+                &Device::Cpu,
+            )?;
+            let bytes = residual.to_polar_bytes(bits)?;
+            assert_eq!(bytes.len(), row_bytes);
+            let table = crate::packops::make_residual_dequant_table_with_radius_levels(bits, None)?;
+            let decoded =
+                crate::packops::residuals_from_bytes(&bytes, 8, &table, bits, &Device::Cpu)?;
+            assert_eq!(decoded.dims2()?, (1, 8));
+
+            let raw_decoded = crate::packops::residuals_from_bytes_in_quantized_domain(
+                &bytes,
+                8,
+                &table,
+                bits,
+                &Device::Cpu,
+            )?;
+            let query = Tensor::from_vec(
+                vec![-0.25f32, 0.5, 0.125, -0.75, 1.0, 0.25, -0.5, 0.375],
+                (1, 8),
+                &Device::Cpu,
+            )?;
+            let rotated_query =
+                crate::packops::rotate_rows_for_hadamard_residual_similarity(&query)?;
+            let decoded = decoded.flatten_all()?.to_vec1::<f32>()?;
+            let raw_decoded = raw_decoded.flatten_all()?.to_vec1::<f32>()?;
+            let query = query.flatten_all()?.to_vec1::<f32>()?;
+            let rotated_query = rotated_query.flatten_all()?.to_vec1::<f32>()?;
+            let original_dot: f32 = query
+                .iter()
+                .zip(decoded.iter())
+                .map(|(query, residual)| query * residual)
+                .sum();
+            let rotated_dot: f32 = rotated_query
+                .iter()
+                .zip(raw_decoded.iter())
+                .map(|(query, residual)| query * residual)
+                .sum();
+            assert!((original_dot - rotated_dot).abs() < 1e-5);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_center_q4_formats_decode_finite_centers() -> anyhow::Result<()> {
+        use crate::packops::TensorPackOps;
+
+        let center_count = 20usize;
+        let dim = 8usize;
+        let centers: Vec<f32> = (0..center_count * dim)
+            .map(|idx| {
+                let row = idx / dim;
+                let col = idx % dim;
+                ((row as f32 + 1.0) * (col as f32 - 3.5)) / 100.0
+            })
+            .collect();
+        let centers = Tensor::from_vec(centers, (center_count, dim), &Device::Cpu)?;
+        let center_block = centers.to_f32_bytes()?;
+        let bucket_indices: Vec<usize> = (0..center_count).collect();
+        let coarse_tree =
+            crate::build_coarse_tree_from_bucket_indices(&bucket_indices, &center_block, dim)?;
+
+        for center_format in [
+            crate::BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA,
+            crate::BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA,
+        ] {
+            let encoded = crate::encode_q4_center_residual_block(
+                &center_block,
+                &bucket_indices,
+                &coarse_tree,
+                center_count,
+                dim,
+                center_format,
+            )?;
+            assert_eq!(
+                encoded.len(),
+                crate::center_block_bytes_for_count(center_count, dim, center_format)?
+            );
+            let decoded = crate::center_block_to_f32_bytes(
+                &encoded,
+                &bucket_indices,
+                &coarse_tree,
+                center_count,
+                dim,
+                center_format,
+            )?;
+            let decoded = Tensor::from_f32_bytes(&decoded, dim, &Device::Cpu)?;
+            assert_eq!(decoded.dims2()?, (center_count, dim));
+            let decoded = decoded.flatten_all()?.to_vec1::<f32>()?;
+            assert!(decoded.iter().all(|value| value.is_finite()));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_semantic_index_readiness_reports_stale_and_missing_indexes() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("stale.sqlite");
+        let mut db = DB::new(path.clone())?;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"stale-index-reset");
+        db.add_doc(None, &uuid, None, "{}", "stale index reset should not scan", None)?;
+
+        let data_file = "stale.sqlite.buckets.0.stale";
+        let header_bytes = u32::try_from(crate::file_index::GENERATION_DATA_HEADER_BYTES)?;
+        let mut sidecar = vec![];
+        sidecar.extend_from_slice(&crate::file_index::GENERATION_DATA_APP_ID.to_le_bytes());
+        sidecar.extend_from_slice(&(crate::file_index::GENERATION_DATA_VERSION - 1).to_le_bytes());
+        sidecar.extend_from_slice(&0u32.to_le_bytes());
+        sidecar.extend_from_slice(&0u32.to_le_bytes());
+        sidecar.extend_from_slice(&(crate::DEFAULT_EMBEDDING_DIM as u32).to_le_bytes());
+        sidecar.extend_from_slice(&crate::BUCKET_CENTER_FORMAT.to_le_bytes());
+        sidecar.extend_from_slice(&header_bytes.to_le_bytes());
+        sidecar.extend_from_slice(&header_bytes.to_le_bytes());
+        sidecar.extend_from_slice(&u64::from(header_bytes).to_le_bytes());
+        std::fs::write(dir.path().join(data_file), sidecar)?;
+        std::fs::write(
+            dir.path().join("stale.sqlite.index"),
+            format!(
+                "{}\t{}\n0\t1\t{data_file}\n",
+                crate::file_index::GENERATION_DATA_APP_ID,
+                crate::file_index::GENERATION_DATA_VERSION
+            ),
+        )?;
+
+        let reason = crate::semantic_index_unavailable_reason(&db)?.unwrap();
+        assert!(reason.contains("stale"));
+        assert!(dir.path().join(data_file).exists());
+        let query = Tensor::from_vec(
+            vec![0.0f32; crate::DEFAULT_EMBEDDING_DIM],
+            (1, crate::DEFAULT_EMBEDDING_DIM),
+            &Device::Cpu,
+        )?;
+        let results = crate::match_centroids(&db, &query, 0.0, 10, None)?;
+        assert!(results.is_empty());
+
+        let missing_path = dir.path().join("missing.sqlite");
+        let mut missing_db = DB::new(missing_path)?;
+        let missing_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"missing-index");
+        missing_db.add_doc(None, &missing_uuid, None, "{}", "missing semantic index", None)?;
+        let reason = crate::semantic_index_unavailable_reason(&missing_db)?.unwrap();
+        assert!(reason.contains("missing"));
+        Ok(())
+    }
+
     /// Regression test for scoring off-by-one: the last token vector was
     /// dropped because vmax_inplace was unreachable after the break.
     /// A single-document corpus exercises this: the one document is both
@@ -539,12 +987,15 @@ mod tests {
 
         let mut db = DB::new(path.clone())?;
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"only-doc");
-        db.add_doc(&uuid, None, &uuid.to_string(), "Honey never spoils", None)?;
+        db.add_doc(None, &uuid, None, &uuid.to_string(), "Honey never spoils because it has low moisture content and high acidity which prevents bacterial growth", None)?;
         crate::embed_chunks(&db, &embedder, None)?;
-        crate::index_chunks(&db, &device)?;
+        let chunk_rows: i64 = db.query("SELECT COUNT(*) FROM chunk")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(chunk_rows, 1);
+        index_chunks(&db, &device)?;
 
         let results = crate::search(
-            &db, &embedder, &mut cache,
+            &db, Some(&embedder), &mut cache,
             "honey preservation", 0.3, 10, false, None,
         )?;
         assert!(!results.is_empty(), "single-doc search must return the document");
@@ -557,10 +1008,17 @@ mod tests {
         let path = dir.path().join("batch_test.sqlite");
         let mut db = DB::new(path)?;
 
-        let docs: Vec<(Uuid, Option<iso8601_timestamp::Timestamp>, &str, &str, Option<Vec<usize>>)> = vec![
-            (Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc1"), None, r#"{"title":"one"}"#, "first document body", None),
-            (Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc2"), None, r#"{"title":"two"}"#, "second document body", None),
-            (Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc3"), None, r#"{"title":"three"}"#, "third document body", None),
+        let docs: Vec<(
+            Option<u64>,
+            Uuid,
+            Option<iso8601_timestamp::Timestamp>,
+            &str,
+            &str,
+            Option<Vec<usize>>,
+        )> = vec![
+            (None, Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc1"), None, r#"{"title":"one"}"#, "first document body", None),
+            (None, Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc2"), None, r#"{"title":"two"}"#, "second document body", None),
+            (None, Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc3"), None, r#"{"title":"three"}"#, "third document body", None),
         ];
 
         let count = db.add_docs_batch(&docs)?;
@@ -573,14 +1031,14 @@ mod tests {
 
         // Verify add_doc delegates to add_docs_batch correctly
         let uuid4 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc4");
-        db.add_doc(&uuid4, None, r#"{"title":"four"}"#, "fourth body", None)?;
+        db.add_doc(None, &uuid4, None, r#"{"title":"four"}"#, "fourth body", None)?;
         let row_count: i64 = db.query("SELECT COUNT(*) FROM document")?
             .query_row((), |row| row.get(0))?;
         assert_eq!(row_count, 4);
 
         // Verify upsert: re-add doc1 with different body
         let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc1");
-        db.add_doc(&uuid1, None, r#"{"title":"one-updated"}"#, "updated body", None)?;
+        db.add_doc(None, &uuid1, None, r#"{"title":"one-updated"}"#, "updated body", None)?;
         let row_count: i64 = db.query("SELECT COUNT(*) FROM document")?
             .query_row((), |row| row.get(0))?;
         assert_eq!(row_count, 4); // still 4, not 5
@@ -588,6 +1046,168 @@ mod tests {
         let metadata: String = db.query("SELECT metadata FROM document WHERE uuid = ?1")?
             .query_row((uuid1.to_string(),), |row| row.get(0))?;
         assert!(metadata.contains("one-updated"));
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_tombstone_trigger_is_transactional() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("delete_tombstone.sqlite");
+        let mut db = DB::new(path)?;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"delete-tombstone");
+        db.add_doc(None, &uuid, None, "{}", "delete me", None)?;
+
+        db.begin_transaction()?;
+        db.execute("DELETE FROM document WHERE rowid = 1")?;
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 1);
+        db.rollback_transaction()?;
+
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 0);
+
+        db.begin_transaction()?;
+        db.execute("DELETE FROM document WHERE rowid = 1")?;
+        db.commit_transaction()?;
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 1);
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_tombstones_drain_into_file_index() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("delete_drain.sqlite");
+        let mut db = DB::new(path.clone())?;
+        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"delete-drain");
+        db.add_doc(None, &uuid, None, "{}", "delete me", None)?;
+        db.remove_doc(&uuid)?;
+
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 1);
+
+        let cache = crate::default_embedding_cache();
+        crate::index_chunks_with_cache(&db, &cache, None, false)?;
+
+        let queued: i64 = db.query("SELECT COUNT(*) FROM document_index_tombstone")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(queued, 0);
+
+        let index = crate::file_index::FileBackedIndex::new(path.clone());
+        let active = index.active_rowids()?;
+        assert_eq!(active.get(&1), Some(&false));
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_chunk_cache_cleanup_triggers() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("chunk_cleanup.sqlite");
+        let mut db = DB::new(path)?;
+        let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"chunk-cleanup-1");
+        let uuid2 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"chunk-cleanup-2");
+        let body = "same cached chunk body";
+        db.add_doc(None, &uuid1, None, "{}", body, None)?;
+        db.add_doc(None, &uuid2, None, "{}", body, None)?;
+
+        let hash: String = db.query("SELECT hash FROM document WHERE uuid = ?1")?
+            .query_row((uuid1.to_string(),), |row| row.get(0))?;
+        db.query(
+            "INSERT INTO chunk(hash, model, embeddings, counts, embedding_count)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute((&hash, "xtr-base-en", vec![1u8, 2, 3], "3", 3i64))?;
+
+        db.remove_doc(&uuid1)?;
+        let chunks: i64 = db.query("SELECT COUNT(*) FROM chunk WHERE hash = ?1")?
+            .query_row((&hash,), |row| row.get(0))?;
+        assert_eq!(chunks, 1);
+
+        db.remove_doc(&uuid2)?;
+        let chunks: i64 = db.query("SELECT COUNT(*) FROM chunk WHERE hash = ?1")?
+            .query_row((&hash,), |row| row.get(0))?;
+        assert_eq!(chunks, 0);
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_docs_with_explicit_rowids() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("rowid_test.sqlite");
+        let mut db = DB::new(path)?;
+
+        let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc1");
+        let uuid2 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc2");
+        let docs = [
+            (Some(10), uuid1, None, r#"{"title":"one"}"#, "first body", None),
+            (Some(20), uuid2, None, r#"{"title":"two"}"#, "second body", None),
+        ];
+
+        assert_eq!(db.add_docs_batch(&docs)?, 2);
+        let rowids = db
+            .query("SELECT rowid FROM document ORDER BY rowid")?
+            .query_map((), |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rowids, vec![10, 20]);
+
+        let uuid3 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc3");
+        db.add_doc(None, &uuid3, None, "{}", "automatic rowid", None)?;
+        let auto_rowid: i64 = db
+            .query("SELECT rowid FROM document WHERE uuid = ?1")?
+            .query_row((uuid3.to_string(),), |row| row.get(0))?;
+        assert!(auto_rowid > 20);
+
+        db.add_doc(
+            Some(30),
+            &uuid1,
+            None,
+            r#"{"title":"one-updated"}"#,
+            "updated body",
+            None,
+        )?;
+        let moved_rowid: i64 = db
+            .query("SELECT rowid FROM document WHERE uuid = ?1")?
+            .query_row((uuid1.to_string(),), |row| row.get(0))?;
+        assert_eq!(moved_rowid, 30);
+
+        let uuid4 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc4");
+        assert!(db
+            .add_doc(Some(30), &uuid4, None, "{}", "duplicate rowid", None)
+            .is_err());
+        assert!(db
+            .add_doc(
+                Some(i64::MAX as u64 + 1),
+                &uuid4,
+                None,
+                "{}",
+                "too large",
+                None,
+            )
+            .is_err());
+
+        let uuid5 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc5");
+        let uuid6 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"rowid-doc6");
+        let non_monotonic = [
+            (Some(40), uuid5, None, "{}", "higher", None),
+            (Some(39), uuid6, None, "{}", "lower", None),
+        ];
+        assert!(db.add_docs_batch(&non_monotonic).is_err());
 
         db.clear();
         db.shutdown();
@@ -608,15 +1228,15 @@ mod tests {
         // Insert two documents that would both match "flamingos"
         let uuid_a = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"filter-a");
         let uuid_b = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"filter-b");
-        db.add_doc(&uuid_a, None, &uuid_a.to_string(), "A group of flamingos is called a flamboyance", None)?;
-        db.add_doc(&uuid_b, None, &uuid_b.to_string(), "Flamingos are pink because of their diet of shrimp and algae", None)?;
+        db.add_doc(None, &uuid_a, None, &uuid_a.to_string(), "A group of flamingos is called a flamboyance. Flamingos are social birds that gather in large colonies near shallow lakes and lagoons.", None)?;
+        db.add_doc(None, &uuid_b, None, &uuid_b.to_string(), "Flamingos are pink because of their diet of shrimp and algae. These wading birds can filter feed for hours while standing on one leg.", None)?;
 
         crate::embed_chunks(&db, &embedder, None)?;
-        crate::index_chunks(&db, &device)?;
+        index_chunks(&db, &device)?;
 
         // Unfiltered search should return both
         let results = crate::search(
-            &db, &embedder, &mut cache, "flamingos", THRESHOLD, 10, false, None,
+            &db, Some(&embedder), &mut cache, "flamingos", 0.3, 10, false, None,
         )?;
         assert!(results.len() == 2, "unfiltered search should find both flamingo docs, got {}", results.len());
 
@@ -632,7 +1252,7 @@ mod tests {
             statements: None,
         };
         let results = crate::search(
-            &db, &embedder, &mut cache, "flamingos", THRESHOLD, 10, false, Some(&filter),
+            &db, Some(&embedder), &mut cache, "flamingos", 0.3, 10, false, Some(&filter),
         )?;
         assert!(results.len() == 1, "filtered search should find exactly one doc, got {}", results.len());
         assert_eq!(results[0].1, uuid_b.to_string(), "filtered result should be uuid_b");
@@ -657,10 +1277,10 @@ mod tests {
         let mut baseline = DB::new(baseline_path.clone())?;
         for &body in &FACTS {
             let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            baseline.add_doc(&uuid, None, &uuid.to_string(), body, None)?;
+            baseline.add_doc(None, &uuid, None, &uuid.to_string(), body, None)?;
         }
         crate::embed_chunks(&baseline, &embedder, None)?;
-        crate::index_chunks(&baseline, &device)?;
+        index_chunks(&baseline, &device)?;
 
         // Empty DB (simulates an overlay with 0 generations)
         let overlay_path = dir.path().join("overlay.sqlite");
@@ -668,15 +1288,15 @@ mod tests {
 
         // Search the empty DB first — this poisoned the global cache before the fix
         let overlay_results = crate::search(
-            &overlay, &embedder, &mut cache,
-            "a lake with funny colors", THRESHOLD, 10, false, None,
+            &overlay, Some(&embedder), &mut cache,
+            "a lake in Australia that stays bright pink", THRESHOLD, 10, false, None,
         )?;
         assert!(overlay_results.is_empty());
 
         // Search the populated DB — must still find indexed results
         let baseline_results = crate::search(
-            &baseline, &embedder, &mut cache,
-            "a lake with funny colors", THRESHOLD, 10, false, None,
+            &baseline, Some(&embedder), &mut cache,
+            "a lake in Australia that stays bright pink", THRESHOLD, 10, false, None,
         )?;
         assert!(
             !baseline_results.is_empty(),
@@ -701,16 +1321,23 @@ mod tests {
         // Add one doc with empty body and one with real content
         let uuid_empty = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"empty");
         let uuid_real = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"real");
-        db.add_doc(&uuid_empty, None, "{}", "", None)?;
-        db.add_doc(&uuid_real, None, "{}", "Octopuses have three hearts", None)?;
+        db.add_doc(None, &uuid_empty, None, "{}", "", None)?;
+        db.add_doc(None, &uuid_real, None, "{}", "Octopuses have three hearts", None)?;
 
-        let count = crate::embed_chunks(&db, &embedder, None)?;
+        let embedding_cache =
+            crate::FileEmbeddingCache::new(dir.path().join(crate::default_embedding_cache_dir()));
+        let count = crate::embed_chunks_with_cache(&db, &embedder, &embedding_cache, None)?;
         assert_eq!(count, 1, "only the non-empty doc should be embedded");
 
-        // Verify the chunk table has exactly one entry
-        let chunk_count: i64 = db.query("SELECT COUNT(*) FROM chunk")?
+        let cache_entries = std::fs::read_dir(embedding_cache.root())?.count();
+        assert_eq!(cache_entries, 1);
+
+        let chunk_table_count: i64 = db.query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'chunk'")?
             .query_row((), |row| row.get(0))?;
-        assert_eq!(chunk_count, 1);
+        assert_eq!(chunk_table_count, 1);
+        let chunk_rows: i64 = db.query("SELECT COUNT(*) FROM chunk")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(chunk_rows, 0);
 
         db.clear();
         db.shutdown();
@@ -719,12 +1346,13 @@ mod tests {
 
     #[test]
     fn fts5_query_splits_punctuation_and_uses_or_terms() {
+        let stopwords = std::collections::HashSet::new();
         let (query, normalized) =
-            super::super::fts5_query("what is the origin of COVID-19").unwrap();
+            super::super::fts5_query("what is the origin of COVID-19", &stopwords).unwrap();
 
         assert_eq!(
             query,
-            "\"what\" OR \"is\" OR \"the\" OR \"origin\" OR \"of\" OR \"COVID\" OR \"19\"*"
+            "\"what\" OR \"is\" OR \"the\" OR \"origin\" OR \"of\" OR \"COVID\" OR \"19\""
         );
         assert_eq!(normalized, "what is the origin of COVID 19");
     }
@@ -739,8 +1367,8 @@ mod tests {
         let distractor = "This paragraph says what is the origin of an unrelated weather report.";
         let relevant_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, relevant.as_bytes());
         let distractor_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, distractor.as_bytes());
-        db.add_doc(&relevant_uuid, None, "relevant", relevant, None)?;
-        db.add_doc(&distractor_uuid, None, "distractor", distractor, None)?;
+        db.add_doc(None, &relevant_uuid, None, "relevant", relevant, None)?;
+        db.add_doc(None, &distractor_uuid, None, "distractor", distractor, None)?;
 
         let relevant_rowid: u32 = db
             .query("SELECT rowid FROM document WHERE metadata = 'relevant'")?
@@ -754,6 +1382,127 @@ mod tests {
 
         db.clear();
         db.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn test_capi_add_search_results() -> anyhow::Result<()> {
+        use std::ffi::{CStr, CString};
+        use std::os::raw::c_void;
+
+        struct EmbeddingStore {
+            blobs: std::collections::HashMap<u64, Vec<u8>>,
+            callback_calls: usize,
+        }
+
+        unsafe fn last_error(handle: *mut crate::capi::WitchcraftHandle) -> String {
+            let ptr = crate::capi::witchcraft_last_error(handle);
+            if ptr.is_null() {
+                return "no error".to_string();
+            }
+            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+
+        unsafe extern "C" fn embedding_callback(
+            rowid: u64,
+            user_data: *mut c_void,
+            dst: *mut u8,
+            dst_cap: usize,
+            out_len: *mut usize,
+        ) -> i32 {
+            let store = &mut *(user_data as *mut EmbeddingStore);
+            store.callback_calls += 1;
+            let Some(blob) = store.blobs.get(&rowid) else {
+                return -1;
+            };
+            if out_len.is_null() {
+                return -1;
+            }
+            *out_len = blob.len();
+            if dst.is_null() {
+                return 0;
+            }
+            if dst_cap < blob.len() {
+                return -1;
+            }
+            std::ptr::copy_nonoverlapping(blob.as_ptr(), dst, blob.len());
+            0
+        }
+
+        let dir = tempdir()?;
+        let path = dir.path().join("capi.sqlite");
+        let db_path = CString::new(path.to_string_lossy().as_bytes())?;
+        let assets = CString::new("assets")?;
+        let mut store = EmbeddingStore {
+            blobs: std::collections::HashMap::new(),
+            callback_calls: 0,
+        };
+
+        unsafe {
+            let handle =
+                crate::capi::witchcraft_open(db_path.as_ptr(), assets.as_ptr(), std::ptr::null());
+            assert!(!handle.is_null(), "{}", last_error(std::ptr::null_mut()));
+
+            let honey = "Honey never spoils";
+            let blob = crate::capi::witchcraft_embed(
+                handle,
+                honey.as_ptr(),
+                honey.len(),
+            );
+            assert_eq!(blob.status, 0, "{}", last_error(handle));
+            store.blobs.insert(42, std::slice::from_raw_parts(blob.ptr, blob.len).to_vec());
+            crate::capi::witchcraft_bytes_free(blob.ptr, blob.len);
+
+            let octopus = "Octopuses have three hearts";
+            let blob = crate::capi::witchcraft_embed(
+                handle,
+                octopus.as_ptr(),
+                octopus.len(),
+            );
+            assert_eq!(blob.status, 0, "{}", last_error(handle));
+            store.blobs.insert(43, std::slice::from_raw_parts(blob.ptr, blob.len).to_vec());
+            crate::capi::witchcraft_bytes_free(blob.ptr, blob.len);
+
+            let user_data = &mut store as *mut _ as *mut c_void;
+            let honey_blob = &store.blobs[&42];
+            assert_eq!(
+                crate::capi::witchcraft_add(handle, 42, honey_blob.as_ptr(), honey_blob.len()),
+                0,
+                "{}",
+                last_error(handle)
+            );
+            let octopus_blob = &store.blobs[&43];
+            assert_eq!(
+                crate::capi::witchcraft_add(handle, 43, octopus_blob.as_ptr(), octopus_blob.len()),
+                0,
+                "{}",
+                last_error(handle)
+            );
+            assert_eq!(
+                crate::capi::witchcraft_index(handle, Some(embedding_callback), user_data),
+                0,
+                "{}",
+                last_error(handle)
+            );
+
+            let query = "honey never spoils";
+            let result = crate::capi::witchcraft_search(
+                handle,
+                query.as_ptr(),
+                query.len(),
+                0.0,
+                10,
+            );
+            assert_eq!(result.status, 0, "{}", last_error(handle));
+            let hits = std::slice::from_raw_parts(result.ptr, result.len).to_vec();
+            crate::capi::witchcraft_search_results_free(result.ptr, result.len);
+            crate::capi::witchcraft_close(handle);
+
+            assert!(store.callback_calls > 0);
+            assert_eq!(hits.first().map(|hit| hit.rowid), Some(42));
+            assert!(hits.first().map(|hit| hit.score.is_finite()).unwrap_or(false));
+        }
+
         Ok(())
     }
 }

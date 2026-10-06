@@ -1,0 +1,600 @@
+//! ModernBERT encoder for ColModernVBert safetensors checkpoints.
+//!
+//! 22-layer ModernBERT with RoPE, GeGLU MLP, RMSNorm.
+//! Produces XTR token embeddings via a learned linear projection.
+
+use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_nn::{self, Activation, Linear, VarBuilder};
+use serde::Deserialize;
+use std::io::Error;
+use tokenizers::Tokenizer;
+
+use crate::embed_asset;
+
+embed_asset!(pub CONFIG,    "modernbert-config.json");
+embed_asset!(pub TOKENIZER, "modernbert-tokenizer.json");
+embed_asset!(pub MODEL,     "modernbert.safetensors");
+
+#[derive(Debug, Deserialize)]
+struct Config {
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    intermediate_size: usize,
+    vocab_size: usize,
+    rope_theta: f64,
+    #[serde(default)]
+    global_rope_theta: Option<f64>,
+    norm_eps: f64,
+    #[serde(default)]
+    projection_mlp: Option<usize>,
+    #[serde(default = "default_projection_dim")]
+    projection_dim: usize,
+    #[serde(default = "default_local_attention")]
+    local_attention: usize,
+    #[serde(default = "default_global_attn_every_n")]
+    global_attn_every_n_layers: usize,
+    #[serde(default = "default_activation")]
+    hidden_activation: String,
+    #[serde(default)]
+    token_gate: bool,
+}
+
+fn default_activation() -> String {
+    "gelu".to_string()
+}
+
+fn default_projection_dim() -> usize {
+    128
+}
+
+fn default_local_attention() -> usize {
+    128
+}
+
+fn default_global_attn_every_n() -> usize {
+    3
+}
+
+#[derive(Debug, Clone)]
+struct LayerNormNoBias {
+    weight: Tensor,
+    eps: f64,
+}
+
+impl LayerNormNoBias {
+    fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get(size, "weight")?;
+        Ok(Self { weight, eps })
+    }
+}
+
+impl Module for LayerNormNoBias {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let dtype = xs.dtype();
+        let xs_f32 = xs.to_dtype(DType::F32)?;
+        let mean = xs_f32.mean_keepdim(D::Minus1)?;
+        let centered = xs_f32.broadcast_sub(&mean)?;
+        let variance = centered.sqr()?.mean_keepdim(D::Minus1)?;
+        let normed = centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let normed = normed.to_dtype(dtype)?;
+        normed.broadcast_mul(&self.weight)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LayerNormWithBias {
+    weight: Tensor,
+    bias: Tensor,
+    eps: f64,
+}
+
+impl LayerNormWithBias {
+    fn load(size: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+        let weight = vb.get(size, "weight")?;
+        let bias = vb.get(size, "bias")?;
+        Ok(Self { weight, bias, eps })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let dtype = xs.dtype();
+        let xs_f32 = xs.to_dtype(DType::F32)?;
+        let mean = xs_f32.mean_keepdim(D::Minus1)?;
+        let centered = xs_f32.broadcast_sub(&mean)?;
+        let variance = centered.sqr()?.mean_keepdim(D::Minus1)?;
+        let normed = centered.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
+        let normed = normed.to_dtype(dtype)?;
+        normed.broadcast_mul(&self.weight)?.broadcast_add(&self.bias)
+    }
+}
+
+fn build_rope_cache(
+    max_len: usize,
+    head_dim: usize,
+    theta: f64,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let half = head_dim / 2;
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|i| 1.0 / theta.powf(i as f64 * 2.0 / head_dim as f64) as f32)
+        .collect();
+    let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
+    let positions: Vec<f32> = (0..max_len).map(|i| i as f32).collect();
+    let positions = Tensor::new(positions.as_slice(), device)?;
+    let freqs = positions.unsqueeze(1)?.matmul(&inv_freq.unsqueeze(0)?)?;
+    Ok((freqs.cos()?, freqs.sin()?))
+}
+
+fn build_key_padding_mask(
+    lengths: &[usize],
+    seq_len: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mut mask = Vec::with_capacity(lengths.len() * seq_len);
+    for &len in lengths {
+        for pos in 0..seq_len {
+            mask.push(if pos < len { 0.0 } else { f32::NEG_INFINITY });
+        }
+    }
+    Tensor::new(mask.as_slice(), device)?
+        .reshape((lengths.len(), 1, 1, seq_len))?
+        .to_dtype(dtype)
+}
+
+fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    // x: (batch, heads, seq, head_dim), cos/sin: (seq, half_dim)
+    let dtype = x.dtype();
+    let half = x.dim(3)? / 2;
+    let x1 = x.narrow(3, 0, half)?.contiguous()?;
+    let x2 = x.narrow(3, half, half)?.contiguous()?;
+    let cos = cos.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?;
+    let sin = sin.to_dtype(dtype)?.unsqueeze(0)?.unsqueeze(0)?;
+    let r1 = x1
+        .broadcast_mul(&cos)?
+        .broadcast_sub(&x2.broadcast_mul(&sin)?)?;
+    let r2 = x2
+        .broadcast_mul(&cos)?
+        .broadcast_add(&x1.broadcast_mul(&sin)?)?;
+    Tensor::cat(&[&r1, &r2], 3)?.contiguous()
+}
+
+#[derive(Debug, Clone)]
+struct Attention {
+    wqkv: Linear,
+    wo: Linear,
+    n_heads: usize,
+    head_dim: usize,
+}
+
+impl Attention {
+    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let wqkv = candle_nn::linear_no_bias(cfg.hidden_size, 3 * cfg.hidden_size, vb.pp("Wqkv"))?;
+        let wo = candle_nn::linear_no_bias(cfg.hidden_size, cfg.hidden_size, vb.pp("Wo"))?;
+        Ok(Self {
+            wqkv,
+            wo,
+            n_heads: cfg.num_attention_heads,
+            head_dim,
+        })
+    }
+
+    fn forward(
+        &self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        local_window: Option<usize>,
+        key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b, s, _) = xs.dims3()?;
+        let qkv = self.wqkv.forward(xs)?;
+        let qkv = qkv
+            .reshape((b, s, 3, self.n_heads, self.head_dim))?
+            .permute((2, 0, 3, 1, 4))?
+            .contiguous()?;
+        let (q, k, v) = if matches!(qkv.device(), Device::Cpu) {
+            let qkv = crate::fast_ops::modernbert_rope_qkv(&qkv, cos, sin)?;
+            (qkv.get(0)?, qkv.get(1)?, qkv.get(2)?)
+        } else {
+            (
+                apply_rope(&qkv.get(0)?, cos, sin)?,
+                apply_rope(&qkv.get(1)?, cos, sin)?,
+                qkv.get(2)?,
+            )
+        };
+
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        if let Some(w) = local_window {
+            if crate::fast_ops::should_use_modernbert_local_attention(s, w)
+                && matches!(q.device(), Device::Cpu)
+            {
+                let out = crate::fast_ops::modernbert_local_attention(&q, &k, &v, scale as f32, w)?;
+                let out = out.transpose(1, 2)?.contiguous()?.reshape((
+                    b,
+                    s,
+                    self.n_heads * self.head_dim,
+                ))?;
+                return self.wo.forward(&out);
+            }
+        }
+
+        let mut attn = (q.matmul(&k.t()?)? * scale)?;
+
+        // Apply sliding window mask for local attention layers.
+        // local_window = local_attention (full window size, e.g. 128).
+        // Half-window = local_attention / 2 = sliding_window from HF config.
+        if let Some(w) = local_window {
+            if s > w {
+                let half_w = w / 2;
+                let mask: Vec<f32> = (0..s)
+                    .flat_map(|i| {
+                        (0..s).map(move |j| {
+                            if (i as isize - j as isize).unsigned_abs() <= half_w {
+                                0.0
+                            } else {
+                                f32::NEG_INFINITY
+                            }
+                        })
+                    })
+                    .collect();
+                let mask = Tensor::new(mask.as_slice(), attn.device())?
+                    .reshape((1, 1, s, s))?
+                    .to_dtype(attn.dtype())?;
+                attn = attn.broadcast_add(&mask)?;
+            }
+        }
+        if let Some(mask) = key_padding_mask {
+            attn = attn.broadcast_add(mask)?;
+        }
+
+        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        let out = attn.matmul(&v)?;
+        let out =
+            out.transpose(1, 2)?
+                .contiguous()?
+                .reshape((b, s, self.n_heads * self.head_dim))?;
+        self.wo.forward(&out)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Mlp {
+    wi: Linear,
+    wo: Linear,
+    intermediate_size: usize,
+    activation: Activation,
+    fast_activation: crate::fast_ops::ModernBertActivation,
+}
+
+impl Mlp {
+    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        let wi =
+            candle_nn::linear_no_bias(cfg.hidden_size, 2 * cfg.intermediate_size, vb.pp("Wi"))?;
+        let wo = candle_nn::linear_no_bias(cfg.intermediate_size, cfg.hidden_size, vb.pp("Wo"))?;
+        let (activation, fast_activation) = match cfg.hidden_activation.as_str() {
+            "silu" | "swish" => (
+                Activation::Silu,
+                crate::fast_ops::ModernBertActivation::Silu,
+            ),
+            _ => (
+                Activation::Gelu,
+                crate::fast_ops::ModernBertActivation::Gelu,
+            ),
+        };
+        Ok(Self {
+            wi,
+            wo,
+            intermediate_size: cfg.intermediate_size,
+            activation,
+            fast_activation,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let h = self.wi.forward(xs)?;
+        let h = if matches!(h.device(), Device::Cpu) {
+            crate::fast_ops::modernbert_gated_activation(
+                &h,
+                self.intermediate_size,
+                self.fast_activation,
+            )?
+        } else {
+            let gate = h.narrow(D::Minus1, 0, self.intermediate_size)?;
+            let up = h.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+            self.activation.forward(&gate)?.broadcast_mul(&up)?
+        };
+        self.wo.forward(&h)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Layer {
+    attn_norm: Option<LayerNormNoBias>,
+    attn: Attention,
+    mlp_norm: LayerNormNoBias,
+    mlp: Mlp,
+}
+
+impl Layer {
+    fn load(i: usize, vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        let attn_norm = if i > 0 {
+            Some(LayerNormNoBias::load(
+                cfg.hidden_size,
+                cfg.norm_eps,
+                vb.pp("attn_norm"),
+            )?)
+        } else {
+            None
+        };
+        let attn = Attention::load(vb.pp("attn"), cfg)?;
+        let mlp_norm = LayerNormNoBias::load(cfg.hidden_size, cfg.norm_eps, vb.pp("mlp_norm"))?;
+        let mlp = Mlp::load(vb.pp("mlp"), cfg)?;
+        Ok(Self {
+            attn_norm,
+            attn,
+            mlp_norm,
+            mlp,
+        })
+    }
+
+    fn forward(
+        &self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        local_window: Option<usize>,
+        key_padding_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let normed = match &self.attn_norm {
+            Some(norm) => norm.forward(xs)?,
+            None => xs.clone(),
+        };
+        let attn = self
+            .attn
+            .forward(&normed, cos, sin, local_window, key_padding_mask)?
+            .to_dtype(xs.dtype())?;
+        let xs = (xs + attn)?;
+        let normed = self.mlp_norm.forward(&xs)?;
+        let mlp = self.mlp.forward(&normed)?.to_dtype(xs.dtype())?;
+        xs + mlp
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Encoder {
+    embedding: candle_nn::Embedding,
+    embedding_norm: LayerNormNoBias,
+    layers: Vec<Layer>,
+    final_norm: LayerNormNoBias,
+    local_rope_cos: Tensor,
+    local_rope_sin: Tensor,
+    global_rope_cos: Tensor,
+    global_rope_sin: Tensor,
+    local_attention: usize,
+    global_attn_every_n: usize,
+}
+
+impl Encoder {
+    fn load(vb: VarBuilder, cfg: &Config, device: &Device) -> Result<Self> {
+        let vb_enc = vb.pp("encoder");
+        let embedding = candle_nn::embedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            vb_enc.pp("embeddings").pp("tok_embeddings"),
+        )?;
+        let embedding_norm = LayerNormNoBias::load(
+            cfg.hidden_size,
+            cfg.norm_eps,
+            vb_enc.pp("embeddings").pp("norm"),
+        )?;
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|i| Layer::load(i, vb_enc.pp("layers").pp(i.to_string()), cfg))
+            .collect::<Result<Vec<_>>>()?;
+        let final_norm =
+            LayerNormNoBias::load(cfg.hidden_size, cfg.norm_eps, vb_enc.pp("final_norm"))?;
+        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let local_theta = cfg.rope_theta;
+        let global_theta = cfg.global_rope_theta.unwrap_or(local_theta);
+        let (local_rope_cos, local_rope_sin) =
+            build_rope_cache(8192, head_dim, local_theta, device)?;
+        let (global_rope_cos, global_rope_sin) = if global_theta == local_theta {
+            (local_rope_cos.clone(), local_rope_sin.clone())
+        } else {
+            build_rope_cache(8192, head_dim, global_theta, device)?
+        };
+        Ok(Self {
+            embedding,
+            embedding_norm,
+            layers,
+            final_norm,
+            local_rope_cos,
+            local_rope_sin,
+            global_rope_cos,
+            global_rope_sin,
+            local_attention: cfg.local_attention,
+            global_attn_every_n: cfg.global_attn_every_n_layers,
+        })
+    }
+
+    fn forward(&self, input_ids: &Tensor, lengths: Option<&[usize]>) -> Result<Tensor> {
+        let seq_len = input_ids.dim(D::Minus1)?;
+        let mut xs = self
+            .embedding_norm
+            .forward(&self.embedding.forward(input_ids)?)?;
+        let key_padding_mask = lengths
+            .map(|lengths| build_key_padding_mask(lengths, seq_len, xs.device(), xs.dtype()))
+            .transpose()?;
+        let local_cos = self.local_rope_cos.narrow(0, 0, seq_len)?;
+        let local_sin = self.local_rope_sin.narrow(0, 0, seq_len)?;
+        let global_cos = self.global_rope_cos.narrow(0, 0, seq_len)?;
+        let global_sin = self.global_rope_sin.narrow(0, 0, seq_len)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let is_global = self.global_attn_every_n > 0 && i % self.global_attn_every_n == 0;
+            let (cos, sin, local_window) = if is_global {
+                (&global_cos, &global_sin, None)
+            } else {
+                (&local_cos, &local_sin, Some(self.local_attention))
+            };
+            xs = layer.forward(&xs, cos, sin, local_window, key_padding_mask.as_ref())?;
+        }
+        self.final_norm.forward(&xs)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Projection {
+    Linear(Linear),
+    Mlp { fc1: Linear, fc2: Linear },
+}
+
+impl Projection {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Linear(l) => l.forward(xs),
+            Self::Mlp { fc1, fc2 } => fc2.forward(&Activation::Gelu.forward(&fc1.forward(xs)?)?),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TokenGate {
+    norm: LayerNormWithBias,
+    linear: Linear,
+}
+
+impl TokenGate {
+    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+        let norm = LayerNormWithBias::load(cfg.hidden_size, cfg.norm_eps, vb.pp("token_gate_norm"))?;
+        let linear = candle_nn::linear(cfg.hidden_size, 1, vb.pp("token_gate"))?;
+        Ok(Self { norm, linear })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.linear.forward(&self.norm.forward(xs)?)?.squeeze(D::Minus1)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct T5EncoderModel {
+    encoder: Encoder,
+    projection: Projection,
+    token_gate: Option<TokenGate>,
+    device: Device,
+}
+
+impl T5EncoderModel {
+    pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.projection.forward(&self.encoder.forward(input_ids, None)?)
+    }
+
+    pub fn forward_with_gate(&self, input_ids: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
+        let encoder_output = self.encoder.forward(input_ids, None)?;
+        let gate = self
+            .token_gate
+            .as_ref()
+            .map(|gate| gate.forward(&encoder_output))
+            .transpose()?;
+        let output = self.projection.forward(&encoder_output)?;
+        Ok((output, gate))
+    }
+
+    pub fn forward_with_gate_for_lengths(
+        &self,
+        input_ids: &Tensor,
+        lengths: &[usize],
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let encoder_output = self.encoder.forward(input_ids, Some(lengths))?;
+        let gate = self
+            .token_gate
+            .as_ref()
+            .map(|gate| gate.forward(&encoder_output))
+            .transpose()?;
+        let output = self.projection.forward(&encoder_output)?;
+        Ok((output, gate))
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+pub struct T5ModelBuilder {
+    config: Config,
+}
+
+impl T5ModelBuilder {
+    pub fn load(assets: &std::path::Path) -> candle_core::Result<(Self, Tokenizer)> {
+        let cfg_bytes = CONFIG
+            .bytes(assets)
+            .map_err(|_| Error::other("failed to read modernbert-config.json"))?;
+        let config: Config = serde_json::from_slice(cfg_bytes)
+            .map_err(|e| Error::other(format!("failed to parse config: {e}")))?;
+        let tok_bytes = TOKENIZER
+            .bytes(assets)
+            .map_err(|_| Error::other("failed to read modernbert-tokenizer.json"))?;
+        let tokenizer = Tokenizer::from_bytes(tok_bytes)
+            .map_err(|e| Error::other(format!("failed to parse tokenizer: {e}")))?;
+        Ok((Self { config }, tokenizer))
+    }
+
+    pub fn build_encoder(
+        &self,
+        device: &Device,
+        assets: &std::path::Path,
+    ) -> candle_core::Result<T5EncoderModel> {
+        let model_bytes = MODEL
+            .bytes(assets)
+            .map_err(|_| Error::other("failed to read modernbert.safetensors"))?;
+        let vb = candle_nn::VarBuilder::from_buffered_safetensors(
+            model_bytes.to_vec(),
+            model_dtype(device)?,
+            device,
+        )?;
+        let projection = if let Some(mid) = self.config.projection_mlp {
+            let fc1 = candle_nn::linear(self.config.hidden_size, mid, vb.pp("linear").pp("0"))?;
+            let fc2 = candle_nn::linear(mid, self.config.projection_dim, vb.pp("linear").pp("2"))?;
+            Projection::Mlp { fc1, fc2 }
+        } else {
+            Projection::Linear(candle_nn::linear(
+                self.config.hidden_size,
+                self.config.projection_dim,
+                vb.pp("linear"),
+            )?)
+        };
+        let token_gate = if self.config.token_gate {
+            Some(TokenGate::load(vb.clone(), &self.config)?)
+        } else {
+            None
+        };
+        let encoder = Encoder::load(vb, &self.config, device)
+            .map_err(|e| Error::other(format!("failed to load encoder: {e}")))?;
+        Ok(T5EncoderModel {
+            encoder,
+            projection,
+            token_gate,
+            device: device.clone(),
+        })
+    }
+}
+
+fn model_dtype(device: &Device) -> candle_core::Result<DType> {
+    let default = if matches!(device, Device::Cpu) {
+        "f32"
+    } else {
+        "f16"
+    };
+    match std::env::var("WITCHCRAFT_MODEL_DTYPE")
+        .unwrap_or_else(|_| default.to_owned())
+        .to_lowercase()
+        .as_str()
+    {
+        "f32" | "fp32" | "float32" => Ok(DType::F32),
+        "f16" | "fp16" | "float16" => Ok(DType::F16),
+        "bf16" | "bfloat16" => Ok(DType::BF16),
+        other => candle_core::bail!(
+            "unsupported WITCHCRAFT_MODEL_DTYPE {other:?}; expected f32, f16, or bf16"
+        ),
+    }
+}

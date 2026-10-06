@@ -2,9 +2,11 @@ target
 warp.node
 warp-cli
 /pickbrain
+libwitchcraft.dylib
+libwitchcraft.so
+witchcraft.dll
 .claude/
 
-# Uncompressed OpenVINO model files (large, not versioned)
 assets/*
 assets/*
 
@@ -26,15 +28,24 @@ __pycache__/
 *.pyc
 env/
 
-# Decompressed dataset/testset files (versioned as .zst)
+# Generated or decompressed dataset/testset files
 datasets/nfcorpus.tsv
 testset/nfcorpus/collection_map.json
 testset/nfcorpus/qrels.test.json
 testset/nfcorpus/questions.test.tsv
+datasets/treccovid.tsv
+testset/treccovid/collection_map.json
+testset/treccovid/qrels.test.json
+testset/treccovid/questions.test.tsv
+.cache/
+
+# Generated Neso AOT outputs.
+kernels/out/*
+!kernels/out/kernels_metal_nosimd.tar.zst
+!kernels/out/kernels_dxil.tar.zst
 
 # Test/local data
 backup/
 scifact/
-openvino_model/
 xtr-base-en/
 *.safetensors

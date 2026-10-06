@@ -1,0 +1,234 @@
+use anyhow::{Context, Result};
+use std::fs::{self, File};
+use std::io::{Cursor, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const MAGIC: [u8; 8] = *b"WEMB0001";
+const HASH_CHARS: usize = 32;
+
+#[derive(Clone, Debug)]
+pub struct CachedEmbeddings {
+    pub model: String,
+    pub counts: String,
+    pub embedding_count: usize,
+    pub embeddings: Vec<u8>,
+}
+
+impl CachedEmbeddings {
+    pub fn to_cache_entry_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(
+            MAGIC.len()
+                + std::mem::size_of::<u32>() * 2
+                + std::mem::size_of::<u64>() * 2
+                + self.model.len()
+                + self.counts.len()
+                + self.embeddings.len(),
+        );
+        out.extend_from_slice(&MAGIC);
+        write_u32(&mut out, self.model.len())?;
+        write_u32(&mut out, self.counts.len())?;
+        write_u64(&mut out, self.embedding_count)?;
+        write_u64(&mut out, self.embeddings.len())?;
+        out.extend_from_slice(self.model.as_bytes());
+        out.extend_from_slice(self.counts.as_bytes());
+        out.extend_from_slice(&self.embeddings);
+        Ok(out)
+    }
+
+    pub fn from_cache_entry_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cursor = Cursor::new(bytes);
+        let mut magic = [0u8; MAGIC.len()];
+        cursor.read_exact(&mut magic)?;
+        anyhow::ensure!(magic == MAGIC, "bad embedding cache magic");
+
+        let model_len = read_u32(&mut cursor)? as usize;
+        let counts_len = read_u32(&mut cursor)? as usize;
+        let embedding_count = read_u64(&mut cursor)? as usize;
+        let embeddings_len = read_u64(&mut cursor)? as usize;
+
+        let mut model = vec![0u8; model_len];
+        cursor.read_exact(&mut model)?;
+        let model = String::from_utf8(model).context("model id is not UTF-8")?;
+
+        let mut counts = vec![0u8; counts_len];
+        cursor.read_exact(&mut counts)?;
+        let counts = String::from_utf8(counts).context("counts are not UTF-8")?;
+
+        let mut embeddings = vec![0u8; embeddings_len];
+        cursor.read_exact(&mut embeddings)?;
+        anyhow::ensure!(
+            cursor.position() == bytes.len() as u64,
+            "embedding cache entry has trailing bytes"
+        );
+
+        Ok(CachedEmbeddings {
+            model,
+            counts,
+            embedding_count,
+            embeddings,
+        })
+    }
+}
+
+pub trait EmbeddingCache {
+    fn get(&self, hash: &str) -> Result<Option<CachedEmbeddings>>;
+    fn get_for_document(&self, _rowid: u64, hash: &str) -> Result<Option<CachedEmbeddings>> {
+        self.get(hash)
+    }
+    fn put(&self, hash: &str, embeddings: &CachedEmbeddings) -> Result<()>;
+}
+
+#[derive(Clone, Debug)]
+pub struct FileEmbeddingCache {
+    root: PathBuf,
+}
+
+impl FileEmbeddingCache {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn path_for_hash(&self, hash: &str) -> Result<PathBuf> {
+        anyhow::ensure!(
+            hash.len() == HASH_CHARS && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "embedding cache key must be a {HASH_CHARS}-character hex chunk hash: {hash}"
+        );
+        Ok(self.root.join(hash))
+    }
+
+    fn temp_path_for_hash(&self, hash: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        self.root
+            .join(format!(".{hash}.{}.{}.tmp", std::process::id(), nonce))
+    }
+}
+
+impl EmbeddingCache for FileEmbeddingCache {
+    fn get(&self, hash: &str) -> Result<Option<CachedEmbeddings>> {
+        let path = self.path_for_hash(hash)?;
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).with_context(|| {
+                format!("failed to open embedding cache entry {}", path.display())
+            }),
+        };
+
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read embedding cache entry {}", path.display()))?;
+        CachedEmbeddings::from_cache_entry_bytes(&bytes)
+            .with_context(|| format!("failed to parse embedding cache entry {}", path.display()))
+            .map(Some)
+    }
+
+    fn put(&self, hash: &str, embeddings: &CachedEmbeddings) -> Result<()> {
+        let path = self.path_for_hash(hash)?;
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("failed to create {}", self.root.display()))?;
+
+        let tmp_path = self.temp_path_for_hash(hash);
+        let result = (|| -> Result<()> {
+            let mut file = File::create(&tmp_path).with_context(|| {
+                format!("failed to create temporary cache entry {}", tmp_path.display())
+            })?;
+
+            file.write_all(&MAGIC)?;
+            write_u32(&mut file, embeddings.model.len())?;
+            write_u32(&mut file, embeddings.counts.len())?;
+            write_u64(&mut file, embeddings.embedding_count)?;
+            write_u64(&mut file, embeddings.embeddings.len())?;
+            file.write_all(embeddings.model.as_bytes())?;
+            file.write_all(embeddings.counts.as_bytes())?;
+            file.write_all(&embeddings.embeddings)?;
+            file.flush()?;
+            fs::rename(&tmp_path, &path).with_context(|| {
+                format!(
+                    "failed to move temporary cache entry {} to {}",
+                    tmp_path.display(),
+                    path.display()
+                )
+            })?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        result
+    }
+}
+
+fn read_u32(reader: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0u8; std::mem::size_of::<u32>()];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0u8; std::mem::size_of::<u64>()];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn write_u32(writer: &mut impl Write, value: usize) -> Result<()> {
+    writer.write_all(&u32::try_from(value)?.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_u64(writer: &mut impl Write, value: usize) -> Result<()> {
+    writer.write_all(&u64::try_from(value)?.to_le_bytes())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CachedEmbeddings, EmbeddingCache, FileEmbeddingCache};
+
+    #[test]
+    fn file_cache_round_trips_cached_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileEmbeddingCache::new(dir.path());
+        let hash = "0123456789abcdef0123456789abcdef";
+        let value = CachedEmbeddings {
+            model: "xtr-base-en".to_string(),
+            counts: "1,2,3".to_string(),
+            embedding_count: 6,
+            embeddings: vec![1, 2, 3, 4],
+        };
+
+        let bytes = value.to_cache_entry_bytes().unwrap();
+        assert_eq!(&bytes[..8], b"WEMB0001");
+        let decoded = CachedEmbeddings::from_cache_entry_bytes(&bytes).unwrap();
+        assert_eq!(decoded.model, value.model);
+        assert_eq!(decoded.counts, value.counts);
+        assert_eq!(decoded.embedding_count, value.embedding_count);
+        assert_eq!(decoded.embeddings, value.embeddings);
+
+        cache.put(hash, &value).unwrap();
+        let loaded = cache.get(hash).unwrap().unwrap();
+
+        assert_eq!(loaded.model, value.model);
+        assert_eq!(loaded.counts, value.counts);
+        assert_eq!(loaded.embedding_count, value.embedding_count);
+        assert_eq!(loaded.embeddings, value.embeddings);
+    }
+
+    #[test]
+    fn file_cache_missing_entry_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileEmbeddingCache::new(dir.path());
+        assert!(cache
+            .get("0123456789abcdef0123456789abcdef")
+            .unwrap()
+            .is_none());
+    }
+}

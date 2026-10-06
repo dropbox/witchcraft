@@ -2,18 +2,19 @@
 //!
 //! Provides `MatMul`, a drop-in replacement for candle's `QMatMul` that uses
 //! column-tiled loops for better L1 cache behavior on x86.
-//! Pre-dequantized weights use fbgemm-rs bf16 packed GEMM when available
-//! (halves weight memory, reduces cache pressure), otherwise plain candle
-//! matmul (Accelerate BLAS on macOS).
+//! Pre-dequantized weights use fbgemm-rs packed GEMM when available:
+//! int8 on AVX512-VNNI CPUs, BF16 elsewhere.
 
 use candle_core::backend::BackendStorage;
 use candle_core::quantized::k_quants::*;
 use candle_core::quantized::{GgmlDType, GgmlType, QTensor};
 use candle_core::{CpuStorage, CustomOp1, DType, Layout, Module, Result, Shape, Tensor};
 #[cfg(feature = "fbgemm")]
-use fbgemm_rs::PackedMatrixBf16;
+use fbgemm_rs::{PackedBMatrixI8, PackedMatrixBf16};
 use rayon::prelude::*;
 use std::sync::Arc;
+#[cfg(feature = "fbgemm")]
+use std::sync::Mutex;
 
 fn as_block_slice<T>(data: &[u8]) -> &[T] {
     let size = std::mem::size_of::<T>();
@@ -246,10 +247,91 @@ impl CustomOp1 for QGatedMatMul {
     }
 }
 
-// ---- fbgemm-rs bf16 packed GEMM via pre-packed weights ----
+// ---- fbgemm-rs packed GEMM via pre-packed weights ----
+
+#[cfg(feature = "fbgemm")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FbgemmPacking {
+    Bf16,
+    I8,
+}
+
+#[cfg(feature = "fbgemm")]
+fn fbgemm_packing_mode() -> FbgemmPacking {
+    if cpu_has_avx512_vnni_path() {
+        FbgemmPacking::I8
+    } else {
+        FbgemmPacking::Bf16
+    }
+}
+
+#[cfg(all(feature = "fbgemm", target_arch = "x86_64"))]
+fn cpu_has_avx512_vnni_path() -> bool {
+    is_x86_feature_detected!("avx512f")
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vl")
+        && is_x86_feature_detected!("avx512vnni")
+}
+
+#[cfg(all(feature = "fbgemm", not(target_arch = "x86_64")))]
+fn cpu_has_avx512_vnni_path() -> bool {
+    false
+}
 
 #[cfg(feature = "fbgemm")]
 struct FbgemmBf16Op(Arc<PackedMatrixBf16>);
+
+#[cfg(feature = "fbgemm")]
+struct FbgemmI8Op(
+    Arc<PackedBMatrixI8>,
+    Arc<Vec<f32>>,
+    Arc<Mutex<fbgemm_rs::I8GemmScratch>>,
+);
+
+#[cfg(feature = "fbgemm")]
+struct FbgemmBf16GatedGeluOp(Arc<PackedMatrixBf16>, Arc<PackedMatrixBf16>);
+
+#[cfg(feature = "fbgemm")]
+struct FbgemmI8GatedGeluOp(
+    Arc<PackedBMatrixI8>,
+    Arc<Vec<f32>>,
+    Arc<Mutex<fbgemm_rs::I8GemmScratch>>,
+    Arc<PackedBMatrixI8>,
+    Arc<Vec<f32>>,
+    Arc<Mutex<fbgemm_rs::I8GemmScratch>>,
+);
+
+#[cfg(feature = "fbgemm")]
+fn checked_f32_input<'a>(
+    op_name: &str,
+    storage: &'a CpuStorage,
+    layout: &Layout,
+    k: usize,
+    n: usize,
+) -> Result<(&'a [f32], Shape, usize)> {
+    if !layout.is_contiguous() {
+        candle_core::bail!("input tensor is not contiguous {layout:?}")
+    }
+    let src_shape = layout.shape();
+    if src_shape.rank() < 2 {
+        candle_core::bail!("input tensor has only one dimension {layout:?}")
+    }
+    let mut dst_shape = src_shape.dims().to_vec();
+    let last_k = dst_shape.pop().unwrap();
+    if last_k != k {
+        candle_core::bail!("input tensor {layout:?} incompatible with packed matrix ({k}x{n})")
+    }
+    dst_shape.push(n);
+    let dst_shape = Shape::from(dst_shape);
+    let m = dst_shape.elem_count() / n;
+
+    if storage.dtype() != DType::F32 {
+        candle_core::bail!("{op_name} only supports f32 input")
+    }
+    let slice = storage.as_slice::<f32>()?;
+    let slice = &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
+    Ok((slice, dst_shape, m))
+}
 
 #[cfg(feature = "fbgemm")]
 impl CustomOp1 for FbgemmBf16Op {
@@ -258,37 +340,164 @@ impl CustomOp1 for FbgemmBf16Op {
     }
 
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
-        if !layout.is_contiguous() {
-            candle_core::bail!("input tensor is not contiguous {layout:?}")
-        }
-        let src_shape = layout.shape();
         let k = self.0.k();
         let n = self.0.n();
-        if src_shape.rank() < 2 {
-            candle_core::bail!("input tensor has only one dimension {layout:?}")
-        }
-        let mut dst_shape = src_shape.dims().to_vec();
-        let last_k = dst_shape.pop().unwrap();
-        if last_k != k {
-            candle_core::bail!(
-                "input tensor {layout:?} incompatible with packed bf16 matrix ({k}x{n})"
-            )
-        }
-        dst_shape.push(n);
-        let dst_shape = Shape::from(dst_shape);
-        let m = dst_shape.elem_count() / n;
-
-        if storage.dtype() != DType::F32 {
-            candle_core::bail!("FbgemmBf16Op only supports f32 input")
-        }
-        let slice = storage.as_slice::<f32>()?;
-        let slice = &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
+        let (slice, dst_shape, m) = checked_f32_input(self.name(), storage, layout, k, n)?;
         let mut dst_storage = vec![0f32; dst_shape.elem_count()];
 
         fbgemm_rs::sgemm_bf16_simple(m, slice, &self.0, &mut dst_storage);
 
         Ok((CpuStorage::F32(dst_storage), dst_shape))
     }
+}
+
+#[cfg(feature = "fbgemm")]
+impl CustomOp1 for FbgemmI8Op {
+    fn name(&self) -> &'static str {
+        "fbgemm-i8-matmul"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        let k = self.0.k();
+        let n = self.0.n();
+        let (slice, dst_shape, m) = checked_f32_input(self.name(), storage, layout, k, n)?;
+        let mut dst_storage = vec![0f32; dst_shape.elem_count()];
+
+        let mut scratch = self
+            .2
+            .lock()
+            .map_err(|_| candle_core::Error::Msg("i8 GEMM scratch lock poisoned".into()))?;
+        fbgemm_rs::i8gemm_f32_with_scratch(m, slice, &self.0, 1.0, &mut dst_storage, &mut scratch);
+        apply_column_scales(&mut dst_storage, n, &self.1);
+
+        Ok((CpuStorage::F32(dst_storage), dst_shape))
+    }
+}
+
+#[cfg(feature = "fbgemm")]
+impl CustomOp1 for FbgemmBf16GatedGeluOp {
+    fn name(&self) -> &'static str {
+        "fbgemm-bf16-gated-gelu"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        let k = self.0.k();
+        let n = self.0.n();
+        if self.1.k() != k || self.1.n() != n {
+            candle_core::bail!(
+                "gated fbgemm weight shape mismatch: gate is {}x{}, up is {}x{}",
+                k,
+                n,
+                self.1.k(),
+                self.1.n()
+            )
+        }
+        let (slice, dst_shape, m) = checked_f32_input(self.name(), storage, layout, k, n)?;
+        let mut gate = vec![0f32; dst_shape.elem_count()];
+        let mut dst_storage = vec![0f32; dst_shape.elem_count()];
+
+        fbgemm_rs::sgemm_bf16_simple(m, slice, &self.0, &mut gate);
+        fbgemm_rs::sgemm_bf16_simple(m, slice, &self.1, &mut dst_storage);
+
+        for (gate, up) in gate.into_iter().zip(dst_storage.iter_mut()) {
+            let gate = 0.5
+                * gate
+                * (1.0 + fast_tanh(0.7978845608_f32 * gate * (1.0 + 0.044715 * gate * gate)));
+            *up *= gate;
+        }
+
+        Ok((CpuStorage::F32(dst_storage), dst_shape))
+    }
+}
+
+#[cfg(feature = "fbgemm")]
+impl CustomOp1 for FbgemmI8GatedGeluOp {
+    fn name(&self) -> &'static str {
+        "fbgemm-i8-gated-gelu"
+    }
+
+    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        let k = self.0.k();
+        let n = self.0.n();
+        if self.3.k() != k || self.3.n() != n {
+            candle_core::bail!(
+                "gated fbgemm weight shape mismatch: gate is {}x{}, up is {}x{}",
+                k,
+                n,
+                self.3.k(),
+                self.3.n()
+            )
+        }
+        let (slice, dst_shape, m) = checked_f32_input(self.name(), storage, layout, k, n)?;
+        let mut gate = vec![0f32; dst_shape.elem_count()];
+        let mut dst_storage = vec![0f32; dst_shape.elem_count()];
+
+        {
+            let mut scratch = self
+                .2
+                .lock()
+                .map_err(|_| candle_core::Error::Msg("i8 GEMM scratch lock poisoned".into()))?;
+            fbgemm_rs::i8gemm_f32_with_scratch(m, slice, &self.0, 1.0, &mut gate, &mut scratch);
+            apply_column_scales(&mut gate, n, &self.1);
+        }
+        {
+            let mut scratch = self
+                .5
+                .lock()
+                .map_err(|_| candle_core::Error::Msg("i8 GEMM scratch lock poisoned".into()))?;
+            fbgemm_rs::i8gemm_f32_with_scratch(
+                m,
+                slice,
+                &self.3,
+                1.0,
+                &mut dst_storage,
+                &mut scratch,
+            );
+            apply_column_scales(&mut dst_storage, n, &self.4);
+        }
+
+        for (gate, up) in gate.into_iter().zip(dst_storage.iter_mut()) {
+            let gate = 0.5
+                * gate
+                * (1.0 + fast_tanh(0.7978845608_f32 * gate * (1.0 + 0.044715 * gate * gate)));
+            *up *= gate;
+        }
+
+        Ok((CpuStorage::F32(dst_storage), dst_shape))
+    }
+}
+
+#[cfg(feature = "fbgemm")]
+fn apply_column_scales(values: &mut [f32], n: usize, scales: &[f32]) {
+    debug_assert_eq!(scales.len(), n);
+    for row in values.chunks_exact_mut(n) {
+        for (value, scale) in row.iter_mut().zip(scales) {
+            *value *= *scale;
+        }
+    }
+}
+
+#[cfg(feature = "fbgemm")]
+fn quantize_weight_i8_transposed(k: usize, n: usize, data: &[f32]) -> (PackedBMatrixI8, Vec<f32>) {
+    let mut scales = vec![1.0f32; n];
+    let mut quantized = vec![0i8; k * n];
+    for col in 0..n {
+        let mut max_abs = 0f32;
+        for row in 0..k {
+            max_abs = max_abs.max(data[col * k + row].abs());
+        }
+        if max_abs == 0.0 {
+            continue;
+        }
+        let scale = max_abs / 127.0;
+        scales[col] = scale;
+        let inv_scale = scale.recip();
+        for row in 0..k {
+            let value = data[col * k + row];
+            quantized[row * n + col] = (value * inv_scale).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    (PackedBMatrixI8::new(k, n, &quantized), scales)
 }
 
 // ---- MatMul: drop-in replacement for QMatMul ----
@@ -300,6 +509,12 @@ pub enum MatMul {
     QTensor(Arc<QTensor>),
     #[cfg(feature = "fbgemm")]
     PackedBf16(Arc<PackedMatrixBf16>),
+    #[cfg(feature = "fbgemm")]
+    PackedI8(
+        Arc<PackedBMatrixI8>,
+        Arc<Vec<f32>>,
+        Arc<Mutex<fbgemm_rs::I8GemmScratch>>,
+    ),
     Tensor(Tensor),
 }
 
@@ -309,6 +524,10 @@ impl Clone for MatMul {
             Self::QTensor(qt) => Self::QTensor(qt.clone()),
             #[cfg(feature = "fbgemm")]
             Self::PackedBf16(p) => Self::PackedBf16(p.clone()),
+            #[cfg(feature = "fbgemm")]
+            Self::PackedI8(p, scales, scratch) => {
+                Self::PackedI8(p.clone(), scales.clone(), scratch.clone())
+            }
             Self::Tensor(t) => Self::Tensor(t.clone()),
         }
     }
@@ -320,6 +539,8 @@ impl std::fmt::Debug for MatMul {
             Self::QTensor(qt) => f.debug_tuple("QTensor").field(qt).finish(),
             #[cfg(feature = "fbgemm")]
             Self::PackedBf16(p) => write!(f, "PackedBf16({}x{})", p.k(), p.n()),
+            #[cfg(feature = "fbgemm")]
+            Self::PackedI8(p, _, _) => write!(f, "PackedI8({}x{})", p.k(), p.n()),
             Self::Tensor(t) => write!(f, "Tensor({:?})", t.shape()),
         }
     }
@@ -330,9 +551,7 @@ impl MatMul {
         Self::QTensor(qt)
     }
 
-    /// Store a dequantized [N, K] weight tensor as bf16-packed for GEMM.
-    /// Uses fbgemm-rs bf16 packed GEMM when available (halves weight memory),
-    /// otherwise plain candle matmul.
+    /// Store a dequantized [N, K] weight tensor in an fbgemm-packed format.
     pub fn from_tensor(t: Tensor) -> Self {
         #[cfg(feature = "fbgemm")]
         {
@@ -345,8 +564,20 @@ impl MatMul {
                     .flatten_all()
                     .and_then(|t| t.to_vec1::<f32>())
                     .expect("weight to f32");
-                let packed = PackedMatrixBf16::from_transposed(k, n, &data);
-                Self::PackedBf16(Arc::new(packed))
+                match fbgemm_packing_mode() {
+                    FbgemmPacking::Bf16 => {
+                        let packed = PackedMatrixBf16::from_transposed(k, n, &data);
+                        Self::PackedBf16(Arc::new(packed))
+                    }
+                    FbgemmPacking::I8 => {
+                        let (packed, scale) = quantize_weight_i8_transposed(k, n, &data);
+                        Self::PackedI8(
+                            Arc::new(packed),
+                            Arc::new(scale),
+                            Arc::new(Mutex::new(fbgemm_rs::I8GemmScratch::new())),
+                        )
+                    }
+                }
             } else {
                 Self::Tensor(t)
             }
@@ -373,6 +604,10 @@ impl Module for MatMul {
             }
             #[cfg(feature = "fbgemm")]
             Self::PackedBf16(p) => xs.apply_op1_no_bwd(&FbgemmBf16Op(p.clone())),
+            #[cfg(feature = "fbgemm")]
+            Self::PackedI8(p, scales, scratch) => {
+                xs.apply_op1_no_bwd(&FbgemmI8Op(p.clone(), scales.clone(), scratch.clone()))
+            }
             Self::Tensor(w) => {
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
@@ -388,6 +623,23 @@ impl Module for MatMul {
 /// Fused gated-gelu: `gelu(xs @ w0.T) * (xs @ w1.T)`.
 pub fn forward_gated_gelu(w0: &MatMul, w1: &MatMul, xs: &Tensor) -> Result<Tensor> {
     match (w0, w1) {
+        #[cfg(feature = "fbgemm")]
+        (MatMul::PackedBf16(w0), MatMul::PackedBf16(w1)) => {
+            let op = FbgemmBf16GatedGeluOp(w0.clone(), w1.clone());
+            xs.apply_op1_no_bwd(&op)
+        }
+        #[cfg(feature = "fbgemm")]
+        (MatMul::PackedI8(w0, scale0, scratch0), MatMul::PackedI8(w1, scale1, scratch1)) => {
+            let op = FbgemmI8GatedGeluOp(
+                w0.clone(),
+                scale0.clone(),
+                scratch0.clone(),
+                w1.clone(),
+                scale1.clone(),
+                scratch1.clone(),
+            );
+            xs.apply_op1_no_bwd(&op)
+        }
         (MatMul::QTensor(w0_qt), MatMul::QTensor(w1_qt)) => {
             // QGatedMatMul custom op is CPU-only; fall back to unfused path on Metal
             if matches!(xs.device(), candle_core::Device::Metal(_)) {

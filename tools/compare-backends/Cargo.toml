@@ -11,12 +11,10 @@ candle-core = { git = "https://github.com/huggingface/candle", rev="0.9.2-alpha.
 candle-nn = { git = "https://github.com/huggingface/candle", rev="0.9.2-alpha.2" }
 candle-transformers = { git = "https://github.com/huggingface/candle", rev="0.9.2-alpha.2" }
 
-tokenizers = "*"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 serde = "*"
 serde_json = "*"
 
-# OpenVINO support (optional)
-openvino = { version = "0.10.0", features = ["runtime-linking"], optional = true }
 tempfile = "*"
 
 # Warp with hybrid-dequant for comparison (fbgemm feature adds fbgemm-rs packed GEMM)
@@ -31,5 +29,4 @@ accelerate-src = { version = "0.3.2", optional = true }
 
 [features]
 accelerate = ["dep:accelerate-src"]
-ov = ["dep:openvino"]
 fbgemm = ["dep:witchcraft"]

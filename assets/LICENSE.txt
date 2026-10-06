@@ -17,8 +17,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
-The included OpenVINO and TBB DLLs are Copyright 2026 Intel Corporation, and
-covered by The Apache License. You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0

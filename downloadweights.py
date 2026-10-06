@@ -45,5 +45,5 @@ print("writing as .safetensors...")
 save_file(fp16_state_dict, "xtr.safetensors")
 print(f"Saved xtr.safetensors with {len(fp16_state_dict)} tensors")
 
-shutil.copy("xtr-base-en/config.json", "assets/config.json")
-shutil.copy("xtr-base-en/tokenizer.json", "assets/tokenizer.json")
+shutil.copy("xtr-base-en/config.json", "assets/xtr-config.json")
+shutil.copy("xtr-base-en/tokenizer.json", "assets/xtr-tokenizer.json")

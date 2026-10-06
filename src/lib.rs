@@ -1,41 +1,79 @@
 use log::{debug, info, warn};
 use once_cell::sync::Lazy;
-#[cfg(feature = "deterministic")]
+use rand::RngExt;
+#[cfg(any(test, feature = "deterministic"))]
 use rand::SeedableRng;
-use rusqlite::{OptionalExtension, Statement};
+#[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::RwLock;
-// Conditionally compile T5 encoder based on features
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+
+mod app_id;
+
+// Conditionally compile encoder backend based on features
 #[cfg(feature = "t5-quantized")]
 pub mod quantized_t5;
 #[cfg(feature = "t5-quantized")]
 use quantized_t5 as t5_encoder;
 pub mod fast_ops;
+#[cfg(all(feature = "modernbert-quantized", any(
+    all(feature = "neso-metal", target_os = "macos"),
+    all(feature = "neso-d3d12", target_os = "windows"),
+)))]
+mod kernel_archive;
 #[cfg(feature = "hybrid-dequant")]
 pub mod fused_matmul;
+#[cfg(all(feature = "neso-metal", feature = "modernbert-quantized", target_os = "macos"))]
+pub mod neso_metal_kernels;
+#[cfg(all(feature = "neso-metal", feature = "modernbert-quantized", target_os = "macos"))]
+mod gpu_modernbert_metal;
+#[cfg(all(feature = "neso-d3d12", feature = "modernbert-quantized", target_os = "windows"))]
+pub mod neso_d3d12_kernels;
+#[cfg(all(feature = "neso-d3d12", feature = "modernbert-quantized", target_os = "windows"))]
+mod gpu_modernbert_d3d12;
 
-#[cfg(feature = "t5-openvino")]
-mod openvino_t5;
-#[cfg(feature = "t5-openvino")]
-use openvino_t5 as t5_encoder;
+#[cfg(feature = "modernbert")]
+pub mod modernbert;
+#[cfg(feature = "modernbert")]
+use modernbert as t5_encoder;
 
-// Compile-time checks for mutual exclusivity
-#[cfg(not(any(feature = "t5-quantized", feature = "t5-openvino")))]
-compile_error!("Must enable exactly one T5 backend: t5-quantized or t5-openvino");
+#[cfg(feature = "modernbert-quantized")]
+pub mod quantized_modernbert;
+#[cfg(feature = "modernbert-quantized")]
+use quantized_modernbert as t5_encoder;
 
-#[cfg(all(feature = "t5-quantized", feature = "t5-openvino"))]
-compile_error!("Cannot enable multiple T5 backends simultaneously");
+// Compile-time checks: exactly one encoder backend required.
+#[cfg(not(any(
+    feature = "t5-quantized",
+    feature = "modernbert",
+    feature = "modernbert-quantized",
+)))]
+compile_error!("Must enable exactly one encoder backend: t5-quantized, modernbert, or modernbert-quantized");
+
+#[cfg(any(
+    all(feature = "t5-quantized", feature = "modernbert"),
+    all(feature = "t5-quantized", feature = "modernbert-quantized"),
+    all(feature = "modernbert", feature = "modernbert-quantized"),
+))]
+compile_error!("Cannot enable multiple encoder backends simultaneously");
 
 // hybrid-dequant is a CPU-only optimization and cannot be used with Metal
 #[cfg(all(feature = "hybrid-dequant", feature = "metal"))]
 compile_error!("hybrid-dequant is incompatible with metal (use accelerate only for CPU, or metal without hybrid-dequant for GPU)");
 
+#[cfg(feature = "sqlite")]
 mod db;
+#[cfg(feature = "sqlite")]
 pub use db::DB;
 
+mod embedding_cache;
+pub use embedding_cache::{CachedEmbeddings, EmbeddingCache, FileEmbeddingCache};
+
 mod embedder;
-pub use embedder::Embedder;
+pub use embedder::{Embedder, EmbeddingOutput};
 
 pub mod assets;
 
@@ -48,17 +86,42 @@ pub mod rans64;
 
 mod merger;
 
+mod file_writer;
+use file_writer::NewFileWriter;
+
+mod file_index;
+use file_index::{
+    active_rowid_records, nway_merge_rowid_records, read_rowid_records,
+    rowid_records_embedding_count, sort_dedup_rowid_records, sync_parent_dir,
+    write_rowid_records_to_writer, FileBackedIndex, FileIndexGeneration, RowidRecord,
+};
+
 mod priority;
 use priority::PriorityManager;
 
+#[cfg(feature = "sqlite")]
 mod progress_reporter;
-use progress_reporter::ProgressReporter;
 
 pub mod types;
 pub use types::SqlStatementInternal;
 
+#[cfg(feature = "sqlite")]
 pub mod sql_generator;
-use sql_generator::build_filter_sql_and_params;
+
+#[cfg(feature = "sqlite")]
+mod sqlite_index;
+#[cfg(feature = "sqlite")]
+pub use sqlite_index::{
+    count_unindexed_cached_embeddings, count_unindexed_embeddings,
+    count_unindexed_embeddings_with_cache, embed_chunks, embed_chunks_with_cache,
+    exact_match_centroids_bulk, fulltext_search, fulltext_search_with_prefix_wildcard,
+    index_chunks, index_chunks_with_cache, index_chunks_with_cache_and_options,
+    index_chunks_with_options, match_centroids, match_centroids_with_cache,
+    match_centroids_with_query_weights, search, search_cached_rowids_with_cache, search_rowids,
+    search_with_fulltext_prefix_wildcard, semantic_index_unavailable_reason,
+};
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) use sqlite_index::fts5_query;
 
 #[cfg(feature = "napi")]
 #[allow(dead_code)]
@@ -67,11 +130,21 @@ mod napi;
 #[cfg(feature = "python")]
 mod python;
 
+mod capi;
+
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
-const EMBEDDING_DIM: usize = 128;
-const RESIDUAL_BYTES: usize = EMBEDDING_DIM / 2; // packed 4-bit residuals
+const DEFAULT_EMBEDDING_DIM: usize = 128;
+#[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
+const DOCUMENT_CACHE_HASH_CHARS: usize = 32;
+const BUCKET_DATA_APP_ID: u32 = file_index::GENERATION_DATA_APP_ID;
+const BUCKET_DATA_VERSION: u32 = file_index::GENERATION_DATA_VERSION;
+const BUCKET_SCALAR_META_BYTES: usize = 20;
+const BUCKET_DATA_HEADER_BYTES: usize = file_index::GENERATION_DATA_HEADER_BYTES;
+const BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA: u32 = 3;
+const BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA: u32 = 4;
+pub(crate) const BUCKET_CENTER_FORMAT: u32 = BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA;
 #[cfg(not(test))]
 const L0_CAPACITY: usize = 1024;
 #[cfg(test)]
@@ -81,17 +154,266 @@ const L0_CAPACITY: usize = 4;
 const LSM_FANOUT: usize = 16;
 #[cfg(test)]
 const LSM_FANOUT: usize = 2;
+const COARSE_TREE_BRANCHING: usize = 16;
+const INDEX_KMEANS_BRANCHING: usize = 128;
+const INDEX_ASSIGNMENT_BEAM: usize = 2;
+const KMEANS_MATMUL_BATCH: usize = 4096;
+const INDEX_KMEANS_ITERATIONS: usize = 10;
+const LEAF_KMEANS_ITERATIONS: usize = 10;
+const INDEX_BATCH_SIZE: usize = 0x10000;
+const INDEX_TARGET_BUCKET_VECTORS: usize = INDEX_BATCH_SIZE / INDEX_KMEANS_BRANCHING;
+const BUCKET_READ_COALESCE_GAP_BYTES: usize = 16 * 1024;
+
+fn weighted_center_indices<R: RngExt + ?Sized>(
+    weights: &[f32],
+    k: usize,
+    rng: &mut R,
+) -> Option<Vec<u32>> {
+    if weights.is_empty() || k == 0 {
+        return Some(vec![]);
+    }
+    if k > weights.len() {
+        return None;
+    }
+
+    let mut keyed = Vec::with_capacity(weights.len());
+    for (idx, &weight) in weights.iter().enumerate() {
+        let weight = weight.max(0.0);
+        if !weight.is_finite() || weight == 0.0 {
+            continue;
+        }
+        let u: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
+        keyed.push((u.ln() / weight as f64, idx));
+    }
+    if keyed.len() < k {
+        return None;
+    }
+
+    keyed.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    keyed.truncate(k);
+    Some(keyed.into_iter().map(|(_, idx)| idx as u32).collect())
+}
 
 /// A document pointer combining document ID and sub-chunk index
 /// Allows precise location of results within subdivided documents
 pub type DocPtr = (u32, u32);
 
+#[derive(Clone, Copy, Debug)]
+pub struct IndexOptions {
+    residual_quant_bits: u8,
+    force_flush: bool,
+}
+
+impl IndexOptions {
+    pub fn new(residual_quant_bits: u8) -> Result<Self> {
+        packops::validate_residual_quant_bits(residual_quant_bits)?;
+        Ok(Self {
+            residual_quant_bits,
+            force_flush: false,
+        })
+    }
+
+    pub fn force_flush(mut self) -> Self {
+        self.force_flush = true;
+        self
+    }
+
+    pub fn residual_quant_bits(&self) -> u8 {
+        self.residual_quant_bits
+    }
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            residual_quant_bits: packops::DEFAULT_RESIDUAL_QUANT_BITS,
+            force_flush: false,
+        }
+    }
+}
+
+fn f32_center_bytes_for_dim(dim: usize) -> usize {
+    dim * std::mem::size_of::<f32>()
+}
+
+fn center_block_bytes_for_count(
+    centroid_count: usize,
+    dim: usize,
+    center_format: u32,
+) -> Result<usize> {
+    match center_format {
+        BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA => {
+            let scale_len = centroid_count
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| anyhow::anyhow!("bucket center scale block length overflow"))?;
+            let row_bytes = packops::signed_q4_row_bytes(dim);
+            centroid_count
+                .checked_mul(row_bytes)
+                .and_then(|code_len| scale_len.checked_add(code_len))
+                .ok_or_else(|| anyhow::anyhow!("bucket center block length overflow"))
+        }
+        _ => anyhow::bail!("bucket center format {center_format} is not supported"),
+    }
+}
+
+fn residual_bytes_for_dim(dim: usize, residual_quant_bits: u8) -> Result<usize> {
+    packops::temp_residual_bytes_for_dim(dim, residual_quant_bits)
+}
+
+fn model_id_prefix() -> &'static str {
+    #[cfg(feature = "t5-quantized")]
+    {
+        "xtr-base-en"
+    }
+    #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+    {
+        "modernbert"
+    }
+}
+
+fn model_id_for_dim(dim: usize) -> String {
+    let prefix = format!(
+        "{}-p{:03}",
+        model_id_prefix(),
+        (document_token_keep_fraction() * 100.0).round() as usize
+    );
+    if dim == DEFAULT_EMBEDDING_DIM {
+        prefix
+    } else {
+        format!("{prefix}-d{dim}")
+    }
+}
+
+fn document_token_keep_fraction() -> f64 {
+    std::env::var("WARP_DOC_TOKEN_KEEP_FRACTION")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
+        .unwrap_or(0.3)
+}
+
+pub fn query_token_salience_enabled() -> bool {
+    !matches!(
+        std::env::var("WARP_QUERY_TOKEN_SALIENCE").as_deref(),
+        Ok("0") | Ok("false") | Ok("False") | Ok("FALSE") | Ok("off") | Ok("OFF")
+    )
+}
+
+fn sigmoid(value: f32) -> f32 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exp = value.exp();
+        exp / (1.0 + exp)
+    }
+}
+
+fn query_weights_from_gate_scores(gate_scores: Vec<f32>) -> Vec<f32> {
+    gate_scores
+        .into_iter()
+        .map(|score| {
+            let weight = sigmoid(score);
+            if weight.is_finite() {
+                weight
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+pub struct QueryEmbeddings {
+    pub embeddings: Tensor,
+    pub weights: Option<Vec<f32>>,
+}
+
+pub fn embed_query_for_search(embedder: &Embedder, text: &str) -> Result<QueryEmbeddings> {
+    if query_token_salience_enabled() {
+        let output = embedder.embed_query_with_gate_scores_and_tokens(text)?;
+        let weights = output
+            .gate_scores
+            .map(query_weights_from_gate_scores)
+            .ok_or_else(|| anyhow::anyhow!("WARP_QUERY_TOKEN_SALIENCE requires token_gate tensors in ModernBERT assets"))?;
+        Ok(QueryEmbeddings {
+            embeddings: output.embeddings.get(0)?,
+            weights: Some(weights),
+        })
+    } else {
+        let (embeddings, _) = embedder.embed_query(text)?;
+        Ok(QueryEmbeddings {
+            embeddings: embeddings.get(0)?,
+            weights: None,
+        })
+    }
+}
+
+pub fn default_embedding_cache_dir() -> PathBuf {
+    PathBuf::from(".embeddings-cache").join(model_id_prefix())
+}
+
+pub fn default_embedding_cache() -> FileEmbeddingCache {
+    FileEmbeddingCache::new(default_embedding_cache_dir())
+}
+
+pub(crate) fn dim_from_model_id(model: &str) -> usize {
+    model
+        .rsplit_once("-d")
+        .and_then(|(_, dim)| dim.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_EMBEDDING_DIM)
+}
+
+fn cached_embeddings_match_current_encoder(embeddings: &CachedEmbeddings) -> bool {
+    embeddings.model == model_id_for_dim(dim_from_model_id(&embeddings.model))
+}
+
+#[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
+pub(crate) fn document_cache_hash(body: &str, lens: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    hasher.update(lens.as_bytes());
+    let hash: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    hash[..DOCUMENT_CACHE_HASH_CHARS].to_string()
+}
+
+fn load_cached_embeddings(
+    cache: &dyn EmbeddingCache,
+    rowid: u64,
+    hash: &str,
+) -> Result<Option<CachedEmbeddings>> {
+    match cache.get_for_document(rowid, hash)? {
+        Some(embeddings) if cached_embeddings_match_current_encoder(&embeddings) => {
+            debug!("embedding cache hit for chunk {hash}");
+            Ok(Some(embeddings))
+        }
+        Some(embeddings) => {
+            debug!(
+                "embedding cache entry for chunk {hash} has stale model {}; recomputing",
+                embeddings.model
+            );
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
 pub fn make_device() -> Device {
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        match Device::new_metal(0) {
-            Ok(device) => device,
-            Err(v) => {
+    if cfg!(target_os = "macos") && (cfg!(target_arch = "aarch64") || cfg!(feature = "neso-metal")) {
+        let previous_panic_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let metal_device = std::panic::catch_unwind(|| Device::new_metal(0));
+        std::panic::set_hook(previous_panic_hook);
+        match metal_device {
+            Ok(Ok(device)) => device,
+            Ok(Err(v)) => {
                 warn!("unable to create metal device: {v}");
+                Device::Cpu
+            }
+            Err(_) => {
+                warn!("unable to create metal device: initialization panicked");
                 Device::Cpu
             }
         }
@@ -134,7 +456,7 @@ pub mod progress {
         }
 
         pub fn finish(&self) {
-            self.pb.finish();
+            self.pb.finish_and_clear();
         }
     }
 }
@@ -210,21 +532,127 @@ fn matmul_argmax_batched(
     Ok(Tensor::from_vec(assignments, m, device)?)
 }
 
-fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
+fn matmul_argmax_scores_batched(
+    t: &Tensor,
+    centers: &fast_ops::PackedRight,
+    batch_size: usize,
+) -> Result<Vec<(u32, f32)>> {
+    let (m, _n) = t.dims2()?;
+    let mut assignments = Vec::with_capacity(m);
+
+    for start in (0..m).step_by(batch_size) {
+        let end = (start + batch_size).min(m);
+        let batch_len = end - start;
+        let batch = t.narrow(0, start, batch_len)?;
+        let sim = centers.matmul(&batch)?.to_device(&Device::Cpu)?;
+        for row in sim.to_vec2::<f32>()? {
+            let mut best_idx = 0u32;
+            let mut best_score = f32::NEG_INFINITY;
+            for (idx, score) in row.into_iter().enumerate() {
+                if score > best_score {
+                    best_idx = idx as u32;
+                    best_score = score;
+                }
+            }
+            assignments.push((best_idx, best_score));
+        }
+    }
+
+    Ok(assignments)
+}
+
+fn matmul_top2_batched(
+    t: &Tensor,
+    centers: &fast_ops::PackedRight,
+    batch_size: usize,
+) -> Result<Vec<(u32, u32)>> {
+    let (m, _n) = t.dims2()?;
+    let mut assignments = Vec::with_capacity(m);
+
+    for start in (0..m).step_by(batch_size) {
+        let end = (start + batch_size).min(m);
+        let batch_len = end - start;
+        let batch = t.narrow(0, start, batch_len)?;
+        let sim = centers.matmul(&batch)?.to_device(&Device::Cpu)?;
+        for row in sim.to_vec2::<f32>()? {
+            let mut best_idx = 0u32;
+            let mut second_idx = 0u32;
+            let mut best_score = f32::NEG_INFINITY;
+            let mut second_score = f32::NEG_INFINITY;
+            for (idx, score) in row.into_iter().enumerate() {
+                if score > best_score {
+                    second_score = best_score;
+                    second_idx = best_idx;
+                    best_score = score;
+                    best_idx = idx as u32;
+                } else if score > second_score {
+                    second_score = score;
+                    second_idx = idx as u32;
+                }
+            }
+            assignments.push((best_idx, second_idx));
+        }
+    }
+
+    Ok(assignments)
+}
+
+fn kmeans_inner(
+    data: &Tensor,
+    weights: Option<&[f32]>,
+    k: usize,
+    max_iter: usize,
+    bar: Option<&progress::Bar>,
+) -> Result<Tensor> {
     let (m, n) = data.dims2()?;
     debug!("kmeans k={} m={} n={}...", k, m, n);
+    if let Some(weights) = weights {
+        anyhow::ensure!(
+            weights.len() == m,
+            "kmeans received {} salience weights for {m} rows",
+            weights.len()
+        );
+    }
+    if k == 1 {
+        let data_flat = data.flatten_all()?.to_vec1::<f32>()?;
+        let mut center = vec![0f32; n];
+        for (row_idx, row) in data_flat.chunks_exact(n).enumerate() {
+            let weight = weights
+                .map(|weights| weights[row_idx])
+                .filter(|weight| weight.is_finite() && *weight > 0.0)
+                .unwrap_or(1.0);
+            for (dst, value) in center.iter_mut().zip(row) {
+                *dst += value * weight;
+            }
+        }
+        let norm: f32 = center.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for value in &mut center {
+                *value /= norm;
+            }
+        }
+        if let Some(bar) = bar {
+            bar.inc(1);
+        }
+        return Ok(Tensor::from_vec(center, (1, n), data.device())?);
+    }
 
     let _priority_mgr = PriorityManager::new();
-    let total: u64 = (max_iter * k).try_into()?;
-    let bar = progress::new_with_label(total, "kmeans");
     let device = data.device();
 
-    #[cfg(feature = "deterministic")]
+    #[cfg(any(test, feature = "deterministic"))]
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    #[cfg(not(feature = "deterministic"))]
+    #[cfg(not(any(test, feature = "deterministic")))]
     let mut rng = rand::rng();
-    let centroid_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
-    let centroid_idx: Vec<u32> = centroid_idx.iter().map(|&i| i as u32).collect();
+    let weighted_centroid_idx =
+        weights.and_then(|weights| weighted_center_indices(weights, k, &mut rng));
+    let centroid_idx: Vec<u32> = weighted_centroid_idx.clone().unwrap_or_else(|| {
+        rand::seq::index::sample(&mut rng, m, k)
+            .into_vec()
+            .iter()
+            .map(|&i| i as u32)
+            .collect()
+    });
 
     let centroid_idx_tensor = Tensor::from_slice(centroid_idx.as_slice(), (k,), device)?;
     //let centroid_idx_tensor = centroid_idx_tensor.to_device(device)?;
@@ -233,22 +661,28 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
     // Pull data out once; kmeans always runs on CPU.
     let data_flat = data.flatten_all()?.to_vec1::<f32>()?;
 
-    for _ in 0..max_iter {
+    let mut previous_assignments: Option<Vec<u32>> = None;
+
+    for iter in 0..max_iter {
         let packed_centers = fast_ops::PackedRight::new(&centers)?;
-        let cluster_assignments = matmul_argmax_batched(data, &packed_centers, 1024)?;
+        let cluster_assignments = matmul_argmax_batched(data, &packed_centers, KMEANS_MATMUL_BATCH)?;
         let assignments = cluster_assignments.to_vec1::<u32>()?;
 
         // Single O(m × n) pass: accumulate per-cluster sums directly into a
         // flat Vec<f32>, avoiding O(k × m) scans and k separate tensor ops.
         let mut sums = vec![0f32; k * n];
-        let mut counts = vec![0u32; k];
+        let mut weight_sums = vec![0f32; k];
         for (j, &c) in assignments.iter().enumerate() {
             let c = c as usize;
-            counts[c] += 1;
+            let weight = weights
+                .map(|weights| weights[j])
+                .filter(|weight| weight.is_finite() && *weight > 0.0)
+                .unwrap_or(1.0);
+            weight_sums[c] += weight;
             let src = &data_flat[j * n..(j + 1) * n];
             let dst = &mut sums[c * n..(c + 1) * n];
             for (d, s) in dst.iter_mut().zip(src) {
-                *d += s;
+                *d += s * weight;
             }
         }
 
@@ -258,26 +692,44 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
             let src = &sums[i * n..(i + 1) * n];
             let dst = &mut centers_flat[i * n..(i + 1) * n];
             let (emb, owned);
-            if counts[i] > 0 {
+            if weight_sums[i] > 0.0 {
                 emb = src;
             } else {
-                let idx = rand::seq::index::sample(&mut rng, m, 1).into_vec()[0];
+                let idx = weighted_centroid_idx
+                    .as_ref()
+                    .and_then(|indices| indices.get(i % indices.len()))
+                    .map(|idx| *idx as usize)
+                    .unwrap_or_else(|| rand::seq::index::sample(&mut rng, m, 1).into_vec()[0]);
                 owned = data_flat[idx * n..(idx + 1) * n].to_vec();
                 emb = &owned;
             }
             let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                for (d, e) in dst.iter_mut().zip(emb) {
-                    *d = e / norm;
-                }
-            } else {
-                dst.copy_from_slice(emb);
+            assert!(norm > 0.0);
+            for (d, e) in dst.iter_mut().zip(emb) {
+                *d = e / norm;
             }
         }
 
+        let stable_assignments = previous_assignments
+            .as_ref()
+            .is_some_and(|previous| previous == &assignments);
+        previous_assignments = Some(assignments);
         centers = Tensor::from_vec(centers_flat, (k, n), device)?;
-        bar.inc(k as u64);
+        if let Some(bar) = bar {
+            bar.inc(k as u64);
+        }
+        if stable_assignments && weight_sums.iter().all(|&weight_sum| weight_sum > 0.0) {
+            debug!("kmeans converged after {} iterations", iter + 1);
+            break;
+        }
     }
+    Ok(centers)
+}
+
+fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
+    let total = if k == 1 { 1 } else { max_iter * k };
+    let bar = progress::new_with_label(total as u64, "kmeans");
+    let centers = kmeans_inner(data, None, k, max_iter, Some(&bar))?;
     bar.finish();
     Ok(centers)
 }
@@ -343,144 +795,1047 @@ fn decompress_keys(bytes: &[u8]) -> Result<Vec<(u32, u32)>> {
     Ok(keys)
 }
 
+struct BucketSidecarMeta {
+    size: usize,
+    data_offset: u64,
+    indices_len: usize,
+    residual_len: usize,
+}
 
-fn merge_and_write_buckets(
-    db: &DB,
-    tmpfiles: Vec<tempfile::NamedTempFile>,
-    centers_cpu: &Tensor,
-    generation_id: i64,
-    id_offset: u32,
+struct BucketDataHeader {
+    centroid_count: usize,
+    embedding_dim: usize,
+    residual_quant_bits: u8,
+    center_format: u32,
+    meta_offset: usize,
+    centers_offset: usize,
+    payload_offset: usize,
+    rowids_offset: usize,
+}
+
+struct CenterSidecarData {
+    bucket_indices: Vec<usize>,
+    stored_center_block: Vec<u8>,
+    residual_centers_cpu: Tensor,
+    coarse_tree: CoarseTree,
+}
+
+fn write_bucket_data_header(
+    writer: &mut impl Write,
+    centroid_count: usize,
+    embedding_dim: usize,
+    residual_quant_bits: u8,
+    center_format: u32,
+    meta_offset: usize,
+    payload_offset: usize,
+    rowids_offset: usize,
 ) -> Result<()> {
-    let mut merger = merger::Merger::from_tempfiles(tmpfiles, RESIDUAL_BYTES)?;
-    for result in &mut merger {
-        let entry = result?;
-        let center = centers_cpu.get(entry.value as usize)?;
-        let center_bytes = center.to_f32_bytes()?;
-        let compressed_keys = compress_keys(&entry.keys);
-        db.add_bucket(
-            id_offset + entry.value,
-            generation_id,
-            &center_bytes,
-            &compressed_keys,
-            &entry.data,
-        )?;
+    writer.write_all(&BUCKET_DATA_APP_ID.to_le_bytes())?;
+    writer.write_all(&BUCKET_DATA_VERSION.to_le_bytes())?;
+    writer.write_all(&(residual_quant_bits as u32).to_le_bytes())?;
+    writer.write_all(&u32::try_from(centroid_count)?.to_le_bytes())?;
+    writer.write_all(&u32::try_from(embedding_dim)?.to_le_bytes())?;
+    writer.write_all(&center_format.to_le_bytes())?;
+    writer.write_all(&u32::try_from(meta_offset)?.to_le_bytes())?;
+    writer.write_all(&u32::try_from(payload_offset)?.to_le_bytes())?;
+    writer.write_all(&u64::try_from(rowids_offset)?.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32> {
+    anyhow::ensure!(
+        offset + std::mem::size_of::<u32>() <= bytes.len(),
+        "u32 field at offset {offset} is truncated"
+    );
+    Ok(u32::from_le_bytes(bytes[offset..offset + 4].try_into()?))
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> Result<u64> {
+    anyhow::ensure!(
+        offset + std::mem::size_of::<u64>() <= bytes.len(),
+        "u64 field at offset {offset} is truncated"
+    );
+    Ok(u64::from_le_bytes(bytes[offset..offset + 8].try_into()?))
+}
+
+fn coarse_tree_leaf_parent_centers(
+    tree: &CoarseTree,
+    leaf_count: usize,
+    dim: usize,
+) -> Result<Option<(Vec<usize>, Vec<u8>)>> {
+    if tree.levels.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        tree.levels.len() == 1,
+        "bucket center residuals require a single-level coarse tree"
+    );
+    let level = &tree.levels[0];
+    let (parent_count, parent_dim) = level.centers.dims2()?;
+    anyhow::ensure!(
+        parent_count == level.children.len(),
+        "coarse tree parent count does not match child lists"
+    );
+    anyhow::ensure!(
+        parent_dim == dim,
+        "coarse tree parent dimension {parent_dim} does not match center dimension {dim}"
+    );
+    let mut parents = vec![usize::MAX; leaf_count];
+    for (parent_idx, children) in level.children.iter().enumerate() {
+        for &leaf_idx in children {
+            anyhow::ensure!(
+                leaf_idx < leaf_count,
+                "coarse tree leaf {leaf_idx} is outside leaf count {leaf_count}"
+            );
+            anyhow::ensure!(
+                parents[leaf_idx] == usize::MAX,
+                "coarse tree leaf {leaf_idx} has multiple parents"
+            );
+            parents[leaf_idx] = parent_idx;
+        }
+    }
+    for (leaf_idx, &parent_idx) in parents.iter().enumerate() {
+        anyhow::ensure!(
+            parent_idx != usize::MAX,
+            "coarse tree is missing parent for leaf {leaf_idx}"
+        );
+    }
+    let parent_bytes = level.centers.to_device(&Device::Cpu)?.to_f32_bytes()?;
+    Ok(Some((parents, parent_bytes)))
+}
+
+fn bucket_leaf_indices(
+    bucket_indices: &[usize],
+    centroid_count: usize,
+) -> Result<Vec<usize>> {
+    let mut leaf_by_bucket = vec![usize::MAX; centroid_count];
+    for (leaf_idx, &bucket_idx) in bucket_indices.iter().enumerate() {
+        anyhow::ensure!(
+            bucket_idx < centroid_count,
+            "bucket index {bucket_idx} is outside centroid count {centroid_count}"
+        );
+        anyhow::ensure!(
+            leaf_by_bucket[bucket_idx] == usize::MAX,
+            "bucket index {bucket_idx} appears more than once"
+        );
+        leaf_by_bucket[bucket_idx] = leaf_idx;
+    }
+    Ok(leaf_by_bucket)
+}
+
+fn parent_value(
+    parent_info: Option<&(Vec<usize>, Vec<u8>)>,
+    leaf_idx: usize,
+    dim: usize,
+    dim_idx: usize,
+) -> Result<f32> {
+    let Some((parents, parent_bytes)) = parent_info else {
+        return Ok(0.0);
+    };
+    let parent_idx = parents[leaf_idx];
+    let offset = parent_idx
+        .checked_mul(f32_center_bytes_for_dim(dim))
+        .and_then(|offset| offset.checked_add(dim_idx * std::mem::size_of::<f32>()))
+        .ok_or_else(|| anyhow::anyhow!("parent center offset overflow"))?;
+    Ok(f32::from_le_bytes(parent_bytes[offset..offset + 4].try_into()?))
+}
+
+fn encode_q4_center_residual_block(
+    f32_block: &[u8],
+    bucket_indices: &[usize],
+    coarse_tree: &CoarseTree,
+    centroid_count: usize,
+    dim: usize,
+    center_format: u32,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        matches!(
+            center_format,
+            BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA
+        ),
+        "bucket center format {center_format} is not supported"
+    );
+    let use_hadamard = center_format == BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA;
+    let f32_row_bytes = f32_center_bytes_for_dim(dim);
+    let expected_f32_len = centroid_count
+        .checked_mul(f32_row_bytes)
+        .ok_or_else(|| anyhow::anyhow!("f32 center block length overflow"))?;
+    anyhow::ensure!(
+        f32_block.len() == expected_f32_len,
+        "f32 center block length is invalid"
+    );
+    let scale_len = centroid_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("q4 center scale block length overflow"))?;
+    let packed_row_bytes = packops::signed_q4_row_bytes(dim);
+    let code_len = centroid_count
+        .checked_mul(packed_row_bytes)
+        .ok_or_else(|| anyhow::anyhow!("q4 center code block length overflow"))?;
+    let encoded_len = scale_len
+        .checked_add(code_len)
+        .ok_or_else(|| anyhow::anyhow!("q4 center block length overflow"))?;
+    let mut encoded = vec![0; encoded_len];
+    let leaf_by_bucket = bucket_leaf_indices(bucket_indices, centroid_count)?;
+    let parent_info = coarse_tree_leaf_parent_centers(coarse_tree, bucket_indices.len(), dim)?;
+
+    for centroid_idx in 0..centroid_count {
+        let f32_start = centroid_idx
+            .checked_mul(f32_row_bytes)
+            .ok_or_else(|| anyhow::anyhow!("f32 center row offset overflow"))?;
+        let leaf_idx = leaf_by_bucket[centroid_idx];
+        let mut delta = Vec::with_capacity(dim);
+        for dim_idx in 0..dim {
+            let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
+            let value = f32::from_le_bytes(f32_block[offset..offset + 4].try_into()?);
+            anyhow::ensure!(value.is_finite(), "bucket center contains non-finite value");
+            let base = if leaf_idx == usize::MAX {
+                0.0
+            } else {
+                parent_value(parent_info.as_ref(), leaf_idx, dim, dim_idx)?
+            };
+            delta.push(value - base);
+        }
+        if use_hadamard {
+            packops::hadamard_rotate_values(&mut delta)?;
+        }
+
+        let max_abs = delta.iter().fold(0.0f32, |max_abs, &value| {
+            max_abs.max(value.abs())
+        });
+        let scale = packops::signed_q4_scale(max_abs);
+        let scale_offset = centroid_idx * std::mem::size_of::<f32>();
+        encoded[scale_offset..scale_offset + 4].copy_from_slice(&scale.to_le_bytes());
+        if scale == 0.0 {
+            continue;
+        }
+
+        let code_start = scale_len + centroid_idx * packed_row_bytes;
+        let code_end = code_start + packed_row_bytes;
+        let codes = &mut encoded[code_start..code_end];
+        for (dim_idx, &value) in delta.iter().enumerate() {
+            let packed = packops::quantize_signed_q4(value, scale);
+            packops::write_signed_q4_code(codes, dim_idx, packed);
+        }
+    }
+
+    Ok(encoded)
+}
+
+fn decode_q4_center_residual_block(
+    q4_block: &[u8],
+    bucket_indices: &[usize],
+    coarse_tree: &CoarseTree,
+    centroid_count: usize,
+    dim: usize,
+    center_format: u32,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        matches!(
+            center_format,
+            BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA
+        ),
+        "bucket center format {center_format} is not supported"
+    );
+    let use_hadamard = center_format == BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA;
+    let expected_len = center_block_bytes_for_count(centroid_count, dim, center_format)?;
+    anyhow::ensure!(
+        q4_block.len() == expected_len,
+        "q4 center block length is invalid"
+    );
+    let scale_len = centroid_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| anyhow::anyhow!("q4 center scale block length overflow"))?;
+    let f32_row_bytes = f32_center_bytes_for_dim(dim);
+    let f32_len = centroid_count
+        .checked_mul(f32_row_bytes)
+        .ok_or_else(|| anyhow::anyhow!("f32 center block length overflow"))?;
+    let mut decoded = vec![0; f32_len];
+    let leaf_by_bucket = bucket_leaf_indices(bucket_indices, centroid_count)?;
+    let parent_info = coarse_tree_leaf_parent_centers(coarse_tree, bucket_indices.len(), dim)?;
+    let packed_row_bytes = packops::signed_q4_row_bytes(dim);
+
+    for centroid_idx in 0..centroid_count {
+        let scale_offset = centroid_idx * std::mem::size_of::<f32>();
+        let scale = f32::from_le_bytes(q4_block[scale_offset..scale_offset + 4].try_into()?);
+        anyhow::ensure!(
+            scale.is_finite() && scale >= 0.0,
+            "q4 center scale is invalid"
+        );
+        let code_start = scale_len + centroid_idx * packed_row_bytes;
+        let f32_start = centroid_idx
+            .checked_mul(f32_row_bytes)
+            .ok_or_else(|| anyhow::anyhow!("f32 center row offset overflow"))?;
+        let leaf_idx = leaf_by_bucket[centroid_idx];
+        let mut delta = vec![0.0f32; dim];
+        for (byte_idx, &byte) in q4_block[code_start..code_start + packed_row_bytes]
+            .iter()
+            .enumerate()
+        {
+            let values = packops::signed_q4_pair_values(byte);
+            let dim_idx = byte_idx * 2;
+            for lane in 0..2 {
+                let dim_idx = dim_idx + lane;
+                if dim_idx >= dim {
+                    break;
+                }
+                delta[dim_idx] = values[lane] * scale;
+            }
+        }
+        if use_hadamard {
+            packops::hadamard_inverse_rotate_values(&mut delta)?;
+        }
+        for (dim_idx, &delta) in delta.iter().enumerate() {
+            let base = if leaf_idx == usize::MAX {
+                0.0
+            } else {
+                parent_value(parent_info.as_ref(), leaf_idx, dim, dim_idx)?
+            };
+            let value = base + delta;
+            let offset = f32_start + dim_idx * std::mem::size_of::<f32>();
+            decoded[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    Ok(decoded)
+}
+
+fn center_block_to_f32_bytes(
+    center_block: &[u8],
+    bucket_indices: &[usize],
+    coarse_tree: &CoarseTree,
+    centroid_count: usize,
+    dim: usize,
+    center_format: u32,
+) -> Result<Vec<u8>> {
+    match center_format {
+        BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA => {
+            decode_q4_center_residual_block(
+                center_block,
+                bucket_indices,
+                coarse_tree,
+                centroid_count,
+                dim,
+                center_format,
+            )
+        }
+        _ => anyhow::bail!("bucket center format {center_format} is not supported"),
+    }
+}
+
+fn write_u64_le(bytes: &mut Vec<u8>, value: usize) -> Result<()> {
+    bytes.write_all(&u64::try_from(value)?.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_tree_u64(bytes: &[u8], cursor: &mut usize) -> Result<usize> {
+    let end = cursor
+        .checked_add(std::mem::size_of::<u64>())
+        .ok_or_else(|| anyhow::anyhow!("coarse tree cursor overflow"))?;
+    anyhow::ensure!(end <= bytes.len(), "coarse tree data is truncated");
+    let value = u64::from_le_bytes(bytes[*cursor..end].try_into()?);
+    *cursor = end;
+    Ok(value.try_into()?)
+}
+
+#[cfg(all(not(unix), windows))]
+fn positioned_read(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::ReadFile;
+    use windows::Win32::System::IO::OVERLAPPED;
+
+    let read_len = buf.len().min(u32::MAX as usize);
+    let buf = &mut buf[..read_len];
+    let mut bytes_read = 0u32;
+    let mut overlapped = OVERLAPPED::default();
+    unsafe {
+        overlapped.Anonymous.Anonymous.Offset = offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        ReadFile(
+            HANDLE(file.as_raw_handle()),
+            Some(buf),
+            Some(&mut bytes_read),
+            Some(&mut overlapped),
+        )
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+    }
+    Ok(bytes_read as usize)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positioned_read(_file: &File, _buf: &mut [u8], _offset: u64) -> io::Result<usize> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "bucket positioned reads are only implemented on Unix and Windows",
+    ))
+}
+
+#[cfg(not(unix))]
+fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = positioned_read(file, buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short positioned read",
+            ));
+        }
+        offset += n as u64;
+        buf = &mut buf[n..];
     }
     Ok(())
 }
 
-fn fts5_query(q: &str) -> Option<(String, String)> {
-    let terms: Vec<&str> = q
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|term| !term.is_empty())
-        .collect();
-    if terms.is_empty() {
-        return None;
+#[cfg(unix)]
+fn max_iov() -> usize {
+    let n = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+    if n > 0 {
+        n as usize
+    } else {
+        1024
     }
-
-    let last_is_space = q.chars().last().is_some_and(char::is_whitespace);
-    let mut query = String::new();
-    let mut normalized = String::new();
-    for (idx, term) in terms.iter().enumerate() {
-        if idx != 0 {
-            query.push_str(" OR ");
-            normalized.push(' ');
-        }
-        query.push('"');
-        query.push_str(term);
-        query.push('"');
-        if idx + 1 == terms.len() && !last_is_space {
-            query.push('*');
-        }
-        normalized.push_str(term);
-    }
-    Some((query, normalized))
 }
 
-pub fn fulltext_search(
-    db: &DB,
-    q: &str,
-    top_k: usize,
-    sql_filter: Option<&SqlStatementInternal>,
-) -> Result<Vec<(f32, u32, u32)>> {
-    let mut fts_matches = vec![];
-
-    let fts_query = fts5_query(q);
-
-    let (filter_sql, mut filter_params) = build_filter_sql_and_params(sql_filter)?;
-    let filter_clause = if !filter_sql.is_empty() {
-        format!("AND {}", filter_sql)
-    } else {
-        String::new()
-    };
-
-    let sql = if fts_query.is_some() {
-        format!(
-            "SELECT document.rowid, document.body, document.lens,
-            bm25(document_fts) AS score
-            FROM document,document_fts
-            WHERE document.rowid = document_fts.rowid
-            AND document_fts MATCH ? {filter_clause}
-            ORDER BY score,date DESC
-            LIMIT ?",
-        )
-    } else {
-        // For empty query, we don't need the query param in the WHERE clause
-        format!(
-            "SELECT rowid,\"\",\"\",0.0
-            FROM document
-            WHERE 1=1 {filter_clause}
-            ORDER BY date DESC
-            LIMIT ?",
+#[cfg(unix)]
+fn preadv_once(file: &File, offset: u64, buffers: &mut [&mut [u8]]) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    let mut iovecs: Vec<libc::iovec> = buffers
+        .iter_mut()
+        .map(|buf| libc::iovec {
+            iov_base: (*buf).as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        })
+        .collect();
+    let n = unsafe {
+        libc::preadv(
+            file.as_raw_fd(),
+            iovecs.as_mut_ptr(),
+            iovecs.len().try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "too many iovecs")
+            })?,
+            offset.try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "preadv offset overflow")
+            })?,
         )
     };
-    let mut query = db.query(&sql)?;
-
-    // Build complete params list: query param (if q.len() > 0), filter params, top_k
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some((query, _)) = &fts_query {
-        params.push(Box::new(query.clone()));
+    if n < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
     }
-    params.append(&mut filter_params);
-    params.push(Box::new(top_k as i64));
+}
 
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+#[cfg(unix)]
+fn readv_one_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = {
+            let mut single = [&mut *buf];
+            preadv_once(file, offset, &mut single)?
+        };
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short vectored positioned read",
+            ));
+        }
+        offset += n as u64;
+        let (_, rest) = buf.split_at_mut(n);
+        buf = rest;
+    }
+    Ok(())
+}
 
-    let results = query.query_map(param_refs.as_slice(), |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, f32>(3)?,
-        ))
-    })?;
-    for result in results {
-        let (rowid, body, lens, score) = result?;
-        let rank_score = -score;
+#[cfg(unix)]
+fn readv_group_exact_at(file: &File, offset: u64, buffers: &mut [&mut [u8]]) -> io::Result<()> {
+    let total = buffers.iter().map(|buf| buf.len()).sum::<usize>();
+    if total == 0 {
+        return Ok(());
+    }
+    let n = preadv_once(file, offset, buffers)?;
+    if n == total {
+        return Ok(());
+    }
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short vectored positioned read",
+        ));
+    }
 
-        let lens: Vec<usize> = lens
-            .split(',')
-            .filter_map(|s| s.parse::<usize>().ok())
-            .collect();
+    let mut skipped = n;
+    let mut cursor = offset;
+    for buf in buffers.iter_mut() {
+        if skipped >= buf.len() {
+            skipped -= buf.len();
+            cursor += buf.len() as u64;
+            continue;
+        }
+        if skipped > 0 {
+            let skip = skipped;
+            skipped = 0;
+            readv_one_exact_at(file, cursor + skip as u64, &mut buf[skip..])?;
+        } else {
+            readv_one_exact_at(file, cursor, buf)?;
+        }
+        cursor += buf.len() as u64;
+    }
+    Ok(())
+}
 
-        let mut i_max = 0;
-        if !lens.is_empty() {
-            let score_query = fts_query
-                .as_ref()
-                .map(|(_, normalized)| normalized.as_str())
-                .unwrap_or("");
-            let bodies = split_by_codepoints(&body, &lens);
-            let mut max = -1.0f64;
-            for (i, &b) in bodies.iter().enumerate() {
-                let s = strsim::jaro_winkler(score_query, b);
-                if s > max {
-                    max = s;
-                    i_max = i;
-                }
+#[cfg(unix)]
+fn readv_exact_at(file: &File, mut offset: u64, buffers: &mut [&mut [u8]]) -> io::Result<()> {
+    let mut rest = buffers;
+    let max_iov = max_iov();
+    while !rest.is_empty() {
+        let take = rest.len().min(max_iov);
+        let (group, tail) = rest.split_at_mut(take);
+        readv_group_exact_at(file, offset, group)?;
+        offset += group.iter().map(|buf| buf.len() as u64).sum::<u64>();
+        rest = tail;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn readv_exact_at(file: &File, mut offset: u64, buffers: &mut [&mut [u8]]) -> io::Result<()> {
+    for buf in buffers {
+        read_exact_at(file, offset, buf)?;
+        offset += buf.len() as u64;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn read_contiguous_exact_at(file: &File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let mut data = vec![0; len];
+    read_exact_at(file, offset, &mut data)?;
+    Ok(data)
+}
+
+fn bucket_data_header_from_prefix(prefix: &[u8], sidecar_len: usize) -> Result<BucketDataHeader> {
+    anyhow::ensure!(
+        sidecar_len >= BUCKET_DATA_HEADER_BYTES,
+        "bucket sidecar is too small: {} bytes",
+        sidecar_len
+    );
+    anyhow::ensure!(
+        prefix.len() >= std::mem::size_of::<u32>(),
+        "bucket sidecar header is too small"
+    );
+    let app_id = read_u32_le(prefix, 0)?;
+    anyhow::ensure!(
+        app_id == BUCKET_DATA_APP_ID,
+        "bucket sidecar app id {app_id:#x} is not supported"
+    );
+    let version = read_u32_le(prefix, std::mem::size_of::<u32>())?;
+    anyhow::ensure!(
+        version == BUCKET_DATA_VERSION,
+        "bucket sidecar version {version} is not supported"
+    );
+    anyhow::ensure!(
+        BUCKET_DATA_HEADER_BYTES <= prefix.len(),
+        "bucket sidecar header read was too short"
+    );
+    let mut offset = 2 * std::mem::size_of::<u32>();
+    let residual_quant_bits: u8 = read_u32_le(prefix, offset)?.try_into()?;
+    packops::validate_residual_quant_bits(residual_quant_bits)?;
+    offset += std::mem::size_of::<u32>();
+    let centroid_count: usize = read_u32_le(prefix, offset)?.try_into()?;
+    offset += std::mem::size_of::<u32>();
+    let embedding_dim: usize = read_u32_le(prefix, offset)?.try_into()?;
+    anyhow::ensure!(embedding_dim > 0, "bucket sidecar embedding dimension is zero");
+    offset += std::mem::size_of::<u32>();
+    let center_format = read_u32_le(prefix, offset)?;
+    match center_format {
+        BUCKET_CENTER_FORMAT_Q4_PARENT_DELTA | BUCKET_CENTER_FORMAT_HADAMARD_Q4_PARENT_DELTA => {}
+        _ => anyhow::bail!("bucket center format {center_format} is not supported"),
+    }
+    offset += std::mem::size_of::<u32>();
+    let meta_offset: usize = read_u32_le(prefix, offset)?.try_into()?;
+    offset += std::mem::size_of::<u32>();
+    let payload_offset: usize = read_u32_le(prefix, offset)?.try_into()?;
+    offset += std::mem::size_of::<u32>();
+    let rowids_offset: usize = read_u64_le(prefix, offset)?.try_into()?;
+    let scalar_meta_len = centroid_count
+        .checked_mul(BUCKET_SCALAR_META_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar metadata length overflow"))?;
+    let centers_offset = meta_offset
+        .checked_add(scalar_meta_len)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar centers offset overflow"))?;
+    let centers_len = center_block_bytes_for_count(centroid_count, embedding_dim, center_format)?;
+    let expected_payload_offset = centers_offset
+        .checked_add(centers_len)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload offset overflow"))?;
+    anyhow::ensure!(
+        meta_offset >= BUCKET_DATA_HEADER_BYTES
+            && payload_offset == expected_payload_offset
+            && rowids_offset >= payload_offset
+            && rowids_offset <= sidecar_len,
+        "bucket sidecar layout is invalid"
+    );
+    Ok(BucketDataHeader {
+        centroid_count,
+        embedding_dim,
+        residual_quant_bits,
+        center_format,
+        meta_offset,
+        centers_offset,
+        payload_offset,
+        rowids_offset,
+    })
+}
+
+fn bucket_data_header_from_file(file: &File, sidecar_len: usize) -> Result<BucketDataHeader> {
+    let prefix_len = BUCKET_DATA_HEADER_BYTES.min(sidecar_len);
+    let mut prefix = vec![0; prefix_len];
+    let mut buffers = [prefix.as_mut_slice()];
+    readv_exact_at(file, 0, &mut buffers)?;
+    bucket_data_header_from_prefix(&prefix, sidecar_len)
+}
+
+fn validate_residual_radius_levels(levels: &[f32], residual_quant_bits: u8) -> Result<()> {
+    packops::validate_polar_radius_levels(levels, residual_quant_bits)
+}
+
+fn residual_radius_levels_byte_len(residual_quant_bits: u8) -> Result<usize> {
+    Ok(packops::residual_radius_level_count(residual_quant_bits)? * std::mem::size_of::<f32>())
+}
+
+fn residual_radius_levels_to_bytes(
+    levels: Option<&[f32]>,
+    residual_quant_bits: u8,
+) -> Result<Vec<u8>> {
+    let Some(levels) = levels else {
+        return Ok(vec![]);
+    };
+    validate_residual_radius_levels(levels, residual_quant_bits)?;
+    let mut bytes = Vec::with_capacity(residual_radius_levels_byte_len(residual_quant_bits)?);
+    for &level in levels {
+        bytes.write_all(&level.to_le_bytes())?;
+    }
+    Ok(bytes)
+}
+
+fn bucket_data_residual_radius_levels_from_file(
+    file: &File,
+    header: &BucketDataHeader,
+) -> Result<Option<Vec<f32>>> {
+    let levels_len = header
+        .meta_offset
+        .checked_sub(BUCKET_DATA_HEADER_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar radius level range is invalid"))?;
+    if levels_len == 0 {
+        return Ok(None);
+    }
+    let expected_len = residual_radius_levels_byte_len(header.residual_quant_bits)?;
+    anyhow::ensure!(
+        levels_len == expected_len,
+        "bucket sidecar Lloyd-Max radius block has {levels_len} bytes, expected {expected_len}"
+    );
+    let mut bytes = vec![0; levels_len];
+    let mut buffers = [bytes.as_mut_slice()];
+    readv_exact_at(file, u64::try_from(BUCKET_DATA_HEADER_BYTES)?, &mut buffers)?;
+    let levels: Vec<f32> = bytes
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    validate_residual_radius_levels(&levels, header.residual_quant_bits)?;
+    Ok(Some(levels))
+}
+
+fn bucket_data_bucket_meta_from_file(
+    file: &File,
+    header: &BucketDataHeader,
+) -> Result<(Vec<BucketSidecarMeta>, Vec<u8>)> {
+    let meta_len = header
+        .centers_offset
+        .checked_sub(header.meta_offset)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar metadata range is invalid"))?;
+    let mut meta_block = vec![0; meta_len];
+    let centers_len = header
+        .payload_offset
+        .checked_sub(header.centers_offset)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar center range is invalid"))?;
+    let mut center_block = vec![0; centers_len];
+    let mut buffers = [meta_block.as_mut_slice(), center_block.as_mut_slice()];
+    readv_exact_at(file, u64::try_from(header.meta_offset)?, &mut buffers)?;
+    let metas = bucket_data_bucket_meta_from_block(&meta_block, header)?;
+    Ok((metas, center_block))
+}
+
+fn bucket_data_bucket_meta_from_block(
+    meta_block: &[u8],
+    header: &BucketDataHeader,
+) -> Result<Vec<BucketSidecarMeta>> {
+    anyhow::ensure!(
+        meta_block.len() == header.centers_offset - header.meta_offset,
+        "bucket sidecar metadata block length is invalid"
+    );
+    let mut metas = Vec::with_capacity(header.centroid_count);
+    for bucket_idx in 0..header.centroid_count {
+        let offset = bucket_idx * BUCKET_SCALAR_META_BYTES;
+        let size = read_u32_le(meta_block, offset)? as usize;
+        let data_offset: u64 = read_u64_le(meta_block, offset + 4)?;
+        let indices_len = read_u32_le(meta_block, offset + 12)? as usize;
+        let residual_len = read_u32_le(meta_block, offset + 16)? as usize;
+        anyhow::ensure!(
+            data_offset >= u64::try_from(header.payload_offset)?,
+            "bucket {bucket_idx} data offset is before payload block"
+        );
+        let bucket_end = data_offset
+            .checked_add(u64::try_from(indices_len)?)
+            .and_then(|offset| offset.checked_add(u64::try_from(residual_len).ok()?))
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_idx} data length overflow"))?;
+        anyhow::ensure!(
+            bucket_end <= u64::try_from(header.rowids_offset)?,
+            "bucket {bucket_idx} data ends beyond bucket payload"
+        );
+        metas.push(BucketSidecarMeta {
+            size,
+            data_offset,
+            indices_len,
+            residual_len,
+        });
+    }
+    Ok(metas)
+}
+
+fn bucket_data_payload_end(
+    header: &BucketDataHeader,
+    metas: &[BucketSidecarMeta],
+) -> Result<usize> {
+    let mut payload_end = header.payload_offset;
+    for (bucket_idx, meta) in metas.iter().enumerate() {
+        let data_offset: usize = meta.data_offset.try_into()?;
+        let bucket_end = data_offset
+            .checked_add(meta.indices_len)
+            .and_then(|offset| offset.checked_add(meta.residual_len))
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_idx} data length overflow"))?;
+        payload_end = payload_end.max(bucket_end);
+    }
+    anyhow::ensure!(
+        payload_end <= header.rowids_offset,
+        "bucket payload ends beyond rowid offset"
+    );
+    Ok(payload_end)
+}
+
+fn bucket_data_coarse_tree_from_file(
+    file: &File,
+    header: &BucketDataHeader,
+    metas: &[BucketSidecarMeta],
+    device: &Device,
+) -> Result<CoarseTree> {
+    let payload_end = bucket_data_payload_end(header, metas)?;
+    let tree_len = header
+        .rowids_offset
+        .checked_sub(payload_end)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar tree range is invalid"))?;
+    anyhow::ensure!(
+        tree_len >= std::mem::size_of::<u64>(),
+        "bucket sidecar is missing coarse tree data; run ./warp-cli reindex"
+    );
+    let mut tree_bytes = vec![0; tree_len];
+    let mut buffers = [tree_bytes.as_mut_slice()];
+    readv_exact_at(file, u64::try_from(payload_end)?, &mut buffers)?;
+    deserialize_coarse_tree(&tree_bytes, device)
+}
+
+fn write_bucket_meta(writer: &mut impl Write, meta: &BucketSidecarMeta) -> Result<()> {
+    writer.write_all(&u32::try_from(meta.size)?.to_le_bytes())?;
+    writer.write_all(&meta.data_offset.to_le_bytes())?;
+    writer.write_all(&u32::try_from(meta.indices_len)?.to_le_bytes())?;
+    writer.write_all(&u32::try_from(meta.residual_len)?.to_le_bytes())?;
+    Ok(())
+}
+
+fn build_coarse_tree_from_bucket_indices(
+    bucket_indices: &[usize],
+    center_block: &[u8],
+    center_dim: usize,
+) -> Result<CoarseTree> {
+    let center_bytes = f32_center_bytes_for_dim(center_dim);
+    anyhow::ensure!(
+        center_block.len() % center_bytes == 0,
+        "bucket center block length is invalid"
+    );
+    let centroid_count = center_block.len() / center_bytes;
+    for &bucket_idx in bucket_indices {
+        anyhow::ensure!(
+            bucket_idx < centroid_count,
+            "bucket index {bucket_idx} is outside centroid count {centroid_count}"
+        );
+    }
+    if bucket_indices.is_empty() {
+        Ok(CoarseTree { levels: vec![] })
+    } else {
+        let centers = Tensor::from_f32_bytes(center_block, center_dim, &Device::Cpu)?;
+        let indices: Vec<u32> = bucket_indices
+            .iter()
+            .map(|&idx| u32::try_from(idx))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let index = Tensor::from_slice(indices.as_slice(), (indices.len(),), &Device::Cpu)?;
+        let centers = centers.index_select(&index, 0)?;
+        build_coarse_tree_from_centers(&centers, &Device::Cpu)
+    }
+}
+
+fn prepare_center_sidecar_data(
+    centers_cpu: &Tensor,
+    bucket_indices: Vec<usize>,
+) -> Result<CenterSidecarData> {
+    let (centroid_count, center_dim) = centers_cpu.dims2()?;
+    let center_block = centers_cpu.to_f32_bytes()?;
+    let expected_center_block_len = centroid_count
+        .checked_mul(f32_center_bytes_for_dim(center_dim))
+        .ok_or_else(|| anyhow::anyhow!("bucket center block length overflow"))?;
+    anyhow::ensure!(
+        center_block.len() == expected_center_block_len,
+        "bucket center block length is invalid"
+    );
+    let coarse_tree =
+        build_coarse_tree_from_bucket_indices(&bucket_indices, &center_block, center_dim)?;
+    let stored_center_block = encode_q4_center_residual_block(
+        &center_block,
+        &bucket_indices,
+        &coarse_tree,
+        centroid_count,
+        center_dim,
+        BUCKET_CENTER_FORMAT,
+    )?;
+    let residual_center_block = center_block_to_f32_bytes(
+        &stored_center_block,
+        &bucket_indices,
+        &coarse_tree,
+        centroid_count,
+        center_dim,
+        BUCKET_CENTER_FORMAT,
+    )?;
+    let residual_centers_cpu =
+        Tensor::from_f32_bytes(&residual_center_block, center_dim, &Device::Cpu)?;
+    Ok(CenterSidecarData {
+        bucket_indices,
+        stored_center_block,
+        residual_centers_cpu,
+        coarse_tree,
+    })
+}
+
+fn coarse_tree_leaf_order(tree: &CoarseTree, leaf_count: usize) -> Result<Vec<usize>> {
+    let mut order: Vec<usize> = (0..leaf_count).collect();
+    if tree.levels.is_empty() {
+        return Ok(order);
+    }
+
+    let mut keys = vec![vec![usize::MAX; tree.levels.len()]; leaf_count];
+    for (level_idx, level) in tree.levels.iter().enumerate() {
+        for (node_idx, leaves) in level.children.iter().enumerate() {
+            for &leaf in leaves {
+                anyhow::ensure!(
+                    leaf < leaf_count,
+                    "coarse tree leaf {leaf} is outside leaf count {leaf_count}"
+                );
+                keys[leaf][level_idx] = node_idx;
             }
         }
-        fts_matches.push((rank_score, rowid, i_max as u32));
     }
-    Ok(fts_matches)
+    for (leaf, key) in keys.iter().enumerate() {
+        anyhow::ensure!(
+            key.iter().all(|&node| node != usize::MAX),
+            "coarse tree is missing leaf {leaf}"
+        );
+    }
+
+    order.sort_by(|&a, &b| {
+        for level_idx in 0..tree.levels.len() {
+            let cmp = keys[a][level_idx].cmp(&keys[b][level_idx]);
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        a.cmp(&b)
+    });
+    Ok(order)
+}
+
+fn copy_exact_bytes(reader: &mut File, writer: &mut impl Write, len: usize) -> Result<()> {
+    let mut limited = reader.take(u64::try_from(len)?);
+    let copied = std::io::copy(&mut limited, writer)?;
+    anyhow::ensure!(
+        copied == u64::try_from(len)?,
+        "bucket payload copy ended after {copied} bytes, expected {len}"
+    );
+    Ok(())
+}
+
+fn merge_and_write_buckets_to_path(
+    tmpfiles: Vec<tempfile::NamedTempFile>,
+    center_sidecar: &CenterSidecarData,
+    rowid_records: &[RowidRecord],
+    final_path: &Path,
+    residual_quant_bits: u8,
+    residual_radius_levels: Option<&[f32]>,
+) -> Result<()> {
+    let mut tmp_path = final_path.as_os_str().to_os_string();
+    tmp_path.push(format!(
+        ".{}.tmp",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0)
+    ));
+    let tmp_path = PathBuf::from(tmp_path);
+
+    let temp_dir = final_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let data_tmp = tempfile::NamedTempFile::new_in(temp_dir)?;
+    let mut data_writer = data_tmp.reopen()?;
+    let (centroid_count, center_dim) = center_sidecar.residual_centers_cpu.dims2()?;
+    let residual_bytes = residual_bytes_for_dim(center_dim, residual_quant_bits)?;
+    let mut bucket_meta: Vec<BucketSidecarMeta> = (0..centroid_count)
+        .map(|_| BucketSidecarMeta {
+            size: 0,
+            data_offset: 0,
+            indices_len: 0,
+            residual_len: 0,
+        })
+        .collect();
+    let mut data_offset = 0u64;
+
+    let mut merger = merger::Merger::from_tempfiles(tmpfiles, residual_bytes)?;
+    for result in &mut merger {
+        let entry = result?;
+        let bucket_idx = entry.value as usize;
+        anyhow::ensure!(
+            bucket_idx < centroid_count,
+            "bucket {} is outside centroid count {centroid_count}",
+            entry.value
+        );
+        let compressed_keys = compress_keys(&entry.keys);
+        anyhow::ensure!(
+            entry.data.len() % residual_bytes == 0,
+            "bucket {} residual byte length {} is not divisible by residual width {}",
+            entry.value,
+            entry.data.len(),
+            residual_bytes
+        );
+        data_writer.write_all(&compressed_keys)?;
+        data_writer.write_all(&entry.data)?;
+        let meta = &mut bucket_meta[bucket_idx];
+        meta.size = entry.data.len() / residual_bytes;
+        meta.data_offset = data_offset;
+        meta.indices_len = compressed_keys.len();
+        meta.residual_len = entry.data.len();
+        let payload_len = compressed_keys
+            .len()
+            .checked_add(entry.data.len())
+            .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload length overflow"))?;
+        data_offset = data_offset
+            .checked_add(u64::try_from(payload_len)?)
+            .ok_or_else(|| anyhow::anyhow!("bucket sidecar data offset overflow"))?;
+    }
+    data_writer.flush()?;
+    drop(data_writer);
+
+    let nonempty_buckets: Vec<usize> = bucket_meta
+        .iter()
+        .enumerate()
+        .filter_map(|(bucket_idx, meta)| (meta.size > 0).then_some(bucket_idx))
+        .collect();
+    anyhow::ensure!(
+        nonempty_buckets == center_sidecar.bucket_indices,
+        "routed bucket set changed while writing bucket payloads"
+    );
+    let coarse_tree_bytes = serialize_coarse_tree(&center_sidecar.coarse_tree)?;
+    let leaf_order = coarse_tree_leaf_order(&center_sidecar.coarse_tree, nonempty_buckets.len())?;
+    let mut payload_chunks = Vec::with_capacity(nonempty_buckets.len());
+    for leaf_idx in leaf_order {
+        let bucket_idx = nonempty_buckets[leaf_idx];
+        let meta = &bucket_meta[bucket_idx];
+        let len = meta
+            .indices_len
+            .checked_add(meta.residual_len)
+            .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload length overflow"))?;
+        payload_chunks.push((bucket_idx, meta.data_offset, len));
+    }
+
+    let meta_block_len = centroid_count
+        .checked_mul(BUCKET_SCALAR_META_BYTES)
+        .ok_or_else(|| anyhow::anyhow!("bucket metadata block length overflow"))?;
+    let residual_radius_level_block =
+        residual_radius_levels_to_bytes(residual_radius_levels, residual_quant_bits)?;
+    let meta_offset = BUCKET_DATA_HEADER_BYTES
+        .checked_add(residual_radius_level_block.len())
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar metadata offset overflow"))?;
+    let centers_offset = meta_offset
+        .checked_add(meta_block_len)
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar center block offset overflow"))?;
+    let payload_start = centers_offset
+        .checked_add(center_sidecar.stored_center_block.len())
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload start overflow"))?;
+    let payload_start = u64::try_from(payload_start)?;
+    let payload_len = payload_chunks
+        .iter()
+        .try_fold(0u64, |total, &(_, _, len)| {
+            total
+                .checked_add(u64::try_from(len).ok()?)
+        })
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar payload length overflow"))?;
+    anyhow::ensure!(
+        payload_len == data_offset,
+        "bucket sidecar payload reorder length {payload_len} does not match merged length {data_offset}"
+    );
+    let rowids_offset = payload_start
+        .checked_add(payload_len)
+        .and_then(|offset| offset.checked_add(u64::try_from(coarse_tree_bytes.len()).ok()?))
+        .ok_or_else(|| anyhow::anyhow!("bucket sidecar rowid offset overflow"))?;
+
+    let mut bucket_data_writer = NewFileWriter::create_new(&tmp_path)?;
+
+    write_bucket_data_header(
+        &mut bucket_data_writer,
+        centroid_count,
+        center_dim,
+        residual_quant_bits,
+        BUCKET_CENTER_FORMAT,
+        meta_offset,
+        payload_start.try_into()?,
+        rowids_offset.try_into()?,
+    )?;
+    bucket_data_writer.write_all(&residual_radius_level_block)?;
+    for meta in &mut bucket_meta {
+        if meta.size == 0 {
+            meta.data_offset = payload_start;
+        }
+    }
+    let mut reordered_offset = payload_start;
+    for &(bucket_idx, _, len) in &payload_chunks {
+        let meta = &mut bucket_meta[bucket_idx];
+        meta.data_offset = reordered_offset;
+        reordered_offset = reordered_offset
+            .checked_add(u64::try_from(len)?)
+            .ok_or_else(|| anyhow::anyhow!("bucket sidecar absolute offset overflow"))?;
+    }
+    anyhow::ensure!(
+        reordered_offset == payload_start + payload_len,
+        "bucket sidecar reordered payload length mismatch"
+    );
+    for meta in &bucket_meta {
+        write_bucket_meta(&mut bucket_data_writer, meta)?;
+    }
+    bucket_data_writer.write_all(&center_sidecar.stored_center_block)?;
+    let mut data_reader = data_tmp.reopen()?;
+    for &(_, temp_offset, len) in &payload_chunks {
+        data_reader.seek(SeekFrom::Start(temp_offset))?;
+        copy_exact_bytes(&mut data_reader, &mut bucket_data_writer, len)?;
+    }
+    bucket_data_writer.write_all(&coarse_tree_bytes)?;
+    write_rowid_records_to_writer(&mut bucket_data_writer, rowid_records)?;
+    bucket_data_writer.finish()?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    sync_parent_dir(final_path)?;
+    Ok(())
 }
 
 const HYBRID_FULLTEXT_RRF_WEIGHT: f64 = 0.075;
@@ -615,95 +1970,480 @@ mod reciprocal_rank_fusion_tests {
     }
 }
 
-/// Per-generation centroid data loaded from the database.
-struct GenerationCentroids {
-    generation_id: i64,
-    bucket_ids: Vec<u32>,
-    sizes: Vec<usize>,
-    centers_matrix: Tensor,
+struct BucketRead {
+    bucket_idx: usize,
+    start: usize,
+    len: usize,
 }
 
-type CentersCache = Vec<GenerationCentroids>;
+struct BucketReadBatch {
+    offset: usize,
+    len: usize,
+    buckets: Vec<BucketRead>,
+}
 
-static CACHED: Lazy<RwLock<HashMap<PathBuf, CentersCache>>> =
+#[derive(Clone, Copy, Default)]
+struct BucketReadStats {
+    batches: usize,
+    buckets: usize,
+    bytes: usize,
+}
+
+impl BucketReadStats {
+    fn from_batches(batches: &[BucketReadBatch]) -> Self {
+        Self {
+            batches: batches.len(),
+            buckets: batches.iter().map(|batch| batch.buckets.len()).sum(),
+            bytes: batches.iter().map(|batch| batch.len).sum(),
+        }
+    }
+}
+
+struct BucketPayload<'a> {
+    keys: &'a [u8],
+    residuals: &'a [u8],
+}
+
+struct CoarseTreeLevel {
+    centers: Tensor,
+    children: Vec<Vec<usize>>,
+}
+
+struct CoarseTree {
+    levels: Vec<CoarseTreeLevel>,
+}
+
+struct IndexKMeans {
+    centers: Tensor,
+    routing: IndexKMeansNode,
+}
+
+struct IndexKMeansNode {
+    packed_centers: fast_ops::PackedRight,
+    children: Vec<IndexKMeansNode>,
+    leaf_offset: usize,
+}
+
+#[derive(Default)]
+struct MatchIoCounters {
+    queries: usize,
+    candidate_buckets: usize,
+    selected_buckets: usize,
+    selected_slots: usize,
+    read: BucketReadStats,
+}
+
+impl MatchIoCounters {
+    fn add_read_stats(&mut self, read: BucketReadStats) {
+        self.read.batches += read.batches;
+        self.read.buckets += read.buckets;
+        self.read.bytes += read.bytes;
+    }
+}
+
+thread_local! {
+    static BUCKET_IO_COUNTERS: std::cell::RefCell<MatchIoCounters> =
+        std::cell::RefCell::new(MatchIoCounters::default());
+}
+
+fn record_bucket_io_counters(counters: MatchIoCounters) {
+    BUCKET_IO_COUNTERS.with(|cell| {
+        let mut total = cell.borrow_mut();
+        total.queries += counters.queries;
+        total.candidate_buckets += counters.candidate_buckets;
+        total.selected_buckets += counters.selected_buckets;
+        total.selected_slots += counters.selected_slots;
+        total.read.batches += counters.read.batches;
+        total.read.buckets += counters.read.buckets;
+        total.read.bytes += counters.read.bytes;
+    });
+}
+
+pub fn reset_bucket_io_counters() {
+    BUCKET_IO_COUNTERS.with(|cell| {
+        let _ = cell.replace(MatchIoCounters::default());
+    });
+}
+
+pub fn log_bucket_io_counters() {
+    BUCKET_IO_COUNTERS.with(|cell| {
+        let counters = cell.replace(MatchIoCounters::default());
+        if counters.queries == 0 {
+            return;
+        }
+        let q = counters.queries as f64;
+        info!(
+            "bucket io counters: queries={} avg_candidates={:.1} avg_selected_buckets={:.1} avg_selected_slots={:.1} avg_read_batches={:.1} avg_read_buckets={:.1} avg_read_mb={:.2}",
+            counters.queries,
+            counters.candidate_buckets as f64 / q,
+            counters.selected_buckets as f64 / q,
+            counters.selected_slots as f64 / q,
+            counters.read.batches as f64 / q,
+            counters.read.buckets as f64 / q,
+            counters.read.bytes as f64 / q / (1024.0 * 1024.0),
+        );
+    });
+}
+
+/// Per-generation centroid data loaded from sidecar files.
+pub struct GenerationCentroids {
+    dim: usize,
+    residual_quant_bits: u8,
+    residual_bytes: usize,
+    residual_dequant_table: packops::ResidualDequantTable,
+    bucket_indices: Vec<usize>,
+    sizes: Vec<usize>,
+    data_offsets: Vec<usize>,
+    indices_lens: Vec<usize>,
+    residual_lens: Vec<usize>,
+    sidecar_len: usize,
+    data_file: Arc<File>,
+    centers_matrix: Tensor,
+    coarse_tree: CoarseTree,
+}
+
+static GENERATIONS_CACHE: Lazy<RwLock<HashMap<Vec<PathBuf>, Arc<Vec<GenerationCentroids>>>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-fn invalidate_center_cache(db: &DB) {
-    CACHED.write().unwrap().remove(db.path());
+pub fn invalidate_generations_cache(paths: &[PathBuf]) {
+    GENERATIONS_CACHE.write().unwrap().remove(paths);
 }
 
-fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<GenerationCentroids>> {
-    let now = std::time::Instant::now();
-    {
-        let cache = CACHED.read().unwrap();
-        if let Some(cached) = cache.get(db.path()) {
-            debug!(
-                "get_all_generation_centers cache hit ({} generations)",
-                cached.len()
-            );
-            return Ok(cached.clone());
-        }
+fn clear_generations_cache() {
+    GENERATIONS_CACHE.write().unwrap().clear();
+}
+
+fn build_coarse_tree_from_centers(
+    leaf_centers: &Tensor,
+    device: &Device,
+) -> Result<CoarseTree> {
+    let (leaf_count, _) = leaf_centers.dims2()?;
+    if leaf_count <= COARSE_TREE_BRANCHING {
+        return Ok(CoarseTree { levels: vec![] });
     }
 
-    let mut gen_query = db.query("SELECT id FROM generation ORDER BY level, id")?;
-    let gen_ids: Vec<i64> = gen_query
-        .query_map((), |row| row.get::<_, i64>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut all = Vec::with_capacity(gen_ids.len());
-
-    for gen_id in gen_ids {
-        let mut center_query = db.query(
-            "SELECT id, length(residuals) / ?1, center FROM bucket
-             WHERE generation_id = ?2 ORDER BY id",
-        )?;
-        let mut bucket_ids = vec![];
-        let mut sizes = vec![];
-        let mut centers = vec![];
-        for result in center_query.query_map((RESIDUAL_BYTES as i64, gen_id), |row| {
-            let id = row.get(0)?;
-            let size = row.get::<_, i64>(1)? as usize;
-            let blob: Vec<u8> = row.get(2)?;
-            Ok((id, size, blob))
-        })? {
-            let (id, size, center) = result?;
-            bucket_ids.push(id);
-            sizes.push(size);
-            let t = Tensor::from_f32_bytes(&center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
-            centers.push(t);
-        }
-        let centers_matrix = if !centers.is_empty() {
-            Tensor::stack(&centers, 0)?.to_device(device)?
-        } else {
-            Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?
-        };
-        all.push(GenerationCentroids {
-            generation_id: gen_id,
-            bucket_ids,
-            sizes,
-            centers_matrix,
-        });
-    }
-
+    let root_count = (leaf_count as f64)
+        .sqrt()
+        .ceil()
+        .max(2.0) as usize;
+    let root_count = root_count.min(leaf_count - 1);
+    let leaf_centers = leaf_centers.to_device(&Device::Cpu)?;
     debug!(
-        "reading centers for {} generations took {} ms",
-        all.len(),
-        now.elapsed().as_millis()
+        "building coarse tree root: {} leaves -> {} root buckets",
+        leaf_count, root_count
     );
+    let root_centers = kmeans(&leaf_centers, root_count, LEAF_KMEANS_ITERATIONS)?;
+    let packed = fast_ops::PackedRight::new(&root_centers)?;
+    let assignments = matmul_argmax_batched(&leaf_centers, &packed, KMEANS_MATMUL_BATCH)?;
+    let assignments = assignments.to_vec1::<u32>()?;
 
-    let mut cache = CACHED.write().unwrap();
-    cache.insert(db.path().clone(), all.clone());
-    Ok(all)
+    let mut children = vec![vec![]; root_count];
+    for (leaf_idx, &root_idx) in assignments.iter().enumerate() {
+        children[root_idx as usize].push(leaf_idx);
+    }
+
+    Ok(CoarseTree {
+        levels: vec![CoarseTreeLevel {
+            centers: root_centers.to_device(device)?,
+            children,
+        }],
+    })
 }
 
-impl Clone for GenerationCentroids {
-    fn clone(&self) -> Self {
-        Self {
-            generation_id: self.generation_id,
-            bucket_ids: self.bucket_ids.clone(),
-            sizes: self.sizes.clone(),
-            centers_matrix: self.centers_matrix.clone(),
+fn serialize_coarse_tree(tree: &CoarseTree) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    write_u64_le(&mut bytes, tree.levels.len())?;
+
+    for level in &tree.levels {
+        let centers = level.centers.to_device(&Device::Cpu)?;
+        let (center_count, dim) = centers.dims2()?;
+        anyhow::ensure!(
+            center_count == level.children.len(),
+            "coarse tree level has {} centers but {} child lists",
+            center_count,
+            level.children.len()
+        );
+        write_u64_le(&mut bytes, center_count)?;
+        write_u64_le(&mut bytes, dim)?;
+        bytes.write_all(&centers.to_f32_bytes()?)?;
+        for children in &level.children {
+            write_u64_le(&mut bytes, children.len())?;
+            for &child in children {
+                write_u64_le(&mut bytes, child)?;
+            }
         }
+    }
+
+    Ok(bytes)
+}
+
+fn deserialize_coarse_tree(bytes: &[u8], device: &Device) -> Result<CoarseTree> {
+    anyhow::ensure!(
+        bytes.len() >= std::mem::size_of::<u64>(),
+        "coarse tree data is too small"
+    );
+    let mut cursor = 0;
+    let level_count = read_tree_u64(bytes, &mut cursor)?;
+    anyhow::ensure!(
+        level_count <= bytes.len() / std::mem::size_of::<u64>(),
+        "coarse tree level count is invalid"
+    );
+    let mut levels = Vec::with_capacity(level_count);
+
+    for _ in 0..level_count {
+        let center_count = read_tree_u64(bytes, &mut cursor)?;
+        let dim = read_tree_u64(bytes, &mut cursor)?;
+        anyhow::ensure!(
+            center_count <= bytes.len() / std::mem::size_of::<u64>(),
+            "coarse tree center count is invalid"
+        );
+        let center_bytes_len = center_count
+            .checked_mul(dim)
+            .and_then(|len| len.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("coarse tree center byte length overflow"))?;
+        let center_end = cursor
+            .checked_add(center_bytes_len)
+            .ok_or_else(|| anyhow::anyhow!("coarse tree center cursor overflow"))?;
+        anyhow::ensure!(center_end <= bytes.len(), "coarse tree center data is truncated");
+        let centers = Tensor::from_f32_bytes(&bytes[cursor..center_end], dim, device)?;
+        cursor = center_end;
+
+        let mut children = Vec::with_capacity(center_count);
+        for _ in 0..center_count {
+            let child_count = read_tree_u64(bytes, &mut cursor)?;
+            anyhow::ensure!(
+                child_count <= bytes.len() / std::mem::size_of::<u64>(),
+                "coarse tree child count is invalid"
+            );
+            let mut child_list = Vec::with_capacity(child_count);
+            for _ in 0..child_count {
+                child_list.push(read_tree_u64(bytes, &mut cursor)?);
+            }
+            children.push(child_list);
+        }
+
+        levels.push(CoarseTreeLevel { centers, children });
+    }
+
+    anyhow::ensure!(
+        cursor == bytes.len(),
+        "coarse tree sidecar data has trailing bytes"
+    );
+    Ok(CoarseTree { levels })
+}
+
+impl GenerationCentroids {
+    fn routed_centroid_candidates(&self, query_embeddings: &Tensor) -> Result<Vec<usize>> {
+        let tree = &self.coarse_tree;
+        if tree.levels.is_empty() {
+            return Ok((0..self.sizes.len()).collect());
+        }
+
+        let (query_rows, _) = query_embeddings.dims2()?;
+        let mut candidate_set = vec![false; self.sizes.len()];
+        for level in tree.levels.iter().rev() {
+            let k_level = level.children.len();
+            if k_level == 0 {
+                continue;
+            }
+            let n_expand = (k_level as f64).sqrt().ceil() as usize;
+            let level_sim = fast_ops::matmul_t(query_embeddings, &level.centers)?;
+            let level_sim = level_sim.to_device(&Device::Cpu)?;
+            let level_sorted = level_sim.arg_sort_last_dim(false)?
+                .to_device(&Device::Cpu)?
+                .to_vec2::<u32>()?;
+
+            for qi in 0..query_rows {
+                for &node_idx in level_sorted[qi].iter().take(n_expand) {
+                    if let Some(leaves) = level.children.get(node_idx as usize) {
+                        for &leaf_idx in leaves {
+                            if let Some(selected) = candidate_set.get_mut(leaf_idx) {
+                                *selected = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let candidates: Vec<usize> = candidate_set
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, selected)| selected.then_some(idx))
+            .collect();
+        if candidates.is_empty() {
+            Ok((0..self.sizes.len()).collect())
+        } else {
+            Ok(candidates)
+        }
+    }
+
+    fn bucket_range(&self, bucket_idx: usize) -> Result<(usize, usize, usize, usize)> {
+        let bucket_id = *self
+            .bucket_indices
+            .get(bucket_idx)
+            .ok_or_else(|| anyhow::anyhow!("bucket index {bucket_idx} is out of range"))?;
+        let data_offset = self.data_offsets[bucket_idx];
+        let indices_len = self.indices_lens[bucket_idx];
+        let residual_len = self.residual_lens[bucket_idx];
+        let total_len = indices_len
+            .checked_add(residual_len)
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_id} data length overflow"))?;
+        let end = data_offset
+            .checked_add(total_len)
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_id} data range overflow"))?;
+        anyhow::ensure!(
+            end <= self.sidecar_len,
+            "bucket {bucket_id} data range {}..{} exceeds sidecar length {}",
+            data_offset,
+            end,
+            self.sidecar_len
+        );
+        Ok((bucket_id, data_offset, indices_len, residual_len))
+    }
+
+    fn bucket_read_batches(&self, bucket_indices: &[usize]) -> Result<Vec<BucketReadBatch>> {
+        let mut reads = Vec::with_capacity(bucket_indices.len());
+        for &bucket_idx in bucket_indices {
+            let (_, data_offset, indices_len, residual_len) = self.bucket_range(bucket_idx)?;
+            let len = indices_len
+                .checked_add(residual_len)
+                .ok_or_else(|| anyhow::anyhow!("bucket data length overflow"))?;
+            if len != 0 {
+                reads.push((data_offset, bucket_idx, len));
+            }
+        }
+        reads.sort_by_key(|&(data_offset, bucket_idx, _)| (data_offset, bucket_idx));
+
+        let mut batches: Vec<BucketReadBatch> = vec![];
+        for (data_offset, bucket_idx, len) in reads {
+            if let Some(batch) = batches.last_mut() {
+                let batch_end = batch
+                    .len
+                    .checked_add(batch.offset)
+                    .ok_or_else(|| anyhow::anyhow!("bucket read batch range overflow"))?;
+                if data_offset <= batch_end + BUCKET_READ_COALESCE_GAP_BYTES {
+                    let start = data_offset
+                        .checked_sub(batch.offset)
+                        .ok_or_else(|| anyhow::anyhow!("bucket read batch range underflow"))?;
+                    batch.buckets.push(BucketRead {
+                        bucket_idx,
+                        start,
+                        len,
+                    });
+                    batch.len = batch.len.max(
+                        start
+                            .checked_add(len)
+                            .ok_or_else(|| anyhow::anyhow!("bucket read batch length overflow"))?,
+                    );
+                    continue;
+                }
+            }
+            batches.push(BucketReadBatch {
+                offset: data_offset,
+                len,
+                buckets: vec![BucketRead {
+                    bucket_idx,
+                    start: 0,
+                    len,
+                }],
+            });
+        }
+        Ok(batches)
+    }
+
+    #[cfg(unix)]
+    fn read_bucket_batch(file: &File, batch: &BucketReadBatch) -> Result<Vec<Vec<u8>>> {
+        let mut data = vec![0; batch.len];
+        let mut buffers = [data.as_mut_slice()];
+        readv_exact_at(file, batch.offset as u64, &mut buffers)?;
+        batch
+            .buckets
+            .iter()
+            .map(|bucket| {
+                let end = bucket
+                    .start
+                    .checked_add(bucket.len)
+                    .ok_or_else(|| anyhow::anyhow!("bucket read batch slice overflow"))?;
+                anyhow::ensure!(
+                    end <= data.len(),
+                    "bucket read batch slice {}..{} exceeds batch length {}",
+                    bucket.start,
+                    end,
+                    data.len()
+                );
+                Ok(data[bucket.start..end].to_vec())
+            })
+            .collect()
+    }
+
+    #[cfg(not(unix))]
+    fn read_bucket_batch(file: &File, batch: &BucketReadBatch) -> Result<Vec<Vec<u8>>> {
+        let data = read_contiguous_exact_at(file, batch.offset as u64, batch.len)?;
+        let mut payloads = Vec::with_capacity(batch.buckets.len());
+        for bucket in &batch.buckets {
+            let end = bucket
+                .start
+                .checked_add(bucket.len)
+                .ok_or_else(|| anyhow::anyhow!("bucket read batch slice overflow"))?;
+            anyhow::ensure!(
+                end <= data.len(),
+                "bucket read batch slice {}..{} exceeds batch length {}",
+                bucket.start,
+                end,
+                data.len()
+            );
+            payloads.push(data[bucket.start..end].to_vec());
+        }
+        Ok(payloads)
+    }
+
+    fn prefetch_bucket_payloads(
+        &self,
+        bucket_indices: &[usize],
+    ) -> Result<(Vec<Option<Vec<u8>>>, BucketReadStats)> {
+        let batches = self.bucket_read_batches(bucket_indices)?;
+        let stats = BucketReadStats::from_batches(&batches);
+        let mut payloads = vec![None; self.bucket_indices.len()];
+        if batches.is_empty() {
+            return Ok((payloads, stats));
+        }
+
+        for batch in &batches {
+            let data = Self::read_bucket_batch(&self.data_file, batch)?;
+            anyhow::ensure!(
+                data.len() == batch.buckets.len(),
+                "bucket read batch returned {} buffers for {} buckets",
+                data.len(),
+                batch.buckets.len()
+            );
+            for (bucket, data) in batch.buckets.iter().zip(data) {
+                payloads[bucket.bucket_idx] = Some(data);
+            }
+        }
+        Ok((payloads, stats))
+    }
+
+    fn bucket_payload<'a>(
+        &'a self,
+        bucket_idx: usize,
+        prefetched: &'a [Option<Vec<u8>>],
+    ) -> Result<BucketPayload<'a>> {
+        let (_, _, indices_len, residual_len) = self.bucket_range(bucket_idx)?;
+        let data = prefetched
+            .get(bucket_idx)
+            .and_then(|data| data.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("bucket {bucket_idx} was not prefetched"))?;
+        anyhow::ensure!(
+            data.len() == indices_len + residual_len,
+            "bucket {bucket_idx} prefetched length {} does not match expected {}",
+            data.len(),
+            indices_len + residual_len
+        );
+        Ok(BucketPayload {
+            keys: &data[..indices_len],
+            residuals: &data[indices_len..],
+        })
     }
 }
 
@@ -731,52 +2471,215 @@ fn vmax_inplace(current: &mut [f32], row: &[f32]) {
     }
 }
 
-pub fn match_centroids(
-    db: &DB,
+/// Load generation centroid data from sidecar files (cached).
+pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<GenerationCentroids>>> {
+    let key = paths.to_vec();
+    {
+        let cache = GENERATIONS_CACHE.read().unwrap();
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let mut all = Vec::with_capacity(paths.len());
+    for path in paths {
+        let file = File::open(path)?;
+        let sidecar_len: usize = file.metadata()?.len().try_into()?;
+        let header = bucket_data_header_from_file(&file, sidecar_len)?;
+        let residual_radius_levels =
+            bucket_data_residual_radius_levels_from_file(&file, &header)?;
+        let residual_dequant_table = packops::make_residual_dequant_table_with_radius_levels(
+            header.residual_quant_bits,
+            residual_radius_levels.as_deref(),
+        )?;
+        let (metas, center_block) = bucket_data_bucket_meta_from_file(&file, &header)?;
+        let coarse_tree = bucket_data_coarse_tree_from_file(&file, &header, &metas, device)?;
+        let residual_bytes =
+            residual_bytes_for_dim(header.embedding_dim, header.residual_quant_bits)?;
+
+        let mut bucket_indices = vec![];
+        let mut sizes = vec![];
+        let mut data_offsets = vec![];
+        let mut indices_lens = vec![];
+        let mut residual_lens = vec![];
+
+        for (bucket_idx, meta) in metas.into_iter().enumerate() {
+            if meta.size == 0 {
+                continue;
+            }
+            bucket_indices.push(bucket_idx);
+            sizes.push(meta.size);
+            data_offsets.push(meta.data_offset.try_into()?);
+            indices_lens.push(meta.indices_len);
+            residual_lens.push(meta.residual_len);
+        }
+
+        let centers_matrix = if !bucket_indices.is_empty() {
+            let center_f32_bytes = center_block_to_f32_bytes(
+                &center_block,
+                &bucket_indices,
+                &coarse_tree,
+                header.centroid_count,
+                header.embedding_dim,
+                header.center_format,
+            )?;
+            let centers =
+                Tensor::from_f32_bytes(&center_f32_bytes, header.embedding_dim, &Device::Cpu)?;
+            if bucket_indices.len() == header.centroid_count {
+                centers.to_device(device)?
+            } else {
+                let indices: Vec<u32> = bucket_indices
+                    .iter()
+                    .map(|&idx| u32::try_from(idx))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let index = Tensor::from_slice(indices.as_slice(), (indices.len(),), &Device::Cpu)?;
+                centers.index_select(&index, 0)?.to_device(device)?
+            }
+        } else {
+            Tensor::zeros(&[0, header.embedding_dim], DType::F32, device)?
+        };
+        all.push(GenerationCentroids {
+            dim: header.embedding_dim,
+            residual_quant_bits: header.residual_quant_bits,
+            residual_bytes,
+            residual_dequant_table,
+            bucket_indices,
+            sizes,
+            data_offsets,
+            indices_lens,
+            residual_lens,
+            sidecar_len,
+            data_file: Arc::new(file),
+            centers_matrix,
+            coarse_tree,
+        });
+    }
+
+    let result = Arc::new(all);
+    GENERATIONS_CACHE.write().unwrap().insert(key, result.clone());
+    Ok(result)
+}
+
+/// Pure index search: scores query embeddings against generation sidecar files.
+/// No database access — loads generation metadata and reads bucket payloads from sidecar files.
+/// `unindexed` contains (doc_rowid, embeddings) for documents not yet in any generation.
+struct QueryScoreWeights<'a> {
+    weights: Option<&'a [f32]>,
+    scaler: f32,
+}
+
+impl<'a> QueryScoreWeights<'a> {
+    fn new(token_count: usize, weights: Option<&'a [f32]>) -> Result<Self> {
+        if let Some(weights) = weights {
+            anyhow::ensure!(
+                weights.len() == token_count,
+                "query weight count {} does not match query token count {token_count}",
+                weights.len()
+            );
+            let sum: f32 = weights.iter().copied().sum();
+            if sum.is_finite() && sum > 0.0 {
+                return Ok(Self {
+                    weights: Some(weights),
+                    scaler: 1.0 / sum,
+                });
+            }
+        }
+        Ok(Self {
+            weights: None,
+            scaler: 1.0 / token_count as f32,
+        })
+    }
+
+    fn score(&self, values: &[f32]) -> f32 {
+        match self.weights {
+            Some(weights) => {
+                self.scaler
+                    * values
+                        .iter()
+                        .zip(weights.iter())
+                        .map(|(value, weight)| value * weight)
+                        .sum::<f32>()
+            }
+            None => self.scaler * values.iter().copied().sum::<f32>(),
+        }
+    }
+}
+
+pub fn match_centroids_raw(
+    generation_files: &[PathBuf],
     query_embeddings: &Tensor,
+    query_weights: Option<&[f32]>,
+    unindexed: &[(Vec<DocPtr>, Tensor)],
     threshold: f32,
     top_k: usize,
-    sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<Vec<(f32, u32, u32)>> {
+    let device = query_embeddings.device();
+    let generations = load_generations(generation_files, device)?;
     let total_start = std::time::Instant::now();
+    let indexed_generations_use_hadamard = generations
+        .iter()
+        .filter(|gen| !gen.sizes.is_empty())
+        .try_fold(true, |all, gen| {
+            Ok::<_, anyhow::Error>(
+                all && packops::residual_quant_uses_hadamard(gen.residual_quant_bits)?,
+            )
+        })?;
 
     let k = 32;
     let t_prime = 40000;
     let device = query_embeddings.device();
-    let (m, _n) = query_embeddings.dims2()?;
+    let (m, query_dim) = query_embeddings.dims2()?;
 
     let mut all_residuals = vec![];
-    let mut document_clusters: Vec<(usize, usize)> = vec![]; // (gen_idx, cluster_idx)
+    let mut document_clusters: Vec<(usize, usize)> = vec![];
     let mut gen_centroid_scores_all: Vec<Vec<Vec<f32>>> = vec![];
+    let mut gen_centroid_score_ranges_all: Vec<Vec<(f32, f32)>> = vec![];
     let mut all = vec![];
     let mut count = 0;
     let mut missing = vec![0.0f32; m];
+    let mut io_counters = MatchIoCounters {
+        queries: 1,
+        ..MatchIoCounters::default()
+    };
 
-    let generations = get_all_generation_centers(db, device)?;
-
-    let mut bucket_query =
-        db.query("SELECT indices, residuals FROM bucket WHERE id = ?1")?;
-
-    let table: [f32; 16] = packops::make_q4_dequant_table()?;
-
-    for gen in &generations {
-        if gen.bucket_ids.is_empty() {
+    for gen in generations.iter() {
+        if gen.sizes.is_empty() {
             continue;
         }
+        anyhow::ensure!(
+            gen.dim == query_dim,
+            "index embedding dimension {} does not match query dimension {}; re-embed and reindex with the selected encoder",
+            gen.dim,
+            query_dim
+        );
 
         let gen_idx = gen_centroid_scores_all.len();
-        let n_centroids = gen.bucket_ids.len();
+        let n_centroids = gen.sizes.len();
 
+        let candidates = gen.routed_centroid_candidates(query_embeddings)?;
+        io_counters.candidate_buckets += candidates.len();
+        let candidate_indices: Vec<u32> = candidates.iter().map(|&idx| idx as u32).collect();
+        let candidate_index_tensor =
+            Tensor::from_slice(candidate_indices.as_slice(), (candidate_indices.len(),), device)?;
+        let candidate_centers = gen.centers_matrix.index_select(&candidate_index_tensor, 0)?;
         let query_centroid_similarity =
-            fast_ops::matmul_t(query_embeddings, &gen.centers_matrix)?;
+            fast_ops::matmul_t(query_embeddings, &candidate_centers)?;
         let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
 
-        let gen_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
+        let candidate_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
+        let mut gen_centroid_scores = vec![vec![0.0f32; n_centroids]; m];
+        for (candidate_pos, &centroid_idx) in candidates.iter().enumerate() {
+            for query_idx in 0..m {
+                gen_centroid_scores[query_idx][centroid_idx] =
+                    candidate_centroid_scores[query_idx][candidate_pos];
+            }
+        }
         gen_centroid_scores_all.push(gen_centroid_scores);
 
         let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
 
         let mut topk_clusters = Vec::with_capacity(k);
+        let mut gen_centroid_score_ranges = Vec::with_capacity(m);
         for i in 0..m {
             let row = sorted_indices.get(i)?;
             let row_scores_sorted =
@@ -784,36 +2687,82 @@ pub fn match_centroids(
             let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
             let row = row.to_vec1::<u32>()?;
             let mut cumsum = 0;
-            for j in 0..n_centroids.min(k) {
-                let idx = row[j];
+            let selection_limit = candidates.len().min(k);
+            if selection_limit == 0 {
+                continue;
+            }
+            let mut tail_rank = 0;
+            for j in 0..selection_limit {
+                let idx = candidates[row[j] as usize];
                 topk_clusters.push(idx);
-                cumsum += gen.sizes[idx as usize];
+                io_counters.selected_slots += 1;
+                cumsum += gen.sizes[idx];
+                tail_rank = j;
                 if cumsum >= t_prime {
                     break;
                 }
             }
+            let confidence_tail_rank = (selection_limit / 2).max(1) - 1;
+            let residual_tail_rank = tail_rank.min(confidence_tail_rank);
+            gen_centroid_score_ranges.push((
+                row_scores_sorted[0],
+                row_scores_sorted[residual_tail_rank],
+            ));
             if cumsum < t_prime {
-                missing[i] = missing[i].max(row_scores_sorted[n_centroids.min(k) - 1]);
+                missing[i] = missing[i].max(row_scores_sorted[selection_limit - 1]);
             }
         }
+        gen_centroid_score_ranges_all.push(gen_centroid_score_ranges);
         topk_clusters.sort_unstable();
         topk_clusters.dedup();
+        io_counters.selected_buckets += topk_clusters.len();
 
+        debug!(
+            "hierarchical centroid routing: candidates={} selected={} / {} buckets",
+            candidates.len(),
+            topk_clusters.len(),
+            n_centroids
+        );
+
+        let (prefetched_payloads, read_stats) = gen.prefetch_bucket_payloads(&topk_clusters)?;
+        io_counters.add_read_stats(read_stats);
         for &i in &topk_clusters {
-            let bucket_id = gen.bucket_ids[i as usize];
-            let (keys_compressed, residual_bytes) = bucket_query
-                .query_row((bucket_id,), |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?;
+            let bucket_idx = i as usize;
+            let bucket_id = gen.bucket_indices[bucket_idx];
+            let payload = gen.bucket_payload(bucket_idx, &prefetched_payloads)?;
+            let keys_compressed = payload.keys;
+            let residual_bytes = payload.residuals;
 
-            let document_indices = decompress_keys(&keys_compressed)?;
-            let residuals = Tensor::from_companded_q4_bytes(
-                &residual_bytes,
-                EMBEDDING_DIM,
-                &table,
-                &Device::Cpu,
-            )?;
+            let document_indices = decompress_keys(keys_compressed)?;
+            anyhow::ensure!(
+                residual_bytes.len() % gen.residual_bytes == 0,
+                "bucket {bucket_id} residual byte length {} is not divisible by residual width {}; run ./warp-cli reindex with matching feature flags",
+                residual_bytes.len(),
+                gen.residual_bytes
+            );
+            let residuals = if indexed_generations_use_hadamard {
+                packops::residuals_from_bytes_in_quantized_domain(
+                    residual_bytes,
+                    gen.dim,
+                    &gen.residual_dequant_table,
+                    gen.residual_quant_bits,
+                    &Device::Cpu,
+                )?
+            } else {
+                packops::residuals_from_bytes(
+                    residual_bytes,
+                    gen.dim,
+                    &gen.residual_dequant_table,
+                    gen.residual_quant_bits,
+                    &Device::Cpu,
+                )?
+            };
             let (num_docs, _) = residuals.dims2()?;
+            anyhow::ensure!(
+                num_docs == document_indices.len(),
+                "bucket {bucket_id} has {num_docs} residual vectors but {} document indices; run ./warp-cli reindex with matching feature flags",
+                document_indices.len()
+            );
             all_residuals.push(residuals);
             for idx in &document_indices[..num_docs] {
                 document_clusters.push((gen_idx, i as usize));
@@ -823,37 +2772,8 @@ pub fn match_centroids(
         }
     }
 
-    // Also load any unindexed chunks (documents not yet in any generation)
-    let max_indexed_rowid: i64 = db
-        .query("SELECT IFNULL(MAX(max_chunk_rowid), 0) FROM generation")?
-        .query_row((), |row| row.get(0))?;
-
-    let mut unindexed_embeddings = vec![];
-    {
-        let mut unindexed_query = db.query(
-            "SELECT d.rowid, c.embeddings
-             FROM document AS d
-             JOIN chunk AS c ON c.hash = d.hash
-             WHERE c.rowid > ?1
-             ORDER BY d.rowid",
-        )?;
-        let results = unindexed_query.query_map((max_indexed_rowid,), |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        for result in results {
-            let (id, embeddings) = result?;
-            let embeddings =
-                Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
-            let (num_docs, _) = embeddings.dims2()?;
-            unindexed_embeddings.push(embeddings);
-            for _ in 0..num_docs {
-                all.push(((id, 0), count));
-                count += 1;
-            }
-        }
-    }
-
-    if count == 0 {
+    if count == 0 && unindexed.is_empty() {
+        record_bucket_io_counters(io_counters);
         return Ok(vec![]);
     }
 
@@ -864,29 +2784,65 @@ pub fn match_centroids(
     if !all_residuals.is_empty() {
         let all_residuals = Tensor::cat(&all_residuals, 0)?;
         let all_residuals = all_residuals.to_device(device)?;
+        let rotated_query_embeddings = if indexed_generations_use_hadamard {
+            Some(packops::rotate_rows_for_hadamard_residual_similarity(
+                query_embeddings,
+            )?)
+        } else {
+            None
+        };
+        let residual_query_embeddings = rotated_query_embeddings
+            .as_ref()
+            .unwrap_or(query_embeddings);
 
         let residual_sims =
-            fast_ops::matmul_t(query_embeddings, &all_residuals)?.transpose(0, 1)?;
+            fast_ops::matmul_t(residual_query_embeddings, &all_residuals)?.transpose(0, 1)?;
         let residual_sims = residual_sims.to_device(&Device::Cpu)?;
         let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
-        let (num_indexed, _) = residual_sims.dims2()?;
 
         let mut residual_sims_flat = residual_sims.flatten_all()?.to_vec1::<f32>()?;
         for (doc_idx, &(gen_idx, cluster_idx)) in
-            document_clusters.iter().enumerate().take(num_indexed)
+            document_clusters.iter().enumerate()
         {
+            let gen = &generations[gen_idx];
             let centroid_scores = &gen_centroid_scores_all[gen_idx];
+            let centroid_score_ranges = &gen_centroid_score_ranges_all[gen_idx];
             for (query_idx, scores) in centroid_scores.iter().enumerate().take(n) {
                 let offset = doc_idx * n + query_idx;
-                residual_sims_flat[offset] += scores[cluster_idx];
+                let centroid_score = scores[cluster_idx];
+                let residual_weight = packops::residual_centroid_confidence_weight(
+                    centroid_score,
+                    centroid_score_ranges[query_idx],
+                    gen.residual_quant_bits,
+                );
+                residual_sims_flat[offset] =
+                    centroid_score + residual_weight * residual_sims_flat[offset];
             }
         }
         sim.extend_from_slice(&residual_sims_flat);
     }
 
-    // Process unindexed embeddings: full similarities
-    if !unindexed_embeddings.is_empty() {
-        let all_unindexed = Tensor::cat(&unindexed_embeddings, 0)?;
+    // Process unindexed embeddings: full similarities (no centroid boost)
+    if !unindexed.is_empty() {
+        let mut unindexed_tensors = vec![];
+        for (indices, embeddings) in unindexed {
+            let (num_docs, dim) = embeddings.dims2()?;
+            anyhow::ensure!(
+                dim == query_dim,
+                "unindexed embedding dimension {dim} does not match query dimension {query_dim}; re-embed with the selected encoder"
+            );
+            anyhow::ensure!(
+                indices.len() == num_docs,
+                "unindexed embedding has {num_docs} rows but {} document indices",
+                indices.len()
+            );
+            unindexed_tensors.push(embeddings.clone());
+            for idx in indices {
+                all.push((*idx, count));
+                count += 1;
+            }
+        }
+        let all_unindexed = Tensor::cat(&unindexed_tensors, 0)?;
         let all_unindexed = all_unindexed.to_device(device)?;
 
         let unindexed_sims =
@@ -897,9 +2853,15 @@ pub fn match_centroids(
         sim.extend_from_slice(&unindexed_sims_flat);
     }
 
+    if count == 0 {
+        record_bucket_io_counters(io_counters);
+        return Ok(vec![]);
+    }
+
     let missing_similarities = missing;
 
-    let missing_score: f32 = missing_similarities.iter().sum::<f32>() / m as f32;
+    let query_score_weights = QueryScoreWeights::new(m, query_weights)?;
+    let missing_score: f32 = query_score_weights.score(&missing_similarities);
     let cutoff = if missing_score > threshold {
         missing_score
     } else {
@@ -917,12 +2879,13 @@ pub fn match_centroids(
     sub_scores.copy_from_slice(&missing_similarities);
     let mut doc_scores = vec![0.0f32; n];
     doc_scores.copy_from_slice(&missing_similarities);
+    let mut best_sub_score = f32::NEG_INFINITY;
+    let mut best_sub_idx = 0u32;
 
     let mut scored_results: Vec<(f32, u32, u32)> = Vec::new();
     let mut prev_idx = 0u32;
     let mut prev_sub_idx = 0u32;
 
-    let scaler = 1.0f32 / n as f32;
     for i in 0.. {
 
         let is_beyond_end = i == all.len();
@@ -937,16 +2900,22 @@ pub fn match_centroids(
             let sub_idx_change = idx_change || prev_sub_idx != sub_idx;
 
             if sub_idx_change {
-                let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
-                if sub_score > cutoff {
-                    scored_results.push((sub_score, prev_idx, prev_sub_idx));
+                let sub_score = query_score_weights.score(&sub_scores);
+                if sub_score > best_sub_score {
+                    best_sub_score = sub_score;
+                    best_sub_idx = prev_sub_idx;
                 }
                 vmax_inplace(&mut doc_scores, &sub_scores);
-                sub_scores.copy_from_slice(&doc_scores);
+                sub_scores.copy_from_slice(&missing_similarities);
             }
             if idx_change {
+                let doc_score = query_score_weights.score(&doc_scores);
+                if doc_score > cutoff {
+                    scored_results.push((doc_score, prev_idx, best_sub_idx));
+                }
                 doc_scores.copy_from_slice(&missing_similarities);
-                sub_scores.copy_from_slice(&missing_similarities);
+                best_sub_score = f32::NEG_INFINITY;
+                best_sub_idx = sub_idx;
             }
         }
 
@@ -964,66 +2933,22 @@ pub fn match_centroids(
     }
 
     scored_results.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-
-
-    let results = match sql_filter {
-        Some(filter) => {
-            let (filter_sql, filter_params) = build_filter_sql_and_params(Some(filter))?;
-            db.execute("DROP TABLE IF EXISTS temp2")?;
-        db.execute(
-            "CREATE TEMPORARY TABLE temp2(rowid INTEGER, sub_idx INTEGER, score FLOAT, UNIQUE(rowid, sub_idx))",
-        )?;
-        let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
-        for &(score, rowid, sub_idx) in &scored_results {
-            let _ = insert_temp_query.execute((rowid, sub_idx, score));
-        }
-        drop(insert_temp_query);
-
-        let sql = format!(
-            "SELECT score,document.rowid,sub_idx
-            FROM document,temp2
-            WHERE document.rowid = temp2.rowid
-            AND {filter_sql}
-            ORDER BY score DESC
-            LIMIT ?",
-        );
-        let mut scored_documents_query = db.query(&sql)?;
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = filter_params;
-        params.push(Box::new(top_k as i64));
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let filtered = scored_documents_query
-            .query_map(param_refs.as_slice(), |row| {
-                Ok((
-                    row.get::<_, f32>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, u32>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(scored_documents_query);
-        db.execute("DROP TABLE temp2")?;
-        filtered
-        }
-        None => {
-            scored_results.truncate(top_k);
-            scored_results
-        }
-    };
+    scored_results.truncate(top_k);
 
     debug!(
-        "match_centroids: {} embeddings in {} ms.",
+        "match_centroids_raw: {} embeddings in {} ms.",
         count,
         total_start.elapsed().as_millis()
     );
-    Ok(results)
+    record_bucket_io_counters(io_counters);
+    Ok(scored_results)
 }
 
 fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
     let dims = tensor.dims();
     let num_rows = dims[0];
 
-    // Collect each row as a separate Tensor of shape [EMBEDDING_DIM]
+    // Collect each row as a separate one-row tensor.
     (0..num_rows)
         .map(|i| {
             let row_tensor = tensor.i(i).unwrap();
@@ -1032,107 +2957,198 @@ fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
         .collect()
 }
 
-pub struct Gatherer<'a> {
-    documents: Box<dyn Iterator<Item = (String, String, String)> + 'a>,
-    embedder: &'a Embedder,
+fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
+    let mut document_indices = Vec::new();
+    for (i, count) in counts
+        .split(',')
+        .filter_map(|s| s.parse::<u32>().ok())
+        .enumerate()
+    {
+        for _ in 0..count {
+            document_indices.push((id, i as u32));
+        }
+    }
+    document_indices
 }
 
-impl<'a> Gatherer<'a> {
-    fn new(stmt: &'a mut Statement, embedder: &'a Embedder) -> Self {
-        let documents = Box::new(
-            stmt.query_map((), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap),
+fn cached_embeddings_for_rowid(
+    cache: &dyn EmbeddingCache,
+    rowid: u64,
+) -> Result<CachedEmbeddings> {
+    load_cached_embeddings(cache, rowid, "")?
+        .ok_or_else(|| anyhow::anyhow!("missing embeddings for rowid {rowid}"))
+}
+
+fn sample_embeddings_for_rowids(
+    records: &[RowidRecord],
+    cache: &dyn EmbeddingCache,
+    expected_count: usize,
+) -> Result<(Tensor, usize)> {
+    let mut total_embeddings = 0;
+    #[cfg(any(test, feature = "deterministic"))]
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    #[cfg(not(any(test, feature = "deterministic")))]
+    let mut rng = rand::rng();
+    let mut all_embeddings = vec![];
+    let bar = progress::new_with_label(expected_count as u64, "sampling");
+
+    for record in active_rowid_records(records) {
+        let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
+        anyhow::ensure!(
+            embeddings.embedding_count == record.rows as usize,
+            "rowid {} catalog says {} vectors but embedding blob has {}",
+            record.rowid,
+            record.rows,
+            embeddings.embedding_count
         );
-
-        Self {
-            documents,
-            embedder,
+        let t = Tensor::embeddings_from_packed(
+            &embeddings.embeddings,
+            dim_from_model_id(&embeddings.model),
+            &Device::Cpu,
+        )?;
+        let (m, _) = t.dims2()?;
+        let k = ((m as f32).sqrt().ceil()) as usize;
+        let subset_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
+        for i in subset_idx {
+            let row = t.get(i)?;
+            all_embeddings.push(row);
         }
+        total_embeddings += m;
+        bar.inc(m as u64);
     }
+    bar.finish();
+
+    if all_embeddings.is_empty() {
+        return Ok((
+            Tensor::zeros(&[0, DEFAULT_EMBEDDING_DIM], DType::F32, &Device::Cpu)?,
+            0,
+        ));
+    }
+    let matrix = Tensor::stack(&all_embeddings, 0)?;
+    Ok((matrix, total_embeddings))
 }
 
-impl<'a> Iterator for Gatherer<'a> {
-    type Item = (String, Tensor, Vec<u32>);
+fn token_counts_for_lens(body: &str, lens: &str, offsets: &[(usize, usize)]) -> Result<Vec<u32>> {
+    let lengths: Vec<usize> = lens
+        .split(',')
+        .filter_map(|s| s.parse::<usize>().ok())
+        .collect();
+    anyhow::ensure!(!lengths.is_empty(), "document chunk lens are empty");
 
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.documents.next() {
-            Some((hash, body, lens)) => {
-                let now = std::time::Instant::now();
-                let (embeddings, offsets) = self.embedder.embed(&body).unwrap();
-                let embeddings = embeddings
-                    .squeeze(0)
-                    .unwrap()
-                    .to_device(&Device::Cpu)
-                    .unwrap();
-                let (m, _n) = embeddings.dims2().unwrap();
-                let dt = now.elapsed().as_secs_f64();
-                debug!(
-                    "embedder took {} ms ({} rows/s).",
-                    now.elapsed().as_millis(),
-                    ((m as f64) / dt).round()
-                );
-
-                let mut lengths: Vec<usize> = lens
-                    .split(',')
-                    .filter_map(|s| s.parse::<usize>().ok())
-                    .collect();
-                for i in 1..lengths.len() {
-                    lengths[i] += lengths[i - 1];
-                }
-
-                let mut i = 0;
-                let mut j = 0;
-
-                let i_end = offsets.len();
-                let j_end = lengths.len();
-                let mut count: u32 = 0;
-                let mut done = false;
-                let mut flush = false;
-                let mut counts = vec![];
-
-                while !done {
-                    let o = if i < offsets.len() {
-                        offsets[i].1
-                    } else {
-                        usize::MAX
-                    };
-
-                    let l = if j < lengths.len() {
-                        lengths[j]
-                    } else {
-                        usize::MAX
-                    };
-
-                    if o <= l {
-                        i += 1;
-                        count += 1;
-                    } else {
-                        j += 1;
-                        flush = true;
-                    }
-
-                    done = i == i_end && j == j_end;
-
-                    if flush || done {
-                        counts.push(count);
-                        count = 0;
-                        flush = false;
-                    }
-                }
-                assert!(count == 0);
-                assert!(counts.iter().sum::<u32>() == offsets.len() as u32);
-                Some((hash, embeddings, counts))
-            }
-            None => None,
-        }
+    let mut boundaries: Vec<usize> = body.char_indices().map(|(idx, _)| idx).collect();
+    boundaries.push(body.len());
+    let mut ends = Vec::with_capacity(lengths.len());
+    let mut end = 0usize;
+    for length in lengths {
+        end += length;
+        anyhow::ensure!(end < boundaries.len(), "document chunk lengths exceed body length");
+        ends.push(boundaries[end]);
     }
+
+    let mut counts = vec![0u32; ends.len()];
+    for &(_, token_end) in offsets {
+        let chunk_idx = ends.partition_point(|&chunk_end| chunk_end < token_end);
+        anyhow::ensure!(
+            chunk_idx < ends.len(),
+            "token offset {token_end} exceeds document length {}",
+            ends[ends.len() - 1]
+        );
+        counts[chunk_idx] += 1;
+    }
+    anyhow::ensure!(
+        counts.iter().sum::<u32>() == offsets.len() as u32,
+        "token counts do not cover all offsets"
+    );
+    Ok(counts)
+}
+
+struct PrunedDocumentEmbeddings {
+    embeddings: Tensor,
+    counts: Vec<u32>,
+}
+
+fn prune_document_embeddings_by_gate_fraction(
+    embeddings: &Tensor,
+    offsets: &[(usize, usize)],
+    tokens: &[String],
+    counts: &[u32],
+    gate_scores: &[f32],
+    keep_fraction: f64,
+) -> Result<PrunedDocumentEmbeddings> {
+    let (rows, cols) = embeddings.dims2()?;
+    anyhow::ensure!(
+        rows == gate_scores.len(),
+        "gate score count {} does not match embedding rows {rows}",
+        gate_scores.len()
+    );
+    anyhow::ensure!(
+        rows == offsets.len(),
+        "offset count {} does not match embedding rows {rows}",
+        offsets.len()
+    );
+    anyhow::ensure!(
+        rows == tokens.len(),
+        "token count {} does not match embedding rows {rows}",
+        tokens.len()
+    );
+    anyhow::ensure!(
+        counts.iter().map(|c| *c as usize).sum::<usize>() == rows,
+        "document chunk counts do not match embedding rows"
+    );
+
+    let keep = ((rows as f64) * keep_fraction).ceil() as usize;
+    let keep = keep.clamp(1, rows);
+    let mut ranked: Vec<usize> = (0..rows).collect();
+    ranked.sort_unstable_by(|&a, &b| {
+        gate_scores[b]
+            .total_cmp(&gate_scores[a])
+            .then_with(|| a.cmp(&b))
+    });
+    ranked.truncate(keep);
+
+    let mut selected = vec![false; rows];
+    for idx in ranked {
+        selected[idx] = true;
+    }
+    let selected_count = selected.iter().filter(|selected| **selected).count();
+
+    let rows_vec = embeddings.to_vec2::<f32>()?;
+    let mut pruned_rows = Vec::with_capacity(selected_count);
+    let mut pruned_counts = Vec::with_capacity(counts.len());
+    let mut offset = 0usize;
+
+    for &count in counts {
+        let count = count as usize;
+        let mut kept = 0u32;
+        for local_idx in 0..count {
+            let row_idx = offset + local_idx;
+            if selected[row_idx] {
+                pruned_rows.push(rows_vec[row_idx].clone());
+                kept += 1;
+            }
+        }
+        pruned_counts.push(kept);
+        offset += count;
+    }
+
+    let pruned_count = pruned_rows.len();
+    anyhow::ensure!(
+        pruned_count == selected_count,
+        "selected {selected_count} document tokens but retained {pruned_count}"
+    );
+    let mut flat = Vec::with_capacity(pruned_count * cols);
+    for row in pruned_rows {
+        flat.extend(row);
+    }
+    let pruned = Tensor::from_vec(flat, (pruned_count, cols), embeddings.device())?;
+    debug!(
+        "document token gate pruning kept {pruned_count}/{rows} tokens ({:.1}%)",
+        100.0 * (pruned_count as f64) / (rows as f64)
+    );
+    Ok(PrunedDocumentEmbeddings {
+        embeddings: pruned,
+        counts: pruned_counts,
+    })
 }
 
 #[cfg(debug_assertions)]
@@ -1148,299 +3164,776 @@ fn rowwise_cosine_min(a: &Tensor, b: &Tensor) -> Result<f32> {
     Ok(cos.min_all()?.to_scalar::<f32>()?)
 }
 
-#[cfg(debug_assertions)]
-fn stretch_rows(a: &Tensor) -> Result<Tensor> {
-    let device = a.device();
-    let (m, n) = a.dims2()?;
-
-    let mut scaled_rows = Vec::with_capacity(m);
-
-    for i in 0..m {
-        let row = a.get(i)?;
-        let v = row.to_vec1::<f32>()?;
-
-        let mut max = f32::MIN;
-        for x in &v {
-            let a = (*x).abs();
-            max = if a > max { a } else { max };
-        }
-        let range = max + 1e-6;
-        let scale = 1.0 / range;
-
-        let v2: Vec<f32> = v.iter().map(|x| scale * x).collect();
-
-        scaled_rows.push(Tensor::from_vec(v2, n, device)?);
-    }
-
-    Ok(Tensor::stack(&scaled_rows, 0)?)
+pub fn compute_cached_embeddings(
+    embedder: &Embedder,
+    body: &str,
+    lens: &str,
+) -> Result<CachedEmbeddings> {
+    let output = embedder.embed_with_gate_scores_and_tokens(body)?;
+    cached_embeddings_from_output(body, lens, output)
 }
 
-pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
-    let _priority_mgr = PriorityManager::new();
-
-    // Count total documents to embed for progress reporting
-    let mut progress = {
-        let count_sql = format!(
-            "SELECT COUNT(*) FROM document
-            LEFT JOIN chunk ON document.hash = chunk.hash
-            WHERE chunk.hash IS NULL AND length(document.body) > 0
-            {}",
-            match limit {
-                Some(limit) => format!("LIMIT {limit}"),
-                _ => String::new(),
-            }
-        );
-        let mut count_query = db.query(&count_sql)?;
-        let total: i64 = count_query.query_row((), |row| row.get(0))?;
-        let total: usize = total.try_into()?;
-        ProgressReporter::new("embed", total)
-    };
-
-    let sql = format!(
-        "SELECT
-        document.hash,document.body,document.lens
-        FROM document
-        LEFT JOIN chunk ON document.hash = chunk.hash
-        WHERE chunk.hash IS NULL AND length(document.body) > 0
-        ORDER BY document.hash
-        {}",
-        match limit {
-            Some(limit) => format!("LIMIT {limit}"),
-            _ => String::new(),
-        }
+pub fn compute_cached_embeddings_many(
+    embedder: &Embedder,
+    bodies: &[String],
+    lens: &[String],
+) -> Result<Vec<CachedEmbeddings>> {
+    anyhow::ensure!(
+        bodies.len() == lens.len(),
+        "cached embedding batch has {} bodies and {} lens entries",
+        bodies.len(),
+        lens.len()
     );
-    let mut query = db.query(&sql)?;
+    let outputs = embedder.embed_batch_with_gate_scores_and_tokens(bodies)?;
+    bodies
+        .iter()
+        .zip(lens)
+        .zip(outputs)
+        .map(|((body, lens), output)| cached_embeddings_from_output(body, lens, output))
+        .collect()
+}
 
-    let embedding_iter = Gatherer::new(&mut query, embedder);
-    let mut count = 0;
-    for (hash, embeddings, counts) in embedding_iter {
-        debug!(
-            "got embedding for chunk with hash {} {:?} {:?}",
-            hash,
-            embeddings.dims2()?,
-            counts,
-        );
+pub fn cached_embeddings_from_output(
+    body: &str,
+    lens: &str,
+    output: EmbeddingOutput,
+) -> Result<CachedEmbeddings> {
+    let now = std::time::Instant::now();
+    let embeddings = output
+        .embeddings
+        .squeeze(0)?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?;
+    let counts = token_counts_for_lens(body, lens, &output.offsets)?;
+    let gate_scores = output.gate_scores.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("document token pruning requires token_gate tensors in ModernBERT assets")
+    })?;
+    let unpruned_rows = embeddings.dims2()?.0;
+    let pruned = prune_document_embeddings_by_gate_fraction(
+        &embeddings,
+        &output.offsets,
+        &output.tokens,
+        &counts,
+        gate_scores,
+        document_token_keep_fraction(),
+    )?;
+    let embeddings = pruned.embeddings;
+    let counts = pruned.counts;
+    let (rows, cols) = embeddings.dims2()?;
+    let dt = now.elapsed().as_secs_f64();
+    debug!(
+        "embedder took {} ms ({} rows/s), pruned {}/{} document tokens.",
+        now.elapsed().as_millis(),
+        ((rows as f64) / dt).round(),
+        rows,
+        unpruned_rows,
+    );
 
-        let now = std::time::Instant::now();
-        let bytes = embeddings.embeddings_to_packed()?;
-        let (rows, cols) = embeddings.dims2()?;
-        let pct = 100.0 * (bytes.len() as f32) / ((rows * cols) as f32);
-        let bpe = 8.0 * (bytes.len() as f32) / ((rows * cols) as f32);
-        debug!(
-            "compressing to {pct:.2}% {bpe:.2}bpe took {} ms.",
-            now.elapsed().as_millis()
-        );
+    debug!(
+        "got embedding for chunk {:?} {:?}",
+        embeddings.dims2()?,
+        counts,
+    );
 
-        #[cfg(debug_assertions)]
-        {
-            let t = Tensor::embeddings_from_packed(&bytes, EMBEDDING_DIM, &Device::Cpu)?;
-            let min_acc = rowwise_cosine_min(&embeddings, &t)?;
+    let now = std::time::Instant::now();
+    let bytes = embeddings.embeddings_to_packed()?;
+    let pct = 100.0 * (bytes.len() as f32) / ((rows * cols) as f32);
+    let bpe = 8.0 * (bytes.len() as f32) / ((rows * cols) as f32);
+    debug!(
+        "compressing to {pct:.2}% {bpe:.2}bpe took {} ms.",
+        now.elapsed().as_millis()
+    );
 
-            let n = bpe.ceil() as u32;
-            let qn = stretch_rows(&embeddings)?.quantize(n)?.dequantize(n)?;
-            let min_qn_acc = rowwise_cosine_min(&embeddings, &qn)?;
-            debug!("haar reconstruction accuracy={min_acc} compare at q{n}_acc={min_qn_acc}");
-        }
+    #[cfg(debug_assertions)]
+    {
+        let t = Tensor::embeddings_from_packed(&bytes, cols, &Device::Cpu)?;
+        let min_acc = rowwise_cosine_min(&embeddings, &t)?;
 
-        let counts = counts
+        debug!("haar reconstruction accuracy={min_acc}");
+    }
+
+    Ok(CachedEmbeddings {
+        model: model_id_for_dim(cols),
+        counts: counts
             .iter()
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
-            .join(",");
-
-        match db.add_chunk(&hash, "xtr-base-en", &bytes, &counts) {
-            Ok(()) => {
-                count += 1;
-                progress.inc(1);
-            }
-            Err(v) => {
-                return Err(anyhow::anyhow!("add_chunk failed: {v}"));
-            }
-        };
-    }
-    progress.finish();
-
-    debug!("embedded {count} chunks");
-    if count > 0 {
-        db.checkpoint();
-    }
-    Ok(count)
+            .join(","),
+        embedding_count: rows,
+        embeddings: bytes,
+    })
 }
 
-
-pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
-    let total_chunk_embeddings = count_chunk_embeddings(db)?;
-    let indexed = count_indexed_embeddings(db)?;
-    Ok(total_chunk_embeddings.saturating_sub(indexed))
-}
-
-/// Count total embeddings across all chunks by summing the counts column
-/// (not byte length, which is haar-packed and compressed).
-fn count_chunk_embeddings(db: &DB) -> Result<usize> {
-    let mut query = db.query("SELECT counts FROM chunk")?;
-    let mut total = 0usize;
-    let results = query.query_map((), |row| row.get::<_, String>(0))?;
-    for result in results {
-        let counts_str = result?;
-        let n: usize = counts_str
-            .split(',')
-            .filter_map(|s| s.parse::<usize>().ok())
-            .sum();
-        total += n;
-    }
-    Ok(total)
-}
-
-fn count_indexed_embeddings(db: &DB) -> Result<usize> {
-    let count: i64 = db
-        .query(&format!(
-            "SELECT IFNULL(SUM(length(residuals)/{RESIDUAL_BYTES}), 0) FROM bucket"
-        ))?
-        .query_row((), |row| row.get(0))?;
-    Ok(count.try_into()?)
-}
-
-fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(Tensor, usize)> {
-    let mut kmeans_query = db.query(sql)?;
-    let mut total_embeddings = 0;
-    #[cfg(feature = "deterministic")]
-    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-    #[cfg(not(feature = "deterministic"))]
-    let mut rng = rand::rng();
-    let mut all_embeddings = vec![];
-    for embeddings in kmeans_query.query_map((), |row| row.get::<_, Vec<u8>>(0))? {
-        let t = Tensor::embeddings_from_packed(&embeddings?, EMBEDDING_DIM, &Device::Cpu)?;
-        let (m, _) = t.dims2()?;
-        let k = ((m as f32).sqrt().ceil()) as usize;
-        let subset_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
-        for i in subset_idx {
-            let row = t.get(i)?;
-            all_embeddings.push(row);
+#[cfg(any(feature = "sqlite", feature = "capi-embed-cache"))]
+pub(crate) fn load_or_compute_cached_embeddings(
+    cache: &dyn EmbeddingCache,
+    rowid: u64,
+    hash: &str,
+    body: &str,
+    lens: &str,
+    embedder: &Embedder,
+) -> Result<(CachedEmbeddings, bool)> {
+    if let Some(embeddings) = load_cached_embeddings(cache, rowid, hash)? {
+        let chunk_count = lens.split(',').filter_map(|s| s.parse::<usize>().ok()).count();
+        let count_count = embeddings.counts.split(',').filter_map(|s| s.parse::<u32>().ok()).count();
+        if count_count == chunk_count {
+            return Ok((embeddings, false));
         }
-        total_embeddings += m;
+        warn!(
+            "cached embeddings for document {rowid} have {count_count} chunk counts, expected {chunk_count}; recomputing"
+        );
     }
-    if all_embeddings.is_empty() {
-        return Ok((Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?, 0));
-    }
-    let matrix = Tensor::stack(&all_embeddings, 0)?.to_device(device)?;
-    Ok((matrix, total_embeddings))
+
+    let embeddings = compute_cached_embeddings(embedder, body, lens)?;
+    cache.put(hash, &embeddings)?;
+    Ok((embeddings, true))
 }
 
-fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tensor> {
+fn sample_centers(data: &Tensor, k: usize) -> Result<Tensor> {
+    let (m, _) = data.dims2()?;
+    anyhow::ensure!(k > 0 && k <= m, "cannot sample {k} centers from {m} rows");
+    let indices: Vec<u32> = (0..k).map(|i| ((i * m) / k).min(m - 1) as u32).collect();
+    let index_tensor = Tensor::from_slice(indices.as_slice(), (k,), data.device())?;
+    Ok(data.index_select(&index_tensor, 0)?)
+}
+
+fn allocate_child_kmeans_targets(
+    counts: &[usize],
+    masses: Option<&[f32]>,
+    target_k: usize,
+) -> Vec<usize> {
+    let total: usize = counts.iter().sum();
+    if total == 0 || target_k == 0 {
+        return vec![0; counts.len()];
+    }
+
+    let target_k = target_k.min(total);
+    let use_masses = masses.filter(|masses| {
+        masses.len() == counts.len()
+            && masses
+                .iter()
+                .zip(counts)
+                .any(|(&mass, &count)| count > 0 && mass.is_finite() && mass > 0.0)
+    });
+    let total_basis = use_masses
+        .map(|masses| {
+            masses
+                .iter()
+                .zip(counts)
+                .filter(|&(_, &count)| count > 0)
+                .map(|(&mass, _)| mass.max(0.0) as f64)
+                .sum::<f64>()
+        })
+        .filter(|total| *total > 0.0)
+        .unwrap_or(total as f64);
+    let mut child_ks = vec![0usize; counts.len()];
+    let mut remainders = Vec::new();
+    let mut assigned = 0usize;
+
+    for (idx, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let basis = use_masses
+            .map(|masses| masses[idx].max(0.0) as f64)
+            .unwrap_or(count as f64);
+        let exact = (basis / total_basis) * target_k as f64;
+        let base = (exact.floor() as usize).max(1).min(count);
+        child_ks[idx] = base;
+        assigned += base;
+        remainders.push((exact - exact.floor(), idx));
+    }
+
+    if assigned > target_k {
+        remainders.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut excess = assigned - target_k;
+        while excess > 0 {
+            let mut changed = false;
+            for &(_, idx) in &remainders {
+                if child_ks[idx] > 1 {
+                    child_ks[idx] -= 1;
+                    excess -= 1;
+                    changed = true;
+                    if excess == 0 {
+                        break;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    } else if assigned < target_k {
+        remainders.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut remaining = target_k - assigned;
+        while remaining > 0 {
+            let mut changed = false;
+            for &(_, idx) in &remainders {
+                if child_ks[idx] < counts[idx] {
+                    child_ks[idx] += 1;
+                    remaining -= 1;
+                    changed = true;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    child_ks
+}
+
+fn select_tensor_rows(data: &Tensor, rows: &[u32]) -> Result<Tensor> {
+    let index_tensor = Tensor::from_slice(rows, (rows.len(),), data.device())?;
+    Ok(data.index_select(&index_tensor, 0)?)
+}
+
+fn hierarchical_kmeans_for_index(
+    data: &Tensor,
+    weights: Option<&[f32]>,
+    target_k: usize,
+    max_iter: usize,
+    bar: Option<&progress::Bar>,
+    next_leaf_offset: &mut usize,
+) -> Result<IndexKMeans> {
+    let (m, _) = data.dims2()?;
+    let target_k = target_k.min(m);
+    anyhow::ensure!(target_k > 0, "cannot build index kmeans with zero centers");
+
+    if target_k <= INDEX_KMEANS_BRANCHING || m <= INDEX_KMEANS_BRANCHING {
+        let centers = kmeans_inner(data, weights, target_k, max_iter, None)?;
+        let packed_centers = fast_ops::PackedRight::new(&centers)?;
+        let leaf_offset = *next_leaf_offset;
+        *next_leaf_offset += target_k;
+        if let Some(bar) = bar {
+            bar.inc(target_k as u64);
+        }
+        return Ok(IndexKMeans {
+            centers: centers.clone(),
+            routing: IndexKMeansNode {
+                packed_centers,
+                children: vec![],
+                leaf_offset,
+            },
+        });
+    }
+
+    let branch_k = INDEX_KMEANS_BRANCHING.min(target_k).min(m);
+    let coarse = kmeans_inner(data, weights, branch_k, max_iter, None)?;
+    let packed = fast_ops::PackedRight::new(&coarse)?;
+    let assignments = matmul_argmax_batched(data, &packed, KMEANS_MATMUL_BATCH)?
+        .to_device(&Device::Cpu)?
+        .to_vec1::<u32>()?;
+
+    let mut row_groups = vec![Vec::<u32>::new(); branch_k];
+    let mut weight_groups = weights.map(|_| vec![Vec::<f32>::new(); branch_k]);
+    for (row, &child) in assignments.iter().enumerate() {
+        let child = child as usize;
+        row_groups[child].push(row as u32);
+        if let (Some(weights), Some(weight_groups)) = (weights, weight_groups.as_mut()) {
+            weight_groups[child].push(weights[row]);
+        }
+    }
+    let counts: Vec<usize> = row_groups.iter().map(Vec::len).collect();
+    let masses: Option<Vec<f32>> = weight_groups.as_ref().map(|groups| {
+        groups
+            .iter()
+            .map(|group| group.iter().copied().sum::<f32>())
+            .collect()
+    });
+    let active_children = counts.iter().filter(|&&count| count > 0).count();
+    if active_children <= 1 {
+        let centers = sample_centers(data, target_k)?;
+        let packed_centers = fast_ops::PackedRight::new(&centers)?;
+        let leaf_offset = *next_leaf_offset;
+        *next_leaf_offset += target_k;
+        if let Some(bar) = bar {
+            bar.inc(target_k as u64);
+        }
+        return Ok(IndexKMeans {
+            centers: centers.clone(),
+            routing: IndexKMeansNode {
+                packed_centers,
+                children: vec![],
+                leaf_offset,
+            },
+        });
+    }
+
+    let child_targets = allocate_child_kmeans_targets(&counts, masses.as_deref(), target_k);
+    let mut routing_centers = Vec::new();
+    let mut child_nodes = Vec::new();
+    let mut child_centers = Vec::new();
+
+    for child_idx in 0..branch_k {
+        let child_target = child_targets[child_idx];
+        if child_target == 0 {
+            continue;
+        }
+
+        let child_data = select_tensor_rows(data, &row_groups[child_idx])?;
+        let child_weights = weight_groups
+            .as_ref()
+            .map(|groups| groups[child_idx].as_slice());
+        let child = hierarchical_kmeans_for_index(
+            &child_data,
+            child_weights,
+            child_target,
+            max_iter,
+            bar,
+            next_leaf_offset,
+        )?;
+        routing_centers.push(coarse.get(child_idx)?);
+        child_centers.push(child.centers);
+        child_nodes.push(child.routing);
+    }
+
+    let routing = Tensor::stack(&routing_centers, 0)?.to_device(data.device())?;
+    let packed_centers = fast_ops::PackedRight::new(&routing)?;
+    Ok(IndexKMeans {
+        centers: Tensor::cat(&child_centers, 0)?,
+        routing: IndexKMeansNode {
+            packed_centers,
+            children: child_nodes,
+            leaf_offset: 0,
+        },
+    })
+}
+
+fn run_kmeans_for_index(
+    matrix: &Tensor,
+    weights: Option<&[f32]>,
+    total_embeddings: usize,
+) -> Result<IndexKMeans> {
     let now = std::time::Instant::now();
-    let mut k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
+    let sqrt_k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
+    let size_k = total_embeddings.div_ceil(INDEX_TARGET_BUCKET_VECTORS);
+    let mut k = sqrt_k.max(size_k);
     k = k.max(1);
-    debug!("total_embeddings={} k={}", total_embeddings, k);
+    debug!(
+        "total_embeddings={} k={} sqrt_k={} size_k={} target_bucket_vectors={}",
+        total_embeddings, k, sqrt_k, size_k, INDEX_TARGET_BUCKET_VECTORS
+    );
     let (m, _) = matrix.dims2()?;
     if m < k {
         k = (m / 4).max(1);
     }
-    let centers = kmeans(matrix, k, 5)?;
+    let bar = progress::new_with_label(k as u64, "kmeans");
+    let mut next_leaf_offset = 0;
+    let centers = hierarchical_kmeans_for_index(
+        matrix,
+        weights,
+        k,
+        INDEX_KMEANS_ITERATIONS,
+        Some(&bar),
+        &mut next_leaf_offset,
+    )?;
+    bar.finish();
+    anyhow::ensure!(
+        centers.centers.dims2()?.0 == next_leaf_offset,
+        "index kmeans produced inconsistent leaf offsets"
+    );
+    anyhow::ensure!(
+        next_leaf_offset > 0,
+        "index kmeans produced no centers"
+    );
     debug!("kmeans took {} ms.", now.elapsed().as_millis());
     Ok(centers)
+}
+
+fn assign_with_index_kmeans_node(
+    data: &Tensor,
+    node: &IndexKMeansNode,
+    row_indices: &[usize],
+    assignments: &mut [u32],
+    best_scores: &mut [f32],
+) -> Result<()> {
+    let (m, _) = data.dims2()?;
+    if m == 0 {
+        return Ok(());
+    }
+
+    if node.children.is_empty() {
+        let local_assignments =
+            matmul_argmax_scores_batched(data, &node.packed_centers, KMEANS_MATMUL_BATCH)?;
+        for (row, &bucket) in local_assignments.iter().enumerate() {
+            let global_row = row_indices[row];
+            if bucket.1 > best_scores[global_row] {
+                best_scores[global_row] = bucket.1;
+                assignments[global_row] = (node.leaf_offset + bucket.0 as usize).try_into()?;
+            }
+        }
+        return Ok(());
+    }
+
+    debug_assert_eq!(INDEX_ASSIGNMENT_BEAM, 2);
+    let local_assignments = matmul_top2_batched(data, &node.packed_centers, KMEANS_MATMUL_BATCH)?;
+    let mut child_rows = vec![Vec::<u32>::new(); node.children.len()];
+    let mut child_row_indices = vec![Vec::<usize>::new(); node.children.len()];
+    for (row, &(best_child, second_child)) in local_assignments.iter().enumerate() {
+        for child in [best_child, second_child] {
+            let child = child as usize;
+            anyhow::ensure!(
+                child < node.children.len(),
+                "index kmeans routed row to missing child {child}"
+            );
+            child_rows[child].push(row as u32);
+            child_row_indices[child].push(row_indices[row]);
+        }
+    }
+
+    for (child_idx, rows) in child_rows.iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        let child_data = select_tensor_rows(data, rows)?;
+        assign_with_index_kmeans_node(
+            &child_data,
+            &node.children[child_idx],
+            &child_row_indices[child_idx],
+            assignments,
+            best_scores,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn assign_with_index_kmeans(data: &Tensor, routing: &IndexKMeansNode) -> Result<Vec<u32>> {
+    let (m, _) = data.dims2()?;
+    let mut assignments = vec![0u32; m];
+    let mut best_scores = vec![f32::NEG_INFINITY; m];
+    let row_indices: Vec<usize> = (0..m).collect();
+    assign_with_index_kmeans_node(
+        data,
+        routing,
+        &row_indices,
+        &mut assignments,
+        &mut best_scores,
+    )?;
+    Ok(assignments)
+}
+
+fn learn_residual_radius_levels(
+    embeddings: &[Tensor],
+    index_kmeans: &IndexKMeans,
+    residual_centers_cpu: &Tensor,
+    residual_quant_bits: u8,
+) -> Result<Option<Vec<f32>>> {
+    packops::validate_residual_quant_bits(residual_quant_bits)?;
+    if residual_quant_bits == 0 || embeddings.is_empty() {
+        return Ok(None);
+    }
+
+    let data_cpu = Tensor::cat(embeddings, 0)?;
+    let cluster_assignments = assign_with_index_kmeans(&data_cpu, &index_kmeans.routing)?;
+    let (rows, dim) = data_cpu.dims2()?;
+    let (center_count, center_dim) = residual_centers_cpu.dims2()?;
+    anyhow::ensure!(
+        dim == center_dim,
+        "residual training data dimension {dim} does not match center dimension {center_dim}"
+    );
+    anyhow::ensure!(
+        dim % 2 == 0,
+        "polar residual radius training requires an even embedding dimension"
+    );
+    let data = data_cpu.flatten_all()?.to_vec1::<f32>()?;
+    let centers = residual_centers_cpu.flatten_all()?.to_vec1::<f32>()?;
+    let mut radii = Vec::with_capacity(rows * (dim / 2));
+
+    for (row, &bucket) in cluster_assignments.iter().enumerate() {
+        let bucket: usize = bucket.try_into()?;
+        anyhow::ensure!(
+            bucket < center_count,
+            "assigned bucket {bucket} is outside centroid count {center_count}"
+        );
+        let row_offset = row * dim;
+        let center_offset = bucket * dim;
+        let mut residual = Vec::with_capacity(dim);
+        for dim_idx in 0..dim {
+            residual.push(data[row_offset + dim_idx] - centers[center_offset + dim_idx]);
+        }
+        packops::preprocess_residual_for_quantization(&mut residual, residual_quant_bits)?;
+        for dim_idx in (0..dim).step_by(2) {
+            let x = residual[dim_idx];
+            let y = residual[dim_idx + 1];
+            radii.push(x.mul_add(x, y * y).sqrt());
+        }
+    }
+
+    // We tried learning angle levels too, with residual radius^2 as the weight.
+    // It converged to nearly uniform bins and regressed nfcorpus at 2 and 3 bits,
+    // so keep angle quantization analytic and only learn the residual radii.
+    let levels = packops::lloyd_max_radius_levels(&radii, residual_quant_bits)?;
+    debug!(
+        "Lloyd-Max polar radius levels bits={} samples={} levels={:?}",
+        residual_quant_bits,
+        radii.len(),
+        levels
+    );
+    Ok(Some(levels))
+}
+
+fn write_bucket_batch(
+    embeddings: Vec<Tensor>,
+    indices: Vec<DocPtr>,
+    index_kmeans: &IndexKMeans,
+    residual_centers_cpu: &Tensor,
+    residual_bytes: usize,
+    residual_quant_bits: u8,
+    residual_radius_levels: Option<&[f32]>,
+) -> Result<(tempfile::NamedTempFile, u128, u128)> {
+    let now = std::time::Instant::now();
+    let data_cpu = Tensor::cat(&embeddings, 0)?;
+    let cluster_assignments = assign_with_index_kmeans(&data_cpu, &index_kmeans.routing)?;
+    let mmuls_ms = now.elapsed().as_millis();
+
+    let now = std::time::Instant::now();
+    let mut writer = merger::Writer::new(residual_bytes)?;
+
+    let mut pairs: Vec<(usize, u32)> = cluster_assignments
+        .iter()
+        .enumerate()
+        .map(|(i, &bucket)| (i, bucket))
+        .collect();
+    pairs.sort_by_key(|&(_, bucket)| bucket);
+
+    let mut keys: Vec<(u32, u32)> = Vec::with_capacity(indices.len());
+    let mut residuals_bytes: Vec<u8> = Vec::with_capacity(indices.len() * residual_bytes);
+    let (_, mut prev_bucket) = pairs[0];
+
+    for (sample, bucket) in pairs.iter().copied().chain(std::iter::once((0, u32::MAX))) {
+        let bucket_done = bucket == u32::MAX;
+
+        if (bucket != prev_bucket || bucket_done) && !keys.is_empty() {
+            assert!(prev_bucket < bucket);
+            writer.write_record(prev_bucket, &keys, &residuals_bytes)?;
+
+            keys.clear();
+            residuals_bytes.clear();
+            prev_bucket = bucket;
+        }
+
+        if bucket_done {
+            break;
+        }
+
+        match indices.get(sample) {
+            Some(pair) => {
+                keys.push(*pair);
+            }
+            None => {
+                warn!("unable to get key pair from indices @{sample}");
+                keys.push((0, 0));
+            }
+        }
+
+        let center = residual_centers_cpu.get(bucket as usize)?;
+        let residual = (&data_cpu.get(sample)? - &center)?;
+        let residual_quantized = packops::residual_to_temp_bytes_with_radius_levels(
+            &residual,
+            residual_quant_bits,
+            residual_radius_levels,
+        )?;
+        residuals_bytes.extend(&residual_quantized);
+    }
+
+    let tmpfile = writer.finish()?;
+    Ok((tmpfile, mmuls_ms, now.elapsed().as_millis()))
+}
+
+fn mark_assigned_bucket_batch(
+    embeddings: Vec<Tensor>,
+    assigned: &mut [bool],
+    index_kmeans: &IndexKMeans,
+) -> Result<()> {
+    if embeddings.is_empty() {
+        return Ok(());
+    }
+
+    let centroid_count = assigned.len();
+    let data_cpu = Tensor::cat(&embeddings, 0)?;
+    let assignments = assign_with_index_kmeans(&data_cpu, &index_kmeans.routing)?;
+    for bucket in assignments {
+        let bucket: usize = bucket.try_into()?;
+        anyhow::ensure!(
+            bucket < centroid_count,
+            "assigned bucket {bucket} is outside centroid count {centroid_count}"
+        );
+        assigned[bucket] = true;
+    }
+    Ok(())
+}
+
+fn assigned_bucket_indices_for_rowids(
+    records: &[RowidRecord],
+    cache: &dyn EmbeddingCache,
+    index_kmeans: &IndexKMeans,
+    expected_count: u64,
+) -> Result<Vec<usize>> {
+    let (centroid_count, center_dim) = index_kmeans.centers.dims2()?;
+    let mut assigned = vec![false; centroid_count];
+    let bar = progress::new_with_label(expected_count, "routing");
+    let mut all_embeddings = vec![];
+    let mut batch = 0usize;
+
+    for record in active_rowid_records(records) {
+        let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
+        anyhow::ensure!(
+            embeddings.embedding_count == record.rows as usize,
+            "rowid {} catalog says {} vectors but embedding blob has {}",
+            record.rowid,
+            record.rows,
+            embeddings.embedding_count
+        );
+
+        let dim = dim_from_model_id(&embeddings.model);
+        anyhow::ensure!(
+            dim == center_dim,
+            "document embedding dimension {dim} does not match index center dimension {center_dim}"
+        );
+        let t = Tensor::embeddings_from_packed(&embeddings.embeddings, dim, &Device::Cpu)?;
+        let (m, _) = t.dims2()?;
+
+        if batch > 0 && batch + m > INDEX_BATCH_SIZE {
+            mark_assigned_bucket_batch(
+                std::mem::take(&mut all_embeddings),
+                &mut assigned,
+                index_kmeans,
+            )?;
+            bar.inc(batch as u64);
+            batch = 0;
+        }
+
+        all_embeddings.push(t);
+        batch += m;
+
+        if batch >= INDEX_BATCH_SIZE {
+            mark_assigned_bucket_batch(
+                std::mem::take(&mut all_embeddings),
+                &mut assigned,
+                index_kmeans,
+            )?;
+            bar.inc(batch as u64);
+            batch = 0;
+        }
+    }
+
+    if batch > 0 {
+        mark_assigned_bucket_batch(
+            std::mem::take(&mut all_embeddings),
+            &mut assigned,
+            index_kmeans,
+        )?;
+        bar.inc(batch as u64);
+    }
+    bar.finish();
+
+    Ok(assigned
+        .iter()
+        .enumerate()
+        .filter_map(|(bucket_idx, &seen)| seen.then_some(bucket_idx))
+        .collect())
 }
 
 fn level_capacity(level: u32) -> usize {
     L0_CAPACITY * LSM_FANOUT.pow(level + 1)
 }
 
-/// Build one generation for a range of chunks, reading original embeddings from
-/// the chunk table and running full k-means.
-fn build_layer(
-    db: &DB,
-    device: &Device,
-    level: u32,
-    min_rowid: i64,
-    max_rowid: i64,
-) -> Result<()> {
-    let sql = format!(
-        "SELECT chunk.embeddings FROM chunk
-         WHERE chunk.rowid >= {} AND chunk.rowid <= {}",
-        min_rowid, max_rowid
-    );
-    let (matrix, total_embeddings) = sample_embeddings_for_kmeans(db, &sql, device)?;
-    if total_embeddings == 0 {
-        return Ok(());
-    }
-
-    info!(
-        "building L{} with {} embeddings (chunks {}..={})",
-        level, total_embeddings, min_rowid, max_rowid
-    );
-    let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
-    drop(matrix); // Free kmeans sample matrix before write_buckets
-
-    let (tmpfiles, centers_cpu) =
-        write_buckets_for_range(db, &centers, device, total_embeddings as u64, min_rowid, max_rowid)?;
-
-    let gen_id = db.add_generation(level, total_embeddings as u64, min_rowid, max_rowid)?;
-    let bucket_id_offset = 0u32;
-    merge_and_write_buckets(db, tmpfiles, &centers_cpu, gen_id, bucket_id_offset)?;
-
-    Ok(())
-}
-
-/// Like write_buckets but only processes chunks in [min_rowid, max_rowid].
-fn write_buckets_for_range(
-    db: &DB,
-    centers: &Tensor,
-    device: &Device,
+fn write_buckets_for_rowids(
+    records: &[RowidRecord],
+    cache: &dyn EmbeddingCache,
+    index_kmeans: &IndexKMeans,
     expected_count: u64,
-    min_rowid: i64,
-    max_rowid: i64,
-) -> Result<(Vec<tempfile::NamedTempFile>, Tensor)> {
+    residual_quant_bits: u8,
+) -> Result<(Vec<tempfile::NamedTempFile>, CenterSidecarData, Option<Vec<f32>>)> {
     let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
     let mut writes_total = 0;
 
-    let bar = progress::new_with_label(expected_count, "indexing");
-
     let mut document_indices = Vec::<(u32, u32)>::new();
     let mut all_embeddings = vec![];
-
-    let embeddings_sql = format!(
-        "SELECT document.rowid, chunk.embeddings, chunk.counts
-         FROM document, chunk
-         WHERE document.hash = chunk.hash
-         AND chunk.rowid >= {} AND chunk.rowid <= {}
-         ORDER BY document.rowid",
-        min_rowid, max_rowid
-    );
-
-    let mut query = db.query(&embeddings_sql)?;
-
-    let mut results = query.query_map((), |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, Vec<u8>>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
 
     let mut done = false;
     let mut batch = 0;
     let mut tmpfiles = vec![];
+    let centers = &index_kmeans.centers;
     let centers_cpu = centers.to_device(&Device::Cpu)?;
-    let packed_centers = fast_ops::PackedRight::new(centers)?;
+    let (_, center_dim) = centers_cpu.dims2()?;
+    let residual_bytes = packops::temp_residual_bytes_for_dim(center_dim, residual_quant_bits)?;
+    let bucket_indices =
+        assigned_bucket_indices_for_rowids(records, cache, index_kmeans, expected_count)?;
+    let center_sidecar = prepare_center_sidecar_data(&centers_cpu, bucket_indices)?;
+    let residual_centers_cpu = &center_sidecar.residual_centers_cpu;
+    let bar = progress::new_with_label(expected_count, "indexing");
+    let mut records = active_rowid_records(records);
+    let mut residual_radius_levels = None;
+    let mut attempted_radius_training = false;
     while !done {
-        match results.next() {
-            Some(result) => {
-                let (id, embeddings, counts) = result?;
+        match records.next() {
+            Some(record) => {
+                let id: u32 = record.rowid.try_into().map_err(|_| {
+                    anyhow::anyhow!(
+                        "rowid {} exceeds current bucket key limit {}",
+                        record.rowid,
+                        u32::MAX
+                    )
+                })?;
+                let embeddings = cached_embeddings_for_rowid(cache, record.rowid)?;
+                anyhow::ensure!(
+                    embeddings.embedding_count == record.rows as usize,
+                    "rowid {} catalog says {} vectors but embedding blob has {}",
+                    record.rowid,
+                    record.rows,
+                    embeddings.embedding_count
+                );
 
-                let t = Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
-                let split = split_tensor(&t);
-                let m = split.len();
+                let dim = dim_from_model_id(&embeddings.model);
+                anyhow::ensure!(
+                    dim == center_dim,
+                    "document embedding dimension {dim} does not match index center dimension {center_dim}"
+                );
+                let t = Tensor::embeddings_from_packed(&embeddings.embeddings, dim, &Device::Cpu)?;
+                let (m, _) = t.dims2()?;
 
-                for (i, count) in counts
-                    .split(',')
-                    .filter_map(|s| s.parse::<u32>().ok())
-                    .enumerate()
-                {
-                    for _ in 0..count {
-                        document_indices.push((id, i as u32));
+                let docptrs = docptrs_for_counts(id, &embeddings.counts);
+                anyhow::ensure!(
+                    docptrs.len() == m,
+                    "document {id} has {m} embedding rows but {} document indices",
+                    docptrs.len()
+                );
+                if batch > 0 && batch + m > INDEX_BATCH_SIZE {
+                    if !attempted_radius_training {
+                        residual_radius_levels = learn_residual_radius_levels(
+                            &all_embeddings,
+                            index_kmeans,
+                            residual_centers_cpu,
+                            residual_quant_bits,
+                        )?;
+                        attempted_radius_training = true;
                     }
+                    let (tmpfile, mmuls_ms, writes_ms) = write_bucket_batch(
+                        std::mem::take(&mut all_embeddings),
+                        std::mem::take(&mut document_indices),
+                        index_kmeans,
+                        residual_centers_cpu,
+                        residual_bytes,
+                        residual_quant_bits,
+                        residual_radius_levels.as_deref(),
+                    )?;
+                    tmpfiles.push(tmpfile);
+                    mmuls_total += mmuls_ms;
+                    writes_total += writes_ms;
+                    bar.inc(batch as u64);
+                    batch = 0;
                 }
-                all_embeddings.extend(split);
+
+                document_indices.extend(docptrs);
+                all_embeddings.push(t);
                 batch += m;
             }
             None => {
@@ -1448,73 +3941,34 @@ fn write_buckets_for_range(
             }
         }
 
-        let batch_size = 0x10000;
-
-        if batch >= batch_size || done {
-            let now = std::time::Instant::now();
-
-            let take = batch.min(batch_size);
-            let left = batch - take;
-
-            let embeddings = all_embeddings.split_off(left);
-            let indices = document_indices.split_off(left);
-            let data = Tensor::cat(&embeddings, 0)?.to_device(device)?;
-
-            let cluster_assignments =
-                matmul_argmax_batched(&data, &packed_centers, 1024)?.to_device(&Device::Cpu)?;
-            mmuls_total += now.elapsed().as_millis();
-
-            let now = std::time::Instant::now();
-            let mut writer = merger::Writer::new(RESIDUAL_BYTES)?;
-
-            let mut pairs: Vec<(usize, u32)> = cluster_assignments
-                .to_vec1::<u32>()?
-                .iter()
-                .enumerate()
-                .map(|(i, &bucket)| (i, bucket))
-                .collect();
-            pairs.sort_by_key(|&(_, bucket)| bucket);
-
-            let mut keys: Vec<(u32, u32)> = Vec::with_capacity(take);
-            let mut residuals_bytes: Vec<u8> = Vec::with_capacity(take * RESIDUAL_BYTES);
-            let (_, mut prev_bucket) = pairs[0];
-
-            for (sample, bucket) in pairs.iter().copied().chain(std::iter::once((0, u32::MAX))) {
-                let bucket_done = bucket == u32::MAX;
-
-                if (bucket != prev_bucket || bucket_done) && !keys.is_empty() {
-                    assert!(prev_bucket < bucket);
-                    writer.write_record(prev_bucket, &keys, &residuals_bytes)?;
-
-                    keys.clear();
-                    residuals_bytes.clear();
-                    prev_bucket = bucket;
-                }
-
-                if bucket_done {
-                    break;
-                }
-
-                match indices.get(sample) {
-                    Some(pair) => {
-                        keys.push(*pair);
-                    }
-                    None => {
-                        warn!("unable to get key pair from indices @{sample}");
-                        keys.push((0, 0));
-                    }
-                }
-
-                let center = centers_cpu.get(bucket as usize)?;
-                let residual = (embeddings[sample].get(0) - &center)?;
-                let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
-                residuals_bytes.extend(&residual_quantized);
+        if batch >= INDEX_BATCH_SIZE || done {
+            if batch == 0 {
+                continue;
             }
-            tmpfiles.push(writer.finish()?);
-            writes_total += now.elapsed().as_millis();
-            bar.inc(take as u64);
-
-            batch = left;
+            let flushed = batch;
+            if !attempted_radius_training {
+                residual_radius_levels = learn_residual_radius_levels(
+                    &all_embeddings,
+                    index_kmeans,
+                    residual_centers_cpu,
+                    residual_quant_bits,
+                )?;
+                attempted_radius_training = true;
+            }
+            let (tmpfile, mmuls_ms, writes_ms) = write_bucket_batch(
+                std::mem::take(&mut all_embeddings),
+                std::mem::take(&mut document_indices),
+                index_kmeans,
+                residual_centers_cpu,
+                residual_bytes,
+                residual_quant_bits,
+                residual_radius_levels.as_deref(),
+            )?;
+            tmpfiles.push(tmpfile);
+            mmuls_total += mmuls_ms;
+            writes_total += writes_ms;
+            bar.inc(flushed as u64);
+            batch = 0;
         }
     }
     bar.finish();
@@ -1522,53 +3976,95 @@ fn write_buckets_for_range(
     debug!("mmuls took {} ms.", mmuls_total);
     debug!("writes took {} ms.", writes_total);
 
-    Ok((tmpfiles, centers_cpu))
+    Ok((tmpfiles, center_sidecar, residual_radius_levels))
 }
 
-pub fn full_index(db: &DB, device: &Device) -> Result<()> {
-    db.execute("DELETE FROM bucket")?;
-    db.execute("DELETE FROM generation")?;
-    invalidate_center_cache(db);
-    index_chunks(db, device)
+fn build_index_generation(
+    index: &FileBackedIndex,
+    cache: &dyn EmbeddingCache,
+    level: u32,
+    records: &[RowidRecord],
+    options: IndexOptions,
+) -> Result<Option<FileIndexGeneration>> {
+    let active_embeddings = rowid_records_embedding_count(records);
+    if active_embeddings == 0 {
+        return Ok(None);
+    }
+
+    let (matrix, total_embeddings) = sample_embeddings_for_rowids(records, cache, active_embeddings)?;
+    if total_embeddings == 0 {
+        return Ok(None);
+    }
+
+    info!(
+        "building standalone L{} with {} embeddings",
+        level, total_embeddings
+    );
+    let centers = run_kmeans_for_index(&matrix, None, total_embeddings)?;
+    drop(matrix);
+
+    let data_file = index.generation_file_name(level);
+    let data_path = index.path_for(&data_file);
+    let residual_quant_bits = options.residual_quant_bits();
+
+    let (tmpfiles, center_sidecar, residual_radius_levels) = write_buckets_for_rowids(
+        records,
+        cache,
+        &centers,
+        total_embeddings as u64,
+        residual_quant_bits,
+    )?;
+    if let Err(err) = merge_and_write_buckets_to_path(
+        tmpfiles,
+        &center_sidecar,
+        records,
+        &data_path,
+        residual_quant_bits,
+        residual_radius_levels.as_deref(),
+    ) {
+        let _ = std::fs::remove_file(&data_path);
+        return Err(err);
+    }
+
+    Ok(Some(FileIndexGeneration {
+        level,
+        num_embeddings: total_embeddings,
+        data_file,
+    }))
 }
 
-pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
-    let x = count_unindexed_embeddings(db)?;
+pub(crate) fn index_buffered_embeddings_with_options(
+    index: &FileBackedIndex,
+    cache: &dyn EmbeddingCache,
+    options: IndexOptions,
+) -> Result<()> {
+    let buffer = sort_dedup_rowid_records(read_rowid_records(index.rowid_buffer_path())?);
+    let x = rowid_records_embedding_count(&buffer);
     if x == 0 {
         return Ok(());
     }
 
-    let indexed = count_indexed_embeddings(db)?;
-    info!("database has {} unindexed embeddings ({} indexed)", x, indexed);
+    let generations = index.read_manifest()?;
+    let indexed: usize = generations
+        .iter()
+        .map(|generation| generation.num_embeddings)
+        .sum();
+    info!("standalone index has {} buffered embeddings ({} indexed)", x, indexed);
 
-    if x < L0_CAPACITY {
-        debug!("buffering {} unindexed embeddings (< {} threshold)", x, L0_CAPACITY);
+    if x < L0_CAPACITY && !options.force_flush {
+        debug!("buffering {} embeddings (< {} threshold)", x, L0_CAPACITY);
         return Ok(());
     }
 
-    // Find the max indexed chunk rowid — unindexed chunks are above this
-    let max_indexed_rowid: i64 = db
-        .query("SELECT IFNULL(MAX(max_chunk_rowid), 0) FROM generation")?
-        .query_row((), |row| row.get(0))?;
-    let max_chunk_rowid: i64 = db
-        .query("SELECT MAX(rowid) FROM chunk")?
-        .query_row((), |row| row.get(0))?;
-
-    // Cascade: accumulate x through levels until we find one with room
     let mut total = x;
     let mut target_level = 0u32;
-
     loop {
         let cap = level_capacity(target_level);
-        let level_size: usize = db
-            .query(&format!(
-                "SELECT IFNULL(SUM(num_embeddings), 0) FROM generation WHERE level = {}",
-                target_level
-            ))?
-            .query_row((), |row| {
-                let level_size: i64 = row.get(0)?;
-                Ok(level_size as usize)
-            })?;
+        let level_size: usize = generations
+            .iter()
+            .filter(|generation| generation.level == target_level)
+            .map(|generation| generation.num_embeddings)
+            .sum();
         total += level_size;
         if total <= cap {
             break;
@@ -1576,37 +4072,32 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
         target_level += 1;
     }
 
-    // Find the min chunk rowid across all levels being merged + unindexed
-    let min_rowid: i64 = db
-        .query(&format!(
-            "SELECT IFNULL(MIN(min_chunk_rowid), {}) FROM generation WHERE level <= {}",
-            max_indexed_rowid + 1,
-            target_level
-        ))?
-        .query_row((), |row| row.get(0))?;
+    let mut inputs = vec![buffer];
+    let mut stale_generations = vec![];
+    let mut kept_generations = vec![];
+    for generation in generations {
+        if generation.level <= target_level {
+            inputs.push(index.generation_rowid_records(&generation)?);
+            stale_generations.push(generation);
+        } else {
+            kept_generations.push(generation);
+        }
+    }
 
-    info!(
-        "cascading {} embeddings into L{} (chunks {}..={})",
-        total, target_level, min_rowid, max_chunk_rowid
-    );
-
-    db.begin_transaction()?;
-
-    // Delete all generations at levels 0..=target_level (they get merged)
-    let delete_sql = format!(
-        "DELETE FROM bucket WHERE generation_id IN \
-         (SELECT id FROM generation WHERE level <= {})",
-        target_level
-    );
-    db.execute(&delete_sql)?;
-    let delete_sql = format!("DELETE FROM generation WHERE level <= {}", target_level);
-    db.execute(&delete_sql)?;
-
-    build_layer(db, device, target_level, min_rowid, max_chunk_rowid)?;
-
-    db.commit_transaction()?;
-    invalidate_center_cache(db);
-    db.checkpoint();
+    let mut merged = nway_merge_rowid_records(&inputs);
+    if kept_generations.is_empty() {
+        merged.retain(|record| record.rows > 0);
+    }
+    if let Some(generation) =
+        build_index_generation(index, cache, target_level, &merged, options)?
+    {
+        kept_generations.push(generation);
+    }
+    kept_generations.sort_by_key(|generation| generation.level);
+    index.write_manifest(&kept_generations)?;
+    let _ = std::fs::remove_file(index.rowid_buffer_path());
+    index.remove_generation_files(&stale_generations);
+    clear_generations_cache();
     Ok(())
 }
 
@@ -1634,124 +4125,6 @@ impl EmbeddingsCache {
     }
 }
 
-pub fn search(
-    db: &DB,
-    embedder: &Embedder,
-    cache: &mut EmbeddingsCache,
-    q: &str,
-    threshold: f32,
-    top_k: usize,
-    use_fulltext: bool,
-    sql_filter: Option<&SqlStatementInternal>,
-) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
-    let now = std::time::Instant::now();
-
-    let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    let fts_matches = if use_fulltext {
-        fulltext_search(db, &q, top_k, sql_filter)?
-    } else {
-        vec![]
-    };
-
-    let sem_matches = if q.len() > 3 {
-        let qe = match cache.get(&q) {
-            Some(existing) => existing,
-            None => {
-                let (qe, _) = embedder.embed(&q)?;
-                let qe = qe.get(0)?;
-                cache.put(&q, &qe);
-                qe
-            }
-        };
-        match match_centroids(db, &qe, threshold, top_k, sql_filter) {
-            Ok(result) => result,
-            Err(v) => {
-                warn!("match_centroids failed {v}");
-                vec![]
-            }
-        }
-    } else {
-        vec![]
-    };
-
-    let mut scores: HashMap<DocPtr, f32> = HashMap::new();
-    let mut offsets: HashMap<DocPtr, u32> = HashMap::new();
-
-    for (score, idx, offset) in &fts_matches {
-        let key = (*idx, *offset);
-        scores.insert(key, *score);
-        offsets.insert(key, *offset);
-    }
-    for (score, idx, offset) in &sem_matches {
-        let key = (*idx, *offset);
-        scores.insert(key, *score);
-        offsets.insert(key, *offset);
-    }
-
-    let sem_idxs: Vec<DocPtr> = sem_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
-    info!("semantic search found {} matches", sem_idxs.len());
-
-    let mut fused = if use_fulltext {
-        let fts_idxs: Vec<DocPtr> = fts_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
-        hybrid_reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
-    } else {
-        sem_idxs
-    };
-    fused.truncate(top_k);
-
-    let mut results = vec![];
-    // Stale bucket entries from before a re-chunking may have out-of-range sub_idx
-    // values that clamp to the same position, producing duplicates.
-    let mut seen: HashMap<u32, bool> = HashMap::new();
-    let mut body_query = db.query("SELECT metadata,body,lens,date FROM document WHERE rowid = ?1")?;
-    for (idx, sub_idx) in fused {
-        let tuple : DocPtr = (idx, sub_idx);
-        let score = match scores.get(&tuple) {
-            Some(score) => *score,
-            None => 0.0f32,
-        };
-        let row = body_query.query_row((idx,), |row| {
-            let (metadata, body, lens, date) = (
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            );
-            let lens: Vec<usize> = lens
-                .split(',')
-                .map(|x| x.parse::<usize>().unwrap())
-                .collect();
-            let bodies: Vec<String> = split_by_codepoints(&body, &lens)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect();
-            Ok((metadata, bodies, date))
-        }).optional()?;
-        let Some((metadata, bodies, date)) = row else {
-            continue;
-        };
-
-        let sub = (sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
-        if seen.insert(idx, true).is_some() {
-            continue;
-        }
-        results.push((score, metadata, bodies, sub, date));
-    }
-
-    let mut max = -1.0f32;
-    for (score, _, _, _, _) in results.iter_mut().rev() {
-        max = max.max(*score);
-        *score = max;
-    }
-
-    debug!(
-        "witchcraft search took {} ms end-to-end.",
-        now.elapsed().as_millis()
-    );
-    Ok(results)
-}
-
 pub fn score_query_sentences(
     embedder: &Embedder,
     cache: &mut EmbeddingsCache,
@@ -1762,7 +4135,7 @@ pub fn score_query_sentences(
     let qe = match cache.get(q) {
         Some(existing) => existing,
         None => {
-            let (qe, _offsets) = embedder.embed(q)?;
+            let (qe, _offsets) = embedder.embed_query(q)?;
 
             qe.get(0)?
         }
@@ -1827,6 +4200,18 @@ pub fn split_by_codepoints<'a>(s: &'a str, lengths: &[usize]) -> Vec<&'a str> {
 }
 
 #[test]
+fn token_counts_match_document_chunk_count() {
+    let counts = token_counts_for_lens("abcde", "3,2", &[(0, 1), (1, 3), (3, 4), (4, 5)]).unwrap();
+    assert_eq!(counts, vec![2, 2]);
+}
+
+#[test]
+fn token_counts_use_utf8_byte_offsets() {
+    let counts = token_counts_for_lens("åbcde", "3,2", &[(0, 2), (2, 4), (4, 6)]).unwrap();
+    assert_eq!(counts, vec![2, 1]);
+}
+
+#[test]
 fn test_compress_decompress_keys_roundtrip() {
     let test_cases = vec![
         vec![],
@@ -1845,5 +4230,5 @@ fn test_compress_decompress_keys_roundtrip() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests;

@@ -8,6 +8,7 @@ pub struct ProgressReporter {
     total: usize,
     #[cfg(feature = "napi")]
     current: usize,
+    #[cfg(feature = "napi")]
     phase: String,
 }
 
@@ -35,6 +36,7 @@ impl ProgressReporter {
             total,
             #[cfg(feature = "napi")]
             current: 0,
+            #[cfg(feature = "napi")]
             phase: phase.to_string(),
         }
     }
@@ -58,7 +60,7 @@ impl ProgressReporter {
     pub fn finish(&self) {
         #[cfg(feature = "progress")]
         if let Some(ref pb) = self.pb {
-            pb.finish_with_message(self.phase.clone());
+            pb.finish_and_clear();
         }
 
         #[cfg(feature = "napi")]

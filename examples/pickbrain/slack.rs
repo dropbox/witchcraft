@@ -83,8 +83,7 @@ struct OpenSession {
 }
 
 fn find_slack_blob_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let idb_dir = PathBuf::from(home).join("Library/Application Support/Slack/IndexedDB");
+    let idb_dir = crate::home_dir().join("Library/Application Support/Slack/IndexedDB");
     if !idb_dir.is_dir() {
         return None;
     }
@@ -877,7 +876,7 @@ fn ingest_conversations(db: &mut DB, conversations: Vec<Conversation>) -> Result
             .unwrap_or(true);
 
         if body_changed || metadata_changed {
-            db.add_doc(&uuid, ts, &metadata, &body, Some(lens))?;
+            db.add_doc(None, &uuid, ts, &metadata, &body, Some(lens))?;
         }
         if body_changed {
             count += 1;

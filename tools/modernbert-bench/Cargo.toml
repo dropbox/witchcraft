@@ -1,0 +1,30 @@
+[package]
+name = "modernbert-bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "modernbert-bench"
+path = "src/main.rs"
+
+[dependencies]
+witchcraft = { path = "../..", default-features = false }
+candle-core = { git = "https://github.com/jacobgorm/candle", rev = "6029ddd825b625c93e0d20441e55db673902510b" }
+tokenizers = { version = "0.22", default-features = false }
+anyhow = "*"
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+accelerate-src = { version = "0.3.2", optional = true }
+libc = { version = "0.2.147", optional = true }
+
+[features]
+default = ["modernbert-quantized"]
+modernbert = ["witchcraft/modernbert"]
+modernbert-quantized = ["witchcraft/modernbert-quantized"]
+hybrid-dequant = ["witchcraft/hybrid-dequant"]
+fbgemm = ["witchcraft/fbgemm"]
+metal = ["witchcraft/metal"]
+neso-metal = ["witchcraft/neso-metal"]
+neso-d3d12 = ["witchcraft/neso-d3d12"]
+accelerate = ["dep:libc", "dep:accelerate-src", "candle-core/accelerate"]
+cuda = ["witchcraft/cuda", "candle-core/cuda"]
