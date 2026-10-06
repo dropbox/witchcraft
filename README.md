@@ -97,7 +97,7 @@ make pickbrain
 ./pickbrain --dump <UUID>          # print full conversation
 ```
 
-Set `PRE_INGEST_COMMAND` to a shell command that runs before pickbrain checks for new sessions (for example, an `rsync` from another host). Set `EXTRA_CODEX_DIRS`, `EXTRA_CLAUDE_DIRS`, or `EXTRA_PI_DIRS` to colon-separated additional data directories. Each entry should have the same layout as `~/.codex`, `~/.claude`, or `~/.pi/agent`, respectively. Pickbrain scans these alongside the default directories.
+Set `PRE_INGEST_COMMAND` to a shell command that runs before pickbrain checks for new sessions (for example, an `rsync` from another host). Set `EXTRA_CODEX_DIRS`, `EXTRA_CLAUDE_DIRS`, or `EXTRA_PI_DIRS` to additional data directories separated by `:` on Unix or `;` on Windows. Each entry should have the same layout as `~/.codex`, `~/.claude`, or `~/.pi/agent`, respectively. Pickbrain scans these alongside the default directories.
 
 `scripts/sync_codex_sessions.sh` takes an SSH host and an absolute local directory. It copies only session `*.jsonl` files and writes the host to `pickbrain.remote`. Pickbrain labels those results as downloaded; press `r` in the browser to see the SSH command for that host.
 
@@ -115,6 +115,70 @@ search. To install pickbrain as a skill/extension for Pi and as a skill for both
 ```
 make pickbrain-install
 ```
+
+For automatic ingestion, run Pickbrain in watcher mode:
+
+```
+make pickbrain
+./pickbrain --watch
+```
+
+`pickbrain --watch` watches local Claude, Codex, and Pi directories, configured extra
+directories, and Slack's IndexedDB blobs on macOS. It uses native notifications,
+waits for 30 seconds without changes, and caps the delay at five minutes. Set
+`--delay SECONDS` and `--max-delay SECONDS` to adjust these intervals. It checks
+for outstanding work at startup and rescans when notifications are lost. New or
+recreated source directories are detected automatically.
+
+On macOS, FSEvents can defer notifications for session files kept open by Codex.
+The watcher also checks session file sizes and change times every quiet-delay
+interval (30 seconds by default). This reads metadata only; ingestion starts when
+changes are detected and the debounce delay expires.
+
+The watcher spawns its own executable with `--ingest-only --quiet`, with one child at a time.
+It logs each completed run as `pickbrain: no changes` or
+`pickbrain: ingested and indexed N documents`. Counts refer to processed documents
+(conversation turns and files), including documents reread from changed sessions.
+The summary appears after indexing succeeds; errors remain visible.
+The watcher retains changes arriving during ingestion for another pass. Failed children
+are retried after the quiet delay. Model memory and GPU resources belong to the
+child and are released when it exits; watcher mode enters before database,
+model, or GPU initialization and waits between notifications and metadata checks. Pickbrain's database, logs, and watermarks
+do not trigger ingestion. The normal ingestion lock also protects against
+interactive Pickbrain runs. Incomplete headless ingestion is retried even if
+source watermarks have already advanced.
+
+`make pickbrain-install` installs the single binary in `~/bin`, then registers or
+updates the background watcher. To register an existing binary directly, run:
+
+```
+pickbrain --register
+```
+
+Registration starts the watcher immediately and at login, using a macOS user
+LaunchAgent (`com.dropbox.pickbrain`), Linux user systemd service
+(`pickbrain.service`), or Windows Task Scheduler logon task (`Pickbrain-<user SID>`).
+It replaces the same job on subsequent registrations. `--delay` and `--max-delay`
+also work with `--register`. Registration saves the current working directory,
+`PATH`, source-directory settings, `PICKBRAIN_DIR`, `WARP_ASSETS`, and
+`PRE_INGEST_COMMAND` in `~/.pickbrain/watch.json`, so the background job can use the
+same settings outside your shell. Re-register to change them. Logs, including
+ingestion summaries and errors, go to `~/.pickbrain/watch.log`:
+
+```
+tail -f ~/.pickbrain/watch.log
+```
+
+On macOS, stop the job with
+`launchctl bootout gui/$(id -u)/com.dropbox.pickbrain`; remove
+`~/Library/LaunchAgents/com.dropbox.pickbrain.plist` to prevent launch at the next
+login. On Linux use `systemctl --user disable --now pickbrain.service`; on Windows,
+stop and delete the named task in Task Scheduler. Linux registration requires a
+running user systemd manager. On Windows, `USERPROFILE` supplies the home directory
+when `HOME` is unset. The watcher uses its own executable path, so symlinks and
+`PATH` resolution need no configuration. Remote hosts still need a separate
+periodic synchronization job, since local filesystem notifications cannot detect
+changes on those hosts.
 
 This puts the binary on your `PATH` and installs the skill/extension definitions so
 you can use pickbrain directly from Pi, Claude Code, or Codex to answer questions requiring

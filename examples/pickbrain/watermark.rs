@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 pub fn source_dirs(default: &str, extra_env: &str) -> Vec<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut dirs = vec![PathBuf::from(home).join(default)];
+    let mut dirs = vec![crate::home_dir().join(default)];
     if let Ok(extra) = std::env::var(extra_env) {
         append_extra_dirs(&mut dirs, &extra);
     }
@@ -12,8 +11,7 @@ pub fn source_dirs(default: &str, extra_env: &str) -> Vec<PathBuf> {
 }
 
 fn append_extra_dirs(dirs: &mut Vec<PathBuf>, extra: &str) {
-    for part in extra.split(':').filter(|part| !part.is_empty()) {
-        let dir = PathBuf::from(part);
+    for dir in std::env::split_paths(extra).filter(|dir| !dir.as_os_str().is_empty()) {
         if !dirs.contains(&dir) { dirs.push(dir); }
     }
 }
@@ -56,8 +54,7 @@ fn watermark_path(agent_dir: &str) -> PathBuf {
         let name = agent_dir.trim_start_matches('.');
         return crate::pickbrain_dir().join(format!("{name}.watermark"));
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home)
+    crate::home_dir()
         .join(agent_dir)
         .join("pickbrain.watermark")
 }
@@ -139,9 +136,10 @@ mod tests {
     }
 
     #[test]
-    fn extra_dirs_are_colon_separated_and_deduplicated() {
+    fn extra_dirs_are_path_lists_and_deduplicated() {
         let mut dirs = vec![PathBuf::from("/default")];
-        append_extra_dirs(&mut dirs, "/one::/two:/one:/default");
+        let extra = std::env::join_paths(["/one", "", "/two", "/one", "/default"]).unwrap();
+        append_extra_dirs(&mut dirs, extra.to_str().unwrap());
         assert_eq!(dirs, vec!["/default", "/one", "/two"].into_iter().map(PathBuf::from).collect::<Vec<_>>());
     }
 

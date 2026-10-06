@@ -83,8 +83,7 @@ struct OpenSession {
 }
 
 fn find_slack_blob_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let idb_dir = PathBuf::from(home).join("Library/Application Support/Slack/IndexedDB");
+    let idb_dir = crate::home_dir().join("Library/Application Support/Slack/IndexedDB");
     if !idb_dir.is_dir() {
         return None;
     }

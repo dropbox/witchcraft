@@ -30,6 +30,12 @@ impl log::Log for SimpleLogger {
 static LOGGER: SimpleLogger = SimpleLogger;
 const PICKBRAIN_DIR_ENV: &str = "PICKBRAIN_DIR";
 
+pub(crate) fn home_dir() -> PathBuf {
+    env::var_os("HOME").filter(|home| !home.is_empty())
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from).unwrap_or_default()
+}
+
 fn pickbrain_dir_overridden() -> bool {
     env::var(PICKBRAIN_DIR_ENV)
         .map(|dir| !dir.trim().is_empty())
@@ -50,8 +56,7 @@ pub(crate) fn pickbrain_dir() -> PathBuf {
             return dir;
         }
     }
-    let home = env::var("HOME").unwrap_or_default();
-    let dir = PathBuf::from(home).join(".pickbrain");
+    let dir = home_dir().join(".pickbrain");
     std::fs::create_dir_all(&dir).ok();
     dir
 }
@@ -156,7 +161,23 @@ fn process_is_running(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    unsafe {
+        match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            Ok(handle) => {
+                let exited = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+                let _ = CloseHandle(handle);
+                !exited
+            },
+            Err(error) => error.code() != windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn process_is_running(_pid: u32) -> bool {
     true
 }
@@ -256,8 +277,7 @@ fn detect_active_session() -> Option<String> {
         }
     }
 
-    let home = env::var("HOME").ok()?;
-    let sessions_dir = PathBuf::from(&home).join(".claude/sessions");
+    let sessions_dir = home_dir().join(".claude/sessions");
     let mut pid = std::process::id() as i32;
     while pid > 1 {
         let session_file = sessions_dir.join(format!("{pid}.json"));
@@ -309,7 +329,7 @@ fn ingest(
     stale_ms: i64,
     types: &[String],
     quiet: bool,
-) -> Result<bool> {
+) -> Result<usize> {
     let mut db = DB::new(db_name.clone()).unwrap();
 
     let want = |src: &str| types.is_empty() || types.iter().any(|t| t == src);
@@ -350,14 +370,14 @@ fn ingest(
         if !quiet {
             eprintln!("No new sessions to ingest.");
         }
-        return Ok(false);
+        return Ok(0);
     }
     if !quiet {
         eprintln!(
             "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {pi_sessions} pi sessions, {slack_conversations} slack conversations, {memories} memory files, {authored} authored files, {configs} config files"
         );
     }
-    Ok(true)
+    Ok(total)
 }
 
 fn embed_and_index(db: &DB, embedder: &Embedder, _device: &candle_core::Device) -> Result<()> {
@@ -1341,6 +1361,7 @@ fn search_tui(
                     search_filter.clear();
                     saved_search = Some((active_query.clone(), results.clone(), search_ms));
                 }
+                #[cfg(unix)]
                 (_, KeyCode::Char('z'), KeyModifiers::CONTROL) => {
                     disable_raw_mode()?;
                     crossterm::execute!(
@@ -1524,6 +1545,7 @@ fn maybe_checkout_branch(branch: &str) {
 }
 
 fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     let remote_host = if !s.remote_host.is_empty() {
         Some(s.remote_host.clone())
@@ -1543,24 +1565,25 @@ fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
         maybe_checkout_branch(&s.branch);
     }
     let session_id = &s.session_id;
-    if s.source == "codex" {
-        eprintln!("Resuming codex session {session_id}...");
-        let err = std::process::Command::new("codex")
-            .args(["resume", session_id])
-            .exec();
-        Err(err.into())
+    let (program, args) = if s.source == "codex" {
+        ("codex", ["resume", session_id.as_str()])
     } else if s.source == "pi" {
-        eprintln!("Resuming pi session {session_id}...");
-        let err = std::process::Command::new("pi")
-            .args(["--session", session_id])
-            .exec();
-        Err(err.into())
+        ("pi", ["--session", session_id.as_str()])
     } else {
-        eprintln!("Resuming claude session {session_id}...");
-        let err = std::process::Command::new("claude")
-            .args(["--resume", session_id])
-            .exec();
-        Err(err.into())
+        ("claude", ["--resume", session_id.as_str()])
+    };
+    eprintln!("Resuming {program} session {session_id}...");
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    #[cfg(unix)]
+    {
+        Err(command.exec().into())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status()?;
+        anyhow::ensure!(status.success(), "{program} exited with {status}");
+        Ok(())
     }
 }
 
@@ -2275,6 +2298,12 @@ fn main() -> Result<()> {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Warn));
 
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--register") {
+        return pickbrain_watch::register(args.into_iter().map(std::ffi::OsString::from));
+    }
+    if args.iter().any(|arg| arg == "--watch") {
+        return pickbrain_watch::watch(args.into_iter().map(std::ffi::OsString::from));
+    }
     let mut session_filter: Option<String> = None;
     let mut branch_filter: Option<String> = None;
     let mut exclude_sessions: Vec<String> = Vec::new();
@@ -2289,6 +2318,7 @@ fn main() -> Result<()> {
     let mut current = false;
     let mut exclude_current = false;
     let mut quiet = false;
+    let mut ingest_only = false;
     let mut query_args: Vec<&str> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -2298,6 +2328,9 @@ fn main() -> Result<()> {
                 eprintln!("  pickbrain [options] [query]");
                 eprintln!("  pickbrain --dump <session-id|channel|thr:ts> [--turns N-M] [--since T]");
                 eprintln!("  pickbrain --nuke");
+                eprintln!("  pickbrain --ingest-only [--quiet]");
+                eprintln!("  pickbrain --watch [--delay SECONDS] [--max-delay SECONDS]");
+                eprintln!("  pickbrain --register [--delay SECONDS] [--max-delay SECONDS]");
                 eprintln!();
                 eprintln!("With no arguments, opens an interactive session browser.");
                 eprintln!();
@@ -2310,6 +2343,7 @@ fn main() -> Result<()> {
                 eprintln!("  --since 24h|7d|2w    only search recent history");
                 eprintln!("  --type claude,codex,pi,slack  filter by source");
                 eprintln!("  -q, --quiet          suppress ingest progress output");
+                eprintln!("  --ingest-only        ingest and index, then exit without searching");
                 eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
                 eprintln!("  --dm                 only DMs (Slack)");
                 eprintln!("  --no-dm              exclude DMs (Slack)");
@@ -2327,6 +2361,9 @@ fn main() -> Result<()> {
             }
             "--quiet" | "-q" => {
                 quiet = true;
+            }
+            "--ingest-only" => {
+                ingest_only = true;
             }
             "--nuke" => {
                 let db_name = db_path();
@@ -2425,7 +2462,7 @@ fn main() -> Result<()> {
     }
 
     use std::io::IsTerminal;
-    if std::io::stderr().is_terminal() {
+    if !quiet && std::io::stderr().is_terminal() {
         eprintln!("pickbrain {} — Copyright (c) 2026 Dropbox Inc.", env!("CARGO_PKG_VERSION"));
     }
 
@@ -2434,8 +2471,7 @@ fn main() -> Result<()> {
 
     // Migrate DB from old location (~/.claude/pickbrain.db)
     if !pickbrain_dir_overridden() && !db_name.exists() {
-        let home = env::var("HOME").unwrap_or_default();
-        let old_db = PathBuf::from(home).join(".claude/pickbrain.db");
+        let old_db = home_dir().join(".claude/pickbrain.db");
         if old_db.exists() {
             eprintln!("migrating database from {} to {}", old_db.display(), db_name.display());
             std::fs::rename(&old_db, &db_name).ok();
@@ -2443,7 +2479,7 @@ fn main() -> Result<()> {
     }
 
     // Detect the calling session once — used for both ingest-skip and --current filter.
-    let active_session = detect_active_session();
+    let active_session = if ingest_only { None } else { detect_active_session() };
 
     if current || exclude_current {
         match &active_session {
@@ -2467,31 +2503,61 @@ fn main() -> Result<()> {
     // If we can't detect the active session, nothing is skipped (eager by default).
     let stale_ms = 10 * 60 * 1000;
     run_pre_ingest_command()?;
-    if needs_ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter)? {
+    let pending = pickbrain_dir().join("ingest.pending");
+    let resume_pending = ingest_only && pending.exists();
+    let mut ingested = 0;
+    let mut indexed = false;
+    if resume_pending || needs_ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter)? {
         match IngestLock::try_acquire(&db_name) {
             Ok(Some(_lock)) => {
+                // Watermarks can advance before embedding finishes. Retain a retry marker on failure.
+                if ingest_only {
+                    std::fs::write(&pending, "")?;
+                }
                 match ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter, quiet) {
-                    Ok(have_changes) => {
-                        if have_changes {
+                    Ok(count) => {
+                        ingested = count;
+                        if count > 0 || resume_pending {
                             let db_rw = DB::new(db_name.clone()).unwrap();
                             let device = witchcraft::make_device();
                             let embedder = witchcraft::Embedder::new(&device, &assets)?;
                             embed_and_index(&db_rw, &embedder, &device)?;
+                            indexed = true;
                         }
                     },
                     Err(e) => {
-                        eprintln!("warning: ingest failed: {e}");
-                        std::process::exit(1);
+                        return Err(e).context("ingest sessions");
                     }
+                }
+                if ingest_only {
+                    std::fs::remove_file(&pending)?;
                 }
             },
             Ok(None) => {
+                if ingest_only {
+                    anyhow::bail!("another pickbrain process is ingesting");
+                }
                 warn_lookup_only("another pickbrain process is ingesting");
             }
             Err(e) => {
+                if ingest_only {
+                    return Err(e).context("acquire ingestion lock");
+                }
                 warn_lookup_only(format!("the ingest lock could not be acquired: {e}"));
             }
         }
+    }
+
+    if ingest_only {
+        if ingested > 0 {
+            let suffix = if ingested == 1 { "" } else { "s" };
+            eprintln!("pickbrain: ingested and indexed {ingested} document{suffix}");
+        } else if indexed {
+            eprintln!("pickbrain: completed pending indexing");
+        } else {
+            eprintln!("pickbrain: no changes");
+        }
+        return Ok(());
     }
 
     let has_branch = branch_filter.is_some();

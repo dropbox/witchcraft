@@ -201,6 +201,7 @@ pickbrain: prereqs download
 	ln -sf target/$(TARGET)/release/examples/pickbrain ./pickbrain
 
 pickbrain-install: pickbrain
+	@pkill -u "$$(id -u)" -x pickbrain || test $$? -eq 1
 	mkdir -p ~/bin ~/.claude/skills/pickbrain ~/.codex/skills/pickbrain ~/.pi/agent/skills/pickbrain ~/.pi/agent/extensions/pickbrain
 	ln -f $(realpath pickbrain) ~/bin/pickbrain
 	rm -f ~/.claude/skills/pickbrain/skill.md ~/.codex/skills/pickbrain/skill.md ~/.pi/agent/skills/pickbrain/skill.md
@@ -208,6 +209,7 @@ pickbrain-install: pickbrain
 	cp skills/pickbrain-codex/SKILL.md ~/.codex/skills/pickbrain/SKILL.md
 	cp skills/pickbrain-pi/SKILL.md ~/.pi/agent/skills/pickbrain/SKILL.md
 	cp extensions/pickbrain-pi/index.ts ~/.pi/agent/extensions/pickbrain/index.ts
+	~/bin/pickbrain --register
 
 macintel: prereqs neso-kernels-metal-nosimd download
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features $(ENCODER),neso-metal,progress,sqlite
