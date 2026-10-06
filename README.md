@@ -7,9 +7,16 @@ engine ( https://github.com/jlscheerer/xtr-warp ) in safe rust, using a
 single-file SQLite database as backing storage, making it suitable for
 client-side deployment. It runs completely stand-alone on your device, needs no
 API keys, no vector database, no chunking strategy, no fancy re-rankers, and it
-is lightning fast (21ms p.95 end-to-end search latency on NFCorpus, at 33%
-NDCG@10, on an Apple Macbook Pro M2 Max, more than twice as fast as the
-original XTR-WARP on server-class hardware, at similar accuracy.)
+is lightning fast (14ms p.95 end-to-end search latency on NFCorpus, at 34%
+NDCG@10, on an Apple Macbook Pro M4 Max, more than twice as fast as the
+original XTR-WARP on server-class hardware.)
+
+Version 0.2.0 adds native support for Windows GPUs without relying on OpenVINO
+etc, a much more compact on-disk index format, better scalability with index
+updates, better search accuracy, and many updates to the Pickbrain agent memory
+tool, among them the ability to register as a launchd service on MacOS, so that
+the index is kept updated in the background, reducing the risk of having to
+wait on index updates during queries.
 
 ![pickbrain](pickbrain.png)
 
@@ -44,32 +51,24 @@ For Google's original XTR model, run `make warp-cli ENCODER=t5-quantized`;
 the included Python scripts download its weights from Hugging Face and
 quantize them to GGUF.
 
-To publish the local ModernBERT assets, authenticate `gh` with write access to
-`dropbox/witchcraft`, then run `bash scripts/release_modernbert.sh`. The script
-packages the three model files and their checksums into `modernbert-assets.tar.gz`.
-For a new release, it uploads the archive as a draft and then publishes it.
-For an existing release, it replaces the archive, updates the download instructions,
-and removes the old individual assets after the archive upload succeeds.
 ## Creating an index: ##
-
 For testing, we used the BEIR download script from XTR-Warp to download
 nfcorpus and check that we could replicate their results.
 For your convenience, nfcorpus.tsv is included here, so you can run:
 ```
-$ ./warp-cli readcsv datasets/nfcorpus.tsv
+$ make nfcorpus
 ```
-With all the nfcorpus documents imported, we can now create embeddings for them, with:
-```
-$ ./warp-cli embed
-```
-Next we create the index over the embeddings, with:
-```
-$ ./warp-cli index
-```
+With all the nfcorpus documents imported, embeddings will be created,
+and the index updated with them.
 
 All state gets persisted in mydb.sqlite, and you can abort the indexer and
 it will pick up where it left off. To start over, you can just delete
 mydb.sqlite.
+
+You can rerun the nfcorpus scoring result with:
+```
+$ make nfcorpus-score
+```
 
 ## Querying the index ##
 
