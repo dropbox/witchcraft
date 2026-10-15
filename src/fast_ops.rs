@@ -29,6 +29,9 @@ impl CustomOp2 for FastAddOp {
         if s1.dtype() != DType::F32 || s2.dtype() != DType::F32 {
             candle_core::bail!("fast_add only supports f32")
         }
+        if l1.shape() != l2.shape() || !l1.is_contiguous() || !l2.is_contiguous() {
+            candle_core::bail!("fast_add requires matching shapes and contiguous layouts")
+        }
         let a = s1.as_slice::<f32>()?;
         let b = s2.as_slice::<f32>()?;
         let n = l1.shape().elem_count();
@@ -46,7 +49,7 @@ impl CustomOp2 for FastAddOp {
 /// On Metal/GPU, falls back to candle's built-in addition since custom ops
 /// have overhead on GPU and the optimization is CPU-specific.
 pub fn fast_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    if matches!(a.device(), Device::Cpu) {
+    if matches!(a.device(), Device::Cpu) && a.shape() == b.shape() && a.is_contiguous() && b.is_contiguous() {
         a.apply_op2_no_bwd(b, &FastAddOp)
     } else {
         a + b
