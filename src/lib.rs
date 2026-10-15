@@ -330,13 +330,10 @@ pub struct QueryEmbeddings {
 pub fn embed_query_for_search(embedder: &Embedder, text: &str) -> Result<QueryEmbeddings> {
     if query_token_salience_enabled() {
         let output = embedder.embed_query_with_gate_scores_and_tokens(text)?;
-        let weights = output
-            .gate_scores
-            .map(query_weights_from_gate_scores)
-            .ok_or_else(|| anyhow::anyhow!("WARP_QUERY_TOKEN_SALIENCE requires token_gate tensors in ModernBERT assets"))?;
+        let weights = output.gate_scores.map(query_weights_from_gate_scores);
         Ok(QueryEmbeddings {
             embeddings: output.embeddings.get(0)?,
-            weights: Some(weights),
+            weights,
         })
     } else {
         let (embeddings, _) = embedder.embed_query(text)?;
