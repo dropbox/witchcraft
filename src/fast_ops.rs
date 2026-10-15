@@ -918,6 +918,34 @@ mod tests {
     use candle_nn::{Activation, Module};
 
     #[test]
+    fn fast_add_identical_and_broadcast_shapes() -> Result<()> {
+        let device = Device::Cpu;
+        // 1. Identical shapes
+        let a = Tensor::new(&[1.0f32, 2.0, 3.0, 4.0], &device)?.reshape((2, 2))?;
+        let b = Tensor::new(&[10.0f32, 20.0, 30.0, 40.0], &device)?.reshape((2, 2))?;
+        let got = fast_add(&a, &b)?;
+        let expected = a.broadcast_add(&b)?;
+        assert_eq!(got.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
+
+        // 2. Broadcast shapes (batched attention scores [2, 4, 8, 8] + unbatched position bias [1, 4, 8, 8])
+        let (batch, heads, seq) = (2usize, 4usize, 8usize);
+        let a_vec: Vec<f32> = (0..batch * heads * seq * seq).map(|i| i as f32).collect();
+        let b_vec: Vec<f32> = (0..heads * seq * seq).map(|i| (i * 2) as f32).collect();
+        let a_t = Tensor::from_vec(a_vec, (batch, heads, seq, seq), &device)?;
+        let b_t = Tensor::from_vec(b_vec, (1, heads, seq, seq), &device)?;
+        let got_broadcast = fast_add(&a_t, &b_t)?;
+        let expected_broadcast = a_t.broadcast_add(&b_t)?;
+        let diff = got_broadcast
+            .sub(&expected_broadcast)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-6, "broadcast add difference too large: {diff}");
+
+        Ok(())
+    }
+
+    #[test]
     fn modernbert_local_attention_matches_reference() -> Result<()> {
         let device = Device::Cpu;
         let (b, h, s, d) = (1usize, 2usize, 7usize, 4usize);
