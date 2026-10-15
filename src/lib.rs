@@ -3205,29 +3205,32 @@ pub fn cached_embeddings_from_output(
         .to_device(&Device::Cpu)?
         .to_dtype(DType::F32)?;
     let counts = token_counts_for_lens(body, lens, &output.offsets)?;
-    let gate_scores = output.gate_scores.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("document token pruning requires token_gate tensors in ModernBERT assets")
-    })?;
-    let unpruned_rows = embeddings.dims2()?.0;
-    let pruned = prune_document_embeddings_by_gate_fraction(
-        &embeddings,
-        &output.offsets,
-        &output.tokens,
-        &counts,
-        gate_scores,
-        document_token_keep_fraction(),
-    )?;
-    let embeddings = pruned.embeddings;
-    let counts = pruned.counts;
+    let (embeddings, counts) = if let Some(gate_scores) = output.gate_scores.as_ref() {
+        let unpruned_rows = embeddings.dims2()?.0;
+        let pruned = prune_document_embeddings_by_gate_fraction(
+            &embeddings,
+            &output.offsets,
+            &output.tokens,
+            &counts,
+            gate_scores,
+            document_token_keep_fraction(),
+        )?;
+        let embeddings = pruned.embeddings;
+        let counts = pruned.counts;
+        let (rows, _cols) = embeddings.dims2()?;
+        let dt = now.elapsed().as_secs_f64();
+        debug!(
+            "embedder took {} ms ({} rows/s), pruned {}/{} document tokens.",
+            now.elapsed().as_millis(),
+            ((rows as f64) / dt).round(),
+            rows,
+            unpruned_rows,
+        );
+        (embeddings, counts)
+    } else {
+        (embeddings, counts)
+    };
     let (rows, cols) = embeddings.dims2()?;
-    let dt = now.elapsed().as_secs_f64();
-    debug!(
-        "embedder took {} ms ({} rows/s), pruned {}/{} document tokens.",
-        now.elapsed().as_millis(),
-        ((rows as f64) / dt).round(),
-        rows,
-        unpruned_rows,
-    );
 
     debug!(
         "got embedding for chunk {:?} {:?}",

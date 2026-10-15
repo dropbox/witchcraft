@@ -52,7 +52,7 @@ pub fn fast_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     if matches!(a.device(), Device::Cpu) && a.shape() == b.shape() && a.is_contiguous() && b.is_contiguous() {
         a.apply_op2_no_bwd(b, &FastAddOp)
     } else {
-        a + b
+        a.broadcast_add(b)
     }
 }
 
