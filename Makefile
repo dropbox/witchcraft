@@ -276,6 +276,43 @@ treccovid-testset: \
 	testset/treccovid/qrels.test.json \
 	testset/treccovid/questions.test.tsv
 
+FINANCEBENCH_FILES := \
+	datasets/financebench.tsv \
+	testset/financebench/collection_map.json \
+	testset/financebench/qrels.test.json \
+	testset/financebench/questions.test.tsv
+FINANCEBENCH_STAMP := .make-stamps/financebench-data
+
+.make-stamps/financebench-python: requirements.txt env/pyvenv.cfg | prereqs
+	mkdir -p $(dir $@)
+	uv pip install --python $(PYTHON_BIN) -r requirements.txt
+	touch $@
+
+$(FINANCEBENCH_STAMP): scripts/prepare_financebench_dataset.py scripts/prepare_beir_dataset.py .make-stamps/financebench-python | prereqs
+	mkdir -p $(dir $@)
+	$(PYTHON_BIN) scripts/prepare_financebench_dataset.py
+	touch $@
+
+$(FINANCEBENCH_FILES): $(FINANCEBENCH_STAMP)
+	@if [ ! -f "$@" ]; then \
+		rm -f "$(FINANCEBENCH_STAMP)"; \
+		$(MAKE) "$(FINANCEBENCH_STAMP)"; \
+	fi
+
+financebench-files: $(FINANCEBENCH_FILES)
+
+financebench-testset: \
+	testset/financebench/collection_map.json \
+	testset/financebench/qrels.test.json \
+	testset/financebench/questions.test.tsv
+
+financebench: prereqs datasets/financebench.tsv
+	$(MAKE) warp-cli EXTRA_FEATURES=deterministic
+	rm -rf mydb.sqlite*
+	$(CLI_BIN) readcsv datasets/financebench.tsv
+	$(CLI_BIN) embed
+	$(CLI_BIN) index
+
 nfcorpus: prereqs datasets/nfcorpus.tsv
 	make warp-cli EXTRA_FEATURES=deterministic
 	rm -rf mydb.sqlite*
@@ -310,6 +347,11 @@ treccovid-hybrid-score: treccovid-testset
 treccovid-fulltext-score: treccovid-testset
 	./treccovid-score.sh fulltextcsv output-treccovid-fulltext.txt
 
+financebench-score financebench-hybrid-score financebench-fulltext-score: prereqs trec-score financebench-testset
+	$(MAKE) warp-cli EXTRA_FEATURES=deterministic
+	$(CLI_BIN) $(if $(filter financebench-hybrid-score,$@),hybridcsv,$(if $(filter financebench-fulltext-score,$@),fulltextcsv,querycsv)) testset/financebench/questions.test.tsv output-$@.txt
+	target/release/trec-score output-$@.txt testset/financebench/collection_map.json testset/financebench/qrels.test.json
+
 reindex:
 	make warp-cli EXTRA_FEATURES=deterministic
 	$(CLI_BIN) reindex
@@ -337,6 +379,9 @@ distclean:
 	rm -f testset/nfcorpus/collection_map.json testset/nfcorpus/qrels.test.json testset/nfcorpus/questions.test.tsv
 	rm -f datasets/treccovid.tsv
 	rm -f testset/treccovid/collection_map.json testset/treccovid/qrels.test.json testset/treccovid/questions.test.tsv
+	rm -f $(FINANCEBENCH_FILES)
+	rm -f output-financebench*-score.txt
+	rm -rf .cache/financebench
 	rm -rf .cache/beir
 	@if [ -d assets ]; then \
 		for path in assets/* assets/.[!.]* assets/..?*; do \
@@ -354,6 +399,12 @@ distclean:
 	distclean \
 	download \
 	dylib \
+	financebench \
+	financebench-files \
+	financebench-testset \
+	financebench-score \
+	financebench-hybrid-score \
+	financebench-fulltext-score \
 	macintel \
 	modernbert-assets \
 	modernbert-quantized-assets \
