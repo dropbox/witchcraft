@@ -534,8 +534,10 @@ impl T5ModelBuilder {
         let tok_bytes = TOKENIZER
             .bytes(assets)
             .map_err(|_| Error::other("failed to read modernbert-tokenizer.json"))?;
-        let tokenizer = Tokenizer::from_bytes(tok_bytes)
+        let mut tokenizer = Tokenizer::from_bytes(tok_bytes)
             .map_err(|e| Error::other(format!("failed to parse tokenizer: {e}")))?;
+        // Ignore saved training truncation; the embedder windows full documents.
+        tokenizer.with_truncation(None).map_err(Error::other)?;
         Ok((Self { config }, tokenizer))
     }
 

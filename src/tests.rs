@@ -10,6 +10,47 @@ mod tests {
     use test_log::test;
     use uuid::Uuid;
 
+    #[cfg(all(
+        any(feature = "modernbert", feature = "modernbert-quantized"),
+        not(feature = "embed-assets")
+    ))]
+    #[test]
+    fn modernbert_tokenizer_ignores_saved_truncation() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("modernbert-config.json"),
+            r#"{
+                "hidden_size":1,"num_hidden_layers":1,"num_attention_heads":1,
+                "intermediate_size":1,"vocab_size":3,"rope_theta":1.0,"norm_eps":1.0
+            }"#,
+        )
+        .unwrap();
+        let tokenizer_path = dir.path().join("modernbert-tokenizer.json");
+        let saved_tokenizer = r#"{
+            "version":"1.0",
+            "truncation":{"direction":"Right","max_length":256,"strategy":"LongestFirst","stride":0},
+            "padding":null,
+            "added_tokens":[],
+            "normalizer":null,
+            "pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,
+            "decoder":null,
+            "model":{"type":"WordLevel","vocab":{"<unk>":0,"word":1,"tail":2},"unk_token":"<unk>"}
+        }"#;
+        std::fs::write(&tokenizer_path, saved_tokenizer).unwrap();
+        let text = format!("{}tail", "word ".repeat(2048));
+        let original = tokenizers::Tokenizer::from_bytes(saved_tokenizer.as_bytes()).unwrap();
+        assert_eq!(original.encode(text.as_str(), true).unwrap().len(), 256);
+
+        let (_, tokenizer) = crate::t5_encoder::T5ModelBuilder::load(dir.path()).unwrap();
+        let encoding = tokenizer.encode(text.as_str(), true).unwrap();
+        assert!(tokenizer.get_truncation().is_none());
+        assert_eq!(encoding.len(), 2049);
+        assert_eq!(encoding.get_tokens().last().map(String::as_str), Some("tail"));
+        assert!(encoding.get_overflowing().is_empty());
+        assert_eq!(std::fs::read_to_string(tokenizer_path).unwrap(), saved_tokenizer);
+    }
+
     const FACTS : [&str; 33]= [
         "Bananas are berries, but strawberries aren't.",
         "Octopuses have three hearts and blue blood.",
