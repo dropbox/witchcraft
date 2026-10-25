@@ -16,7 +16,7 @@ use witchcraft::types::{
 
 const MIN_CHUNK_CODEPOINTS: usize = 5;
 const MAX_CHUNK_CODEPOINTS: usize = 4000;
-const INGEST_FORMAT_VERSION: &str = "2";
+const INGEST_FORMAT_VERSION: &str = "3";
 
 const CODEX_NAMESPACE: Uuid = Uuid::from_bytes([
     0xb4, 0xe8, 0xd9, 0xe2, 0x7f, 0x3c, 0x5b, 0xa2, 0xc6, 0xe1, 0x90, 0x2f, 0x4d, 0x8b, 0xac,
@@ -127,16 +127,17 @@ fn extract_branch_from_output(payload: &serde_json::Value) -> Option<String> {
 struct SessionMeta {
     cwd: Option<String>,
     branch: Option<String>,
-    is_guardian: bool,
+    is_subagent: bool,
 }
 
-fn is_guardian_source(payload: &serde_json::Value) -> bool {
-    payload
-        .get("source")
-        .and_then(|source| source.get("subagent"))
-        .and_then(|subagent| subagent.get("other"))
-        .and_then(|other| other.as_str())
-        == Some("guardian")
+// Subagent rollouts contain copied context and cannot be resumed independently.
+// Do not treat forked_from_id alone as a subagent marker: ordinary forks use it too.
+fn is_subagent_source(payload: &serde_json::Value) -> bool {
+    payload.get("thread_source").and_then(|source| source.as_str()) == Some("subagent")
+        || payload
+            .get("source")
+            .and_then(|source| source.get("subagent"))
+            .is_some_and(|subagent| !subagent.is_null())
 }
 
 fn parse_session_file(path: &Path) -> (SessionMeta, Vec<Chunk>) {
@@ -147,7 +148,7 @@ fn parse_session_file(path: &Path) -> (SessionMeta, Vec<Chunk>) {
                 SessionMeta {
                     cwd: None,
                     branch: None,
-                    is_guardian: false,
+                    is_subagent: false,
                 },
                 vec![],
             )
@@ -157,7 +158,7 @@ fn parse_session_file(path: &Path) -> (SessionMeta, Vec<Chunk>) {
     let mut meta = SessionMeta {
         cwd: None,
         branch: None,
-        is_guardian: false,
+        is_subagent: false,
     };
     let mut chunks = Vec::new();
     let mut offset: u64 = 0;
@@ -174,7 +175,7 @@ fn parse_session_file(path: &Path) -> (SessionMeta, Vec<Chunk>) {
         };
 
         if entry.entry_type == "session_meta" {
-            meta.is_guardian |= is_guardian_source(&entry.payload);
+            meta.is_subagent |= is_subagent_source(&entry.payload);
             if meta.cwd.is_none() {
                 meta.cwd = entry.payload.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
             }
@@ -274,7 +275,7 @@ fn ingest_session(
     remote_host: Option<&str>,
 ) -> Result<usize> {
     let (meta, chunks) = parse_session_file(path);
-    if meta.is_guardian || chunks.is_empty() {
+    if meta.is_subagent || chunks.is_empty() {
         return Ok(0);
     }
 
@@ -386,7 +387,7 @@ fn write_ingest_format_version() {
     fs::write(path, INGEST_FORMAT_VERSION).ok();
 }
 
-fn session_file_is_guardian(path: &Path) -> bool {
+fn session_file_is_subagent(path: &Path) -> bool {
     let Ok(file) = fs::File::open(path) else {
         return false;
     };
@@ -395,15 +396,15 @@ fn session_file_is_guardian(path: &Path) -> bool {
             continue;
         };
         if entry.entry_type == "session_meta" {
-            return is_guardian_source(&entry.payload);
+            return is_subagent_source(&entry.payload);
         }
     }
     false
 }
 
-fn remove_existing_guardian_docs(db: &mut DB, session_files: &[PathBuf]) -> Result<()> {
+fn remove_existing_subagent_docs(db: &mut DB, session_files: &[PathBuf]) -> Result<()> {
     for path in session_files {
-        if !session_file_is_guardian(path) {
+        if !session_file_is_subagent(path) {
             continue;
         }
         let filter = SqlStatementInternal {
@@ -487,7 +488,8 @@ pub fn ingest_codex(db: &mut DB, quiet: bool) -> Result<usize> {
     let session_files: Vec<_> = dirs.iter().flat_map(|dir| collect_session_files(&dir.join("sessions"))).collect();
     let format_changed = !ingest_format_is_current();
     if format_changed {
-        remove_existing_guardian_docs(db, &session_files)?;
+        // Also purge unchanged rollouts that were indexed before subagents were excluded.
+        remove_existing_subagent_docs(db, &session_files)?;
     }
 
     let session_names = load_session_index(&dirs);
@@ -695,23 +697,88 @@ mod tests {
             assistant_msg_line("policy verdict", "2025-01-15T10:01:00Z"),
         );
         let f = write_tempfile(&content);
-        assert!(session_file_is_guardian(f.path()));
+        assert!(session_file_is_subagent(f.path()));
         let (meta, chunks) = parse_session_file(f.path());
-        assert!(meta.is_guardian);
+        assert!(meta.is_subagent);
         assert_eq!(chunks.len(), 2);
     }
 
     #[test]
-    fn test_codex_normal_session_is_not_guardian() {
+    fn test_codex_normal_session_is_not_subagent() {
         let content = format!(
             "{}\n{}\n",
             session_meta_line("/Users/me/src/server", "main"),
             user_msg_line("ordinary user conversation", "2025-01-15T10:00:00Z"),
         );
         let f = write_tempfile(&content);
-        assert!(!session_file_is_guardian(f.path()));
+        assert!(!session_file_is_subagent(f.path()));
         let (meta, _) = parse_session_file(f.path());
-        assert!(!meta.is_guardian);
+        assert!(!meta.is_subagent);
+    }
+
+    #[test]
+    fn test_codex_subagent_markers() {
+        let cases = [
+            (serde_json::json!({"source": {"subagent": {"thread_spawn": {
+                "parent_thread_id": "parent", "depth": 1
+            }}}}), true),
+            (serde_json::json!({"source": {"subagent": "review"}}), true),
+            (serde_json::json!({"thread_source": "subagent"}), true),
+            (serde_json::json!({"source": "cli", "forked_from_id": "parent"}), false),
+            (serde_json::json!({"source": "cli", "thread_source": "cli"}), false),
+            (serde_json::json!({"source": {"subagent": null}}), false),
+        ];
+        for (payload, expected) in cases {
+            let content = format!(
+                "{}\n{}\n",
+                serde_json::json!({"type": "session_meta", "payload": payload}),
+                user_msg_line("work on a task", "2025-01-15T10:00:00Z"),
+            );
+            let f = write_tempfile(&content);
+            assert_eq!(session_file_is_subagent(f.path()), expected);
+            assert_eq!(parse_session_file(f.path()).0.is_subagent, expected);
+        }
+    }
+
+    #[test]
+    fn test_codex_skips_subagents_and_removes_existing_docs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = DB::new(dir.path().join("pickbrain.db"))?;
+        let content = format!(
+            "{}\n{}\n",
+            session_meta_line("/Users/me/src/server", "main"),
+            user_msg_line("work on a task", "2025-01-15T10:00:00Z"),
+        );
+        let parent = write_tempfile(&content);
+        let child = write_tempfile(&content);
+        assert_eq!(ingest_session(&mut db, parent.path(), 0, None, None)?, 1);
+        // Simulate a subagent already indexed by the old ingest format.
+        assert_eq!(ingest_session(&mut db, child.path(), 0, None, None)?, 1);
+        let child_content = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {"source": {"subagent": {"thread_spawn": {
+                    "parent_thread_id": "parent", "depth": 1
+                }}}}
+            }),
+            user_msg_line("work on a task", "2025-01-15T10:00:00Z"),
+        );
+        fs::write(child.path(), child_content)?;
+        assert_eq!(ingest_session(&mut db, child.path(), 0, None, None)?, 0);
+        remove_existing_subagent_docs(
+            &mut db,
+            &[parent.path().to_path_buf(), child.path().to_path_buf()],
+        )?;
+        let remaining_path: String = db
+            .query("SELECT json_extract(metadata, '$.path') FROM document")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(remaining_path, parent.path().to_string_lossy());
+        let count: i64 = db
+            .query("SELECT COUNT(*) FROM document")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(count, 1);
+        Ok(())
     }
 
     #[test]
@@ -764,7 +831,7 @@ mod tests {
         let (meta, chunks) = parse_session_file(f.path());
         assert!(meta.branch.is_none());
         assert!(meta.cwd.is_none());
-        assert!(!meta.is_guardian);
+        assert!(!meta.is_subagent);
         assert!(chunks.is_empty());
     }
 
