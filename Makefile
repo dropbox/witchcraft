@@ -210,7 +210,15 @@ pickbrain-install: pickbrain
 	cp skills/pickbrain-codex/SKILL.md ~/.codex/skills/pickbrain/SKILL.md
 	cp skills/pickbrain-pi/SKILL.md ~/.pi/agent/skills/pickbrain/SKILL.md
 	cp extensions/pickbrain-pi/index.ts ~/.pi/agent/extensions/pickbrain/index.ts
+ifeq ($(UNAME_S),Linux)
+	@if systemctl --user show-environment >/dev/null 2>&1; then \
+		~/bin/pickbrain --register; \
+	else \
+		echo "Skipping Pickbrain background registration: systemd user manager unavailable. Run pickbrain --watch manually if needed."; \
+	fi
+else
 	~/bin/pickbrain --register
+endif
 
 macintel: prereqs neso-kernels-metal-nosimd download
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features $(ENCODER),neso-metal,progress,sqlite
