@@ -35,7 +35,6 @@ ifeq ($(UNAME_S),Darwin)
     RUSTFLAGS_EXTRA := -C target-feature=+avx2,+fma
     TARGET := x86_64-apple-darwin
   endif
-  PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
 else ifeq ($(UNAME_S),Linux)
   ifneq ($(NVCC),)
     CLI_FEATURES := $(ENCODER),cuda,hybrid-dequant,progress,sqlite
@@ -55,10 +54,12 @@ else ifeq ($(UNAME_S),Linux)
     NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
     PYTHON_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,python
   endif
-  PICKBRAIN_FEATURES := $(CLI_FEATURES),embed-assets
   RUSTFLAGS_EXTRA :=
   TARGET :=
 endif
+
+# Pickbrain always uses the SQLite-backed document store.
+PICKBRAIN_FEATURES := $(CLI_FEATURES),sqlite,embed-assets
 
 # Binary path
 ifdef TARGET
