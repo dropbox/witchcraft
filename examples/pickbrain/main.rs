@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod claude_code;
 mod codex;
+mod gemini;
 mod pi;
 mod slack;
 mod watermark;
@@ -230,6 +231,13 @@ fn needs_ingest(
         return Ok(true);
     }
 
+    if wants_source(types, "gemini") {
+        let gemini_skip = skip_session.filter(|_| watermark::is_fresh(&watermark::gemini_path(), stale_ms));
+        if gemini::has_work(gemini_skip)? {
+            return Ok(true);
+        }
+    }
+
     Ok(false)
 }
 
@@ -241,6 +249,7 @@ fn reset_ingest_watermarks() {
     watermark::remove(&watermark::claude_path());
     watermark::remove(&watermark::codex_path());
     watermark::remove(&watermark::pi_path());
+    watermark::remove(&watermark::gemini_path());
     slack::remove_watermark();
 }
 
@@ -252,6 +261,8 @@ fn active_session_id_from_env(mut get_var: impl FnMut(&str) -> Option<String>) -
         "CODEX_SESSION_ID",
         "CODEX_THREAD_ID",
         "PI_SESSION_ID",
+        "GEMINI_SESSION_ID",
+        "ANTIGRAVITY_CONVERSATION_ID",
     ] {
         if let Some(value) = get_var(key) {
             let value = value.trim();
@@ -365,7 +376,14 @@ fn ingest(
         0
     };
 
-    let total = sessions + memories + authored + configs + codex_sessions + pi_sessions + slack_conversations;
+    let gemini_sessions = if want("gemini") {
+        let gemini_skip = skip_session.filter(|_| watermark::is_fresh(&watermark::gemini_path(), stale_ms));
+        gemini::ingest_gemini(&mut db, gemini_skip, quiet)?
+    } else {
+        0
+    };
+
+    let total = sessions + memories + authored + configs + codex_sessions + pi_sessions + slack_conversations + gemini_sessions;
     if total == 0 {
         if !quiet {
             eprintln!("No new sessions to ingest.");
@@ -374,7 +392,7 @@ fn ingest(
     }
     if !quiet {
         eprintln!(
-            "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {pi_sessions} pi sessions, {slack_conversations} slack conversations, {memories} memory files, {authored} authored files, {configs} config files"
+            "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {pi_sessions} pi sessions, {slack_conversations} slack conversations, {gemini_sessions} gemini sessions, {memories} memory files, {authored} authored files, {configs} config files"
         );
     }
     Ok(total)
@@ -493,6 +511,8 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
             v.get("message")?.get("content")?
         };
         extract_pi_content_text(content)?
+    } else if source == "gemini" {
+        v.get("content").and_then(|c| c.as_str())?.to_string()
     } else {
         // Claude Code
         let msg = v.get("message")?;
@@ -2270,6 +2290,7 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
                 && !l.starts_with("[Claude]")
                 && !l.starts_with("[Codex]")
                 && !l.starts_with("[Pi]")
+                && !l.starts_with("[Gemini]")
         }) {
             writeln!(buf, "{line}")?;
         }
@@ -2341,7 +2362,7 @@ fn main() -> Result<()> {
                 eprintln!("  --exclude-current    exclude the calling session");
                 eprintln!("  --session ID         search within a session, channel, or thread");
                 eprintln!("  --since 24h|7d|2w    only search recent history");
-                eprintln!("  --type claude,codex,pi,slack  filter by source");
+                eprintln!("  --type claude,codex,gemini,pi,slack  filter by source");
                 eprintln!("  -q, --quiet          suppress ingest progress output");
                 eprintln!("  --ingest-only        ingest and index, then exit without searching");
                 eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
@@ -2357,6 +2378,7 @@ fn main() -> Result<()> {
                 eprintln!("  EXTRA_CODEX_DIRS    colon-separated additional .codex directories");
                 eprintln!("  EXTRA_CLAUDE_DIRS   colon-separated additional .claude directories");
                 eprintln!("  EXTRA_PI_DIRS       colon-separated additional .pi/agent directories");
+                eprintln!("  EXTRA_GEMINI_DIRS   colon-separated additional .gemini/antigravity directories");
                 std::process::exit(0);
             }
             "--quiet" | "-q" => {
@@ -2376,6 +2398,7 @@ fn main() -> Result<()> {
                 watermark::remove(&watermark::claude_path());
                 watermark::remove(&watermark::codex_path());
                 watermark::remove(&watermark::pi_path());
+                watermark::remove(&watermark::gemini_path());
                 slack::remove_watermark();
                 std::process::exit(0);
             }
