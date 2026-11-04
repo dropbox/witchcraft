@@ -2350,6 +2350,7 @@ fn main() -> Result<()> {
                 eprintln!("  --unread             only unread conversations (Slack)");
                 eprintln!("  --dump ID            dump a session, channel, or thread");
                 eprintln!("  --turns N-M          limit turns/conversations in dump");
+                eprintln!("  -V, --version        print version and exit");
                 eprintln!();
                 eprintln!("Environment:");
                 eprintln!("  PICKBRAIN_DIR        override the pickbrain DB and state directory");
@@ -2357,6 +2358,10 @@ fn main() -> Result<()> {
                 eprintln!("  EXTRA_CODEX_DIRS    colon-separated additional .codex directories");
                 eprintln!("  EXTRA_CLAUDE_DIRS   colon-separated additional .claude directories");
                 eprintln!("  EXTRA_PI_DIRS       colon-separated additional .pi/agent directories");
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("pickbrain {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--quiet" | "-q" => {
