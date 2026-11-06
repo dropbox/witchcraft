@@ -1,10 +1,73 @@
 use anyhow::Result;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use witchcraft::DB;
+
+pub const MAX_CHUNK_CODEPOINTS: usize = 4000;
+pub const MAX_TURN_CODEPOINTS: usize = 6000;
+
+static RE_META: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<ADDITIONAL_METADATA[\s>].*?(?:</ADDITIONAL_METADATA>|$)").unwrap()
+});
+static RE_SYS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<SYSTEM_MESSAGE[\s>].*?(?:</SYSTEM_MESSAGE>|$)").unwrap()
+});
+static RE_SETTINGS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<USER_SETTINGS_CHANGE[\s>].*?(?:</USER_SETTINGS_CHANGE>|$)").unwrap()
+});
+static RE_REQ: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)</?USER_REQUEST\b[^>]*>").unwrap()
+});
+static RE_FENCED_CODE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"```+[\s\S]*?```+").unwrap()
+});
+static RE_UNCLOSED_CODE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"```+[\s\S]*$").unwrap()
+});
+static RE_SPACES: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"[ \t]+").unwrap()
+});
+static RE_NEWLINES: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\n[ \t]*\n+").unwrap()
+});
+
+pub fn sanitize_gemini_text(text: &str) -> String {
+    let mut s = text.to_string();
+
+    let phrase = "not actually sent by the user";
+    if let Some(idx) = s.find(phrase) {
+        if let Some(start) = s[..idx].rfind("The following is a") {
+            let after = &s[idx + phrase.len()..];
+            let end = after
+                .find("<SYSTEM_MESSAGE")
+                .map(|offset| idx + phrase.len() + offset)
+                .unwrap_or(s.len());
+            s.replace_range(start..end, "");
+        }
+    }
+
+    s = RE_META.replace_all(&s, "").to_string();
+    s = RE_SYS.replace_all(&s, "").to_string();
+    s = RE_SETTINGS.replace_all(&s, "").to_string();
+    s = RE_REQ.replace_all(&s, "").to_string();
+    s = RE_FENCED_CODE.replace_all(&s, " ").to_string();
+    s = RE_UNCLOSED_CODE.replace_all(&s, " ").to_string();
+
+    s = RE_SPACES.replace_all(&s, " ").to_string();
+    s = RE_NEWLINES.replace_all(&s, "\n\n").to_string();
+    s = s.trim().to_string();
+
+    if let Some((idx, _)) = s.char_indices().nth(MAX_CHUNK_CODEPOINTS) {
+        s.truncate(idx);
+    }
+
+    s
+}
 
 // Stable UUID namespace for Gemini logs
 const GEMINI_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -210,30 +273,40 @@ pub fn parse_and_insert(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize
                     interactions.push(current_turn_blocks.clone());
                     current_turn_blocks.clear();
                 }
+                let clean_text = sanitize_gemini_text(content);
                 current_turn_blocks.push(TurnRaw {
                     role: "user".to_string(),
-                    text: content.to_string(),
+                    text: clean_text,
                     timestamp,
                     offset: line_offset,
                     len: line_len,
                 });
             } else if msg_type == "PLANNER_RESPONSE" {
-                let mut text = content.to_string();
-                let mut role = "assistant".to_string();
-                if text.is_empty() {
-                    if let Some(thinking) = v.get("thinking").and_then(|t| t.as_str()) {
-                        text = thinking.to_string();
-                        role = "thinking".to_string();
+                if let Some(thinking) = v.get("thinking").and_then(|t| t.as_str()) {
+                    if !thinking.is_empty() {
+                        let clean_thinking = sanitize_gemini_text(thinking);
+                        if !clean_thinking.is_empty() {
+                            current_turn_blocks.push(TurnRaw {
+                                role: "thinking".to_string(),
+                                text: clean_thinking,
+                                timestamp: timestamp.clone(),
+                                offset: line_offset,
+                                len: line_len,
+                            });
+                        }
                     }
                 }
-                if !text.is_empty() {
-                    current_turn_blocks.push(TurnRaw {
-                        role,
-                        text,
-                        timestamp,
-                        offset: line_offset,
-                        len: line_len,
-                    });
+                if !content.is_empty() {
+                    let clean_content = sanitize_gemini_text(content);
+                    if !clean_content.is_empty() {
+                        current_turn_blocks.push(TurnRaw {
+                            role: "assistant".to_string(),
+                            text: clean_content,
+                            timestamp,
+                            offset: line_offset,
+                            len: line_len,
+                        });
+                    }
                 }
             }
             continue;
@@ -246,17 +319,19 @@ pub fn parse_and_insert(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize
                 current_turn_blocks.clear();
             }
             if trimmed.starts_with("USER:") {
+                let clean_text = sanitize_gemini_text(trimmed[5..].trim());
                 current_turn_blocks.push(TurnRaw {
                     role: "user".to_string(),
-                    text: trimmed[5..].trim().to_string(),
+                    text: clean_text,
                     timestamp: "".to_string(),
                     offset: line_offset,
                     len: line_len,
                 });
             } else {
+                let clean_text = sanitize_gemini_text(trimmed[6..].trim());
                 current_turn_blocks.push(TurnRaw {
                     role: "assistant".to_string(),
-                    text: trimmed[6..].trim().to_string(),
+                    text: clean_text,
                     timestamp: "".to_string(),
                     offset: line_offset,
                     len: line_len,
@@ -282,22 +357,67 @@ pub fn parse_and_insert(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize
     let mut count = 0;
 
     for (turn_idx, interaction) in interactions.iter().enumerate() {
-        let mut all_parts = vec![format!("[gemini:{project_name}] Session {}\n", session_id)];
-        let mut turns_meta = Vec::new();
+        let last_thinking_idx = interaction.iter().rposition(|t| t.role == "thinking");
 
-        for turn in interaction {
+        let mut eligible_turns: Vec<TurnRaw> = Vec::new();
+        for (idx, turn) in interaction.iter().enumerate() {
+            if turn.role == "thinking" {
+                if Some(idx) != last_thinking_idx {
+                    continue;
+                }
+                let mut t = turn.clone();
+                if let Some((char_idx, _)) = t.text.char_indices().nth(800) {
+                    t.text.truncate(char_idx);
+                }
+                eligible_turns.push(t);
+            } else {
+                let mut t = turn.clone();
+                if t.text.chars().count() > MAX_CHUNK_CODEPOINTS {
+                    if let Some((char_idx, _)) = t.text.char_indices().nth(MAX_CHUNK_CODEPOINTS) {
+                        t.text.truncate(char_idx);
+                    }
+                }
+                eligible_turns.push(t);
+            }
+        }
+
+        let header = format!("[gemini:{project_name}] Session {}\n", session_id);
+        let mut all_parts = vec![header];
+        let mut turns_meta = Vec::new();
+        let mut total_chars: usize = all_parts[0].chars().count();
+
+        for turn in eligible_turns {
+            if total_chars >= MAX_TURN_CODEPOINTS {
+                break;
+            }
+
             let label = match turn.role.as_str() {
                 "user" => "[User]",
                 "thinking" => "[Thinking]",
                 _ => "[Gemini]",
             };
-            all_parts.push(format!("{label} {}\n", turn.text));
-            turns_meta.push(serde_json::json!({
-                "role": turn.role,
-                "timestamp": turn.timestamp,
-                "off": turn.offset,
-                "len": turn.len,
-            }));
+
+            let mut part = format!("{label} {}\n", turn.text);
+            let part_chars = part.chars().count();
+            let remaining = MAX_TURN_CODEPOINTS - total_chars;
+
+            if part_chars > remaining {
+                if let Some((idx, _)) = part.char_indices().nth(remaining) {
+                    part.truncate(idx);
+                }
+            }
+
+            let final_part_chars = part.chars().count();
+            if final_part_chars > 0 {
+                total_chars += final_part_chars;
+                all_parts.push(part);
+                turns_meta.push(serde_json::json!({
+                    "role": turn.role,
+                    "timestamp": turn.timestamp,
+                    "off": turn.offset,
+                    "len": turn.len,
+                }));
+            }
         }
 
         let body = all_parts.join("");
@@ -417,5 +537,79 @@ mod tests {
         assert!(body.contains("[User] How do I fix the podman error?"));
         assert!(body.contains("[Thinking] Let me investigate podman logs."));
         assert!(body.contains("[Gemini] You need to adjust permissions."));
+    }
+
+    #[test]
+    fn test_sanitize_gemini_text_strips_metadata_and_system_preserves_request() {
+        let input = "The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n\
+                     <SYSTEM_MESSAGE>\n[Message] timestamp=2026-08-26T14:34:07Z sender=system content=Server restart alert.\n</SYSTEM_MESSAGE>\n\
+                     <ADDITIONAL_METADATA>\nActive Document: /home/ch/homelab/README.md\nCursor line: 1\n</ADDITIONAL_METADATA>\n\
+                     <USER_SETTINGS_CHANGE>\nModel set to Gemini Flash\n</USER_SETTINGS_CHANGE>\n\
+                     <USER_REQUEST>\nPlease fix the podman error on host 10.\nHere is some code:\n```bash\npodman ps -a\n```\nAll done.\n</USER_REQUEST>";
+
+        let sanitized = sanitize_gemini_text(input);
+
+        assert!(!sanitized.contains("Server restart alert"));
+        assert!(!sanitized.contains("<SYSTEM_MESSAGE>"));
+        assert!(!sanitized.contains("</SYSTEM_MESSAGE>"));
+        assert!(!sanitized.contains("Active Document"));
+        assert!(!sanitized.contains("<ADDITIONAL_METADATA>"));
+        assert!(!sanitized.contains("</ADDITIONAL_METADATA>"));
+        assert!(!sanitized.contains("Model set to Gemini Flash"));
+        assert!(!sanitized.contains("<USER_SETTINGS_CHANGE>"));
+        assert!(!sanitized.contains("</USER_SETTINGS_CHANGE>"));
+        assert!(!sanitized.contains("<USER_REQUEST>"));
+        assert!(!sanitized.contains("</USER_REQUEST>"));
+        assert!(!sanitized.contains("podman ps -a"));
+        assert!(sanitized.contains("Please fix the podman error on host 10."));
+        assert!(sanitized.contains("Here is some code:"));
+        assert!(sanitized.contains("All done."));
+
+        // Long text truncation check
+        let long_input = "x".repeat(5000);
+        let long_sanitized = sanitize_gemini_text(&long_input);
+        assert_eq!(long_sanitized.chars().count(), MAX_CHUNK_CODEPOINTS);
+    }
+
+    #[test]
+    fn test_parse_and_insert_caps_oversized_turn_preserves_labels() {
+        let user_content = format!("<USER_REQUEST>{}</USER_REQUEST>", "U".repeat(5000));
+        let thinking_1 = "T1".repeat(1000);
+        let thinking_2 = "T2".repeat(1000);
+        let gemini_content = "G".repeat(5000);
+
+        let raw_log = format!(
+            r#"{{"type": "USER_INPUT", "content": "{user_content}", "created_at": "2026-04-26T11:00:00Z"}}
+{{"type": "PLANNER_RESPONSE", "content": "", "thinking": "{thinking_1}", "created_at": "2026-04-26T11:00:01Z"}}
+{{"type": "PLANNER_RESPONSE", "content": "", "thinking": "{thinking_2}", "created_at": "2026-04-26T11:00:02Z"}}
+{{"type": "PLANNER_RESPONSE", "content": "{gemini_content}", "created_at": "2026-04-26T11:00:03Z"}}"#
+        );
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{}", raw_log).unwrap();
+
+        let mut db =
+            DB::new(tempfile::tempdir().unwrap().path().join("test_oversized.db")).unwrap();
+        let inserted = parse_and_insert(&mut db, temp_file.path(), 0).unwrap();
+        assert_eq!(inserted, 1);
+
+        let mut stmt = db.query("SELECT body FROM document").unwrap();
+        let mut rows = stmt.query(()).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        let body: String = row.get(0).unwrap();
+
+        assert!(
+            body.chars().count() <= MAX_TURN_CODEPOINTS,
+            "body length {} exceeds MAX_TURN_CODEPOINTS {}",
+            body.chars().count(),
+            MAX_TURN_CODEPOINTS
+        );
+        assert!(body.contains("[User]"));
+        assert!(body.contains("[Thinking]"));
+        assert!(body.contains("[Gemini]"));
+        // First thinking block should have been dropped
+        assert!(!body.contains("T1T1T1"));
+        // Last thinking block should be preserved (truncated to <= 800 chars)
+        assert!(body.contains("T2T2T2"));
     }
 }
