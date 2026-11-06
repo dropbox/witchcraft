@@ -219,14 +219,16 @@ pub fn parse_and_insert(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize
                 });
             } else if msg_type == "PLANNER_RESPONSE" {
                 let mut text = content.to_string();
+                let mut role = "assistant".to_string();
                 if text.is_empty() {
                     if let Some(thinking) = v.get("thinking").and_then(|t| t.as_str()) {
                         text = thinking.to_string();
+                        role = "thinking".to_string();
                     }
                 }
                 if !text.is_empty() {
                     current_turn_blocks.push(TurnRaw {
-                        role: "assistant".to_string(),
+                        role,
                         text,
                         timestamp,
                         offset: line_offset,
@@ -284,10 +286,10 @@ pub fn parse_and_insert(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize
         let mut turns_meta = Vec::new();
 
         for turn in interaction {
-            let label = if turn.role == "user" {
-                "[User]"
-            } else {
-                "[Gemini]"
+            let label = match turn.role.as_str() {
+                "user" => "[User]",
+                "thinking" => "[Thinking]",
+                _ => "[Gemini]",
             };
             all_parts.push(format!("{label} {}\n", turn.text));
             turns_meta.push(serde_json::json!({
@@ -393,5 +395,27 @@ mod tests {
         .unwrap();
         let inserted = parse_and_insert(&mut db, temp_file.path(), 0).unwrap();
         assert_eq!(inserted, 1);
+    }
+
+    #[test]
+    fn test_parse_gemini_thinking_label() {
+        let raw_log = r#"{"type": "USER_INPUT", "content": "How do I fix the podman error?", "created_at": "2026-04-26T11:00:00Z"}
+{"type": "PLANNER_RESPONSE", "content": "", "thinking": "Let me investigate podman logs.", "created_at": "2026-04-26T11:00:01Z"}
+{"type": "PLANNER_RESPONSE", "content": "You need to adjust permissions.", "created_at": "2026-04-26T11:00:02Z"}"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        write!(temp_file, "{}", raw_log).unwrap();
+
+        let mut db =
+            DB::new(tempfile::tempdir().unwrap().path().join("test_thinking.db")).unwrap();
+        let inserted = parse_and_insert(&mut db, temp_file.path(), 0).unwrap();
+        assert_eq!(inserted, 1);
+
+        let mut stmt = db.query("SELECT body FROM document").unwrap();
+        let mut rows = stmt.query(()).unwrap();
+        let row = rows.next().unwrap().unwrap();
+        let body: String = row.get(0).unwrap();
+        assert!(body.contains("[User] How do I fix the podman error?"));
+        assert!(body.contains("[Thinking] Let me investigate podman logs."));
+        assert!(body.contains("[Gemini] You need to adjust permissions."));
     }
 }
