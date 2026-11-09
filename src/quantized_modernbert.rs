@@ -294,7 +294,7 @@ fn profile_take(seq_len: usize) -> bool {
         AtomicUsize::new(limit)
     });
     remaining
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_sub(1))
         .is_ok()
 }
 
