@@ -41,6 +41,7 @@ testset/treccovid/questions.test.tsv
 
 # Generated Neso AOT outputs.
 kernels/out/*
+!kernels/out/kernels_metal.tar.zst
 !kernels/out/kernels_metal_nosimd.tar.zst
 !kernels/out/kernels_dxil.tar.zst
 

@@ -252,10 +252,11 @@ def gen_rust():
 
 
 def pack_kernels(platform):
-    if platform == "metal":
-        return  # Runtime uses the scalar lowering on both Mac architectures.
     from kernel_configs import METAL_KERNELS, get_hlsl_kernels
-    if platform == "metal_nosimd":
+    if platform == "metal":
+        configs, directory, extension = METAL_KERNELS, "metal", "metallib"
+        loader, filename = "neso_metal_gen.rs", "kernels_metal.tar.zst"
+    elif platform == "metal_nosimd":
         configs, directory, extension = METAL_KERNELS, "metal_nosimd", "metallib"
         loader, filename = "neso_metal_gen.rs", "kernels_metal_nosimd.tar.zst"
     else:
@@ -293,7 +294,8 @@ if __name__ == "__main__":
 
     gen_ttir()
     for p in platforms:
-        {"metal": gen_ninja_metal, "metal_nosimd": gen_ninja_metal_nosimd, "hlsl": gen_ninja_hlsl}[p]()
+#        {"metal": gen_ninja_metal, "metal_nosimd": gen_ninja_metal_nosimd, "hlsl": gen_ninja_hlsl}[p]()
+        {"metal": gen_ninja_metal, "metal_nosimd": gen_ninja_metal_nosimd}[p]()
     for p in platforms:
         if not run_ninja(p):
             sys.exit(1)
