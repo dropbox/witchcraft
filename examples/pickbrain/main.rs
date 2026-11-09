@@ -2488,6 +2488,7 @@ fn main() -> Result<()> {
                 eprintln!("  --dump ID            dump a session, channel, or thread");
                 eprintln!("  --turns N-M          limit turns/conversations in dump");
                 eprintln!("  --no-thinking        omit internal thinking blocks when dumping turns");
+                eprintln!("  -V, --version        print version and exit");
                 eprintln!();
                 eprintln!("Environment:");
                 eprintln!("  PICKBRAIN_DIR        override the pickbrain DB and state directory");
@@ -2496,6 +2497,10 @@ fn main() -> Result<()> {
                 eprintln!("  EXTRA_CLAUDE_DIRS   colon-separated additional .claude directories");
                 eprintln!("  EXTRA_PI_DIRS       colon-separated additional .pi/agent directories");
                 eprintln!("  EXTRA_GEMINI_DIRS   colon-separated additional .gemini/antigravity directories");
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("pickbrain {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--quiet" | "-q" => {
@@ -2512,6 +2517,7 @@ fn main() -> Result<()> {
                 } else {
                     eprintln!("no database to remove");
                 }
+                witchcraft::DB::remove_all_sidecars(&db_name);
                 watermark::remove(&watermark::claude_path());
                 watermark::remove(&watermark::codex_path());
                 watermark::remove(&watermark::pi_path());

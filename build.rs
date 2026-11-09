@@ -20,9 +20,17 @@ fn build_kernels() {
     use std::{env, fs, io::Read, path::PathBuf, process::Command};
 
     let target = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+
     let (platform, archive_name, loader) = match target.as_str() {
-        "macos" if env::var_os("CARGO_FEATURE_NESO_METAL").is_some() =>
-            ("metal_nosimd", "kernels_metal_nosimd.tar.zst", "neso_metal_gen.rs"),
+        "macos" if env::var_os("CARGO_FEATURE_NESO_METAL").is_some() => {
+            let archive = if arch == "aarch64" {
+                "kernels_metal.tar.zst"
+            } else {
+                "kernels_metal_nosimd.tar.zst"
+            };
+            ("metal", archive, "neso_metal_gen.rs")
+        }
         "windows" if env::var_os("CARGO_FEATURE_NESO_D3D12").is_some() =>
             ("hlsl", "kernels_dxil.tar.zst", "neso_d3d12_gen.rs"),
         _ => return,
