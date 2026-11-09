@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "pickbrain": {
+      "command": "pickbrain",
+      "args": [
+        "--mcp"
+      ]
+    }
+  }
+}

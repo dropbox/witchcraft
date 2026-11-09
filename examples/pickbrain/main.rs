@@ -7,6 +7,7 @@ use std::path::PathBuf;
 mod claude_code;
 mod codex;
 mod gemini;
+pub mod mcp;
 mod pi;
 mod slack;
 mod watermark;
@@ -424,45 +425,45 @@ fn embed_and_index(db: &DB, embedder: &Embedder, _device: &candle_core::Device) 
 // --- Search result data ---
 
 #[derive(Clone)]
-struct TurnMeta {
-    role: String,
-    timestamp: String,
-    byte_offset: u64,
-    byte_len: u64,
+pub(crate) struct TurnMeta {
+    pub(crate) role: String,
+    pub(crate) timestamp: String,
+    pub(crate) byte_offset: u64,
+    pub(crate) byte_len: u64,
 }
 
 #[derive(Clone)]
-struct SearchResult {
-    timestamp: String,
-    project: String,
-    session_id: String,
-    session_name: String,
-    turn: u64,
-    path: String,
-    cwd: String,
-    source: String,
-    remote_host: String,
-    branch: String,
-    conv_key: String,
-    slack_open: Option<SlackOpenTarget>,
-    bodies: Vec<String>,
-    match_idx: usize,
-    turns: Vec<TurnMeta>,
+pub(crate) struct SearchResult {
+    pub(crate) timestamp: String,
+    pub(crate) project: String,
+    pub(crate) session_id: String,
+    pub(crate) session_name: String,
+    pub(crate) turn: u64,
+    pub(crate) path: String,
+    pub(crate) cwd: String,
+    pub(crate) source: String,
+    pub(crate) remote_host: String,
+    pub(crate) branch: String,
+    pub(crate) conv_key: String,
+    pub(crate) slack_open: Option<SlackOpenTarget>,
+    pub(crate) bodies: Vec<String>,
+    pub(crate) match_idx: usize,
+    pub(crate) turns: Vec<TurnMeta>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SlackOpenTarget {
-    team_id: String,
-    channel_id: String,
-    root_ts: String,
-    conv_key: String,
+pub(crate) struct SlackOpenTarget {
+    pub(crate) team_id: String,
+    pub(crate) channel_id: String,
+    pub(crate) root_ts: String,
+    pub(crate) conv_key: String,
 }
 
 // A turn from the original JSONL session file
-struct SessionTurn {
-    role: String,
-    text: String,
-    timestamp: String,
+pub(crate) struct SessionTurn {
+    pub(crate) role: String,
+    pub(crate) text: String,
+    pub(crate) timestamp: String,
 }
 
 fn read_jsonl_line(path: &str, offset: u64, len: u64) -> Option<String> {
@@ -494,7 +495,7 @@ fn extract_pi_content_text(content: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> {
+pub(crate) fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> {
     let line = read_jsonl_line(path, tm.byte_offset, tm.byte_len)?;
     let v: serde_json::Value = serde_json::from_str(&line).ok()?;
 
@@ -555,7 +556,7 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
 
 
 /// Parse a duration string like "24h", "7d", "2w" into milliseconds.
-fn parse_since(s: &str) -> Option<i64> {
+pub(crate) fn parse_since(s: &str) -> Option<i64> {
     let s = s.trim();
     let (num_str, unit) = s.split_at(s.len().saturating_sub(1));
     let n: i64 = num_str.parse().ok()?;
@@ -889,7 +890,7 @@ fn run_search(
     Ok((parse_search_results(results), search_ms))
 }
 
-fn run_search_with(
+pub(crate) fn run_search_with(
     db: &DB,
     embedder: &Embedder,
     q: &str,
@@ -2233,26 +2234,16 @@ pub(crate) fn filter_turn_body(body: &str, is_channel: bool, no_thinking: bool) 
     result
 }
 
-fn dump(
-    db_name: &PathBuf,
+pub(crate) fn fetch_session_text(
+    db: &DB,
     session_id: &str,
     turns_range: Option<&str>,
     since_ms: Option<i64>,
     no_thinking: bool,
-) -> Result<()> {
+) -> Result<String> {
     use witchcraft::types::*;
     use witchcraft::sql_generator::build_filter_sql_and_params;
 
-    let db = match DB::new_reader(db_name.clone()) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!(
-                "warning: lookup-only mode could not open {}: {e}",
-                db_name.display()
-            );
-            return Ok(());
-        }
-    };
     let name = session_id.strip_prefix('#').unwrap_or(session_id);
 
     // Try as session_id first, then thread conv_key, then channel_id/channel_name
@@ -2286,7 +2277,7 @@ fn dump(
             Ok(rows)
         }
 
-        // 1. Try as Claude/Codex session_id
+        // 1. Try as Claude/Codex/Gemini session_id
         let session_match = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
             condition: Some(SqlConditionInternal {
@@ -2297,7 +2288,7 @@ fn dump(
             logic: None,
             statements: None,
         };
-        let rows = query_filter(&db, &session_match, "turn", turn_start, turn_end)?;
+        let rows = query_filter(db, &session_match, "turn", turn_start, turn_end)?;
         if !rows.is_empty() {
             (rows, false)
         } else {
@@ -2312,7 +2303,7 @@ fn dump(
                 logic: None,
                 statements: None,
             };
-            let rows = query_filter(&db, &thread_match, "date", turn_start, turn_end)?;
+            let rows = query_filter(db, &thread_match, "date", turn_start, turn_end)?;
             if !rows.is_empty() {
                 (rows, true)
             } else {
@@ -2376,14 +2367,13 @@ fn dump(
                     statements: Some(filters),
                 }
             };
-            let rows = query_filter(&db, &combined, "turn DESC", turn_start, turn_end)?;
+            let rows = query_filter(db, &combined, "turn DESC", turn_start, turn_end)?;
             (rows, true)
         }}
     };
 
     if rows.is_empty() {
-        eprintln!("No session or channel found for {session_id}");
-        std::process::exit(1);
+        anyhow::bail!("No session or channel found for {session_id}");
     }
 
     let mut buf = Vec::new();
@@ -2402,8 +2392,36 @@ fn dump(
         writeln!(buf, "---")?;
     }
 
+    Ok(String::from_utf8(buf)?)
+}
+
+fn dump(
+    db_name: &PathBuf,
+    session_id: &str,
+    turns_range: Option<&str>,
+    since_ms: Option<i64>,
+    no_thinking: bool,
+) -> Result<()> {
+    let db = match DB::new_reader(db_name.clone()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "warning: lookup-only mode could not open {}: {e}",
+                db_name.display()
+            );
+            return Ok(());
+        }
+    };
+
+    let output = match fetch_session_text(&db, session_id, turns_range, since_ms, no_thinking) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
     use std::io::IsTerminal;
-    let output = String::from_utf8(buf)?;
     if std::io::stdout().is_terminal() {
         use std::process::{Command, Stdio};
         let mut pager = Command::new("less")
@@ -2453,6 +2471,7 @@ fn main() -> Result<()> {
     let mut exclude_current = false;
     let mut quiet = false;
     let mut ingest_only = false;
+    let mut is_mcp = false;
     let mut log_level: Option<LevelFilter> = None;
     let mut no_thinking = false;
     let mut query_args: Vec<&str> = Vec::new();
@@ -2463,6 +2482,7 @@ fn main() -> Result<()> {
                 eprintln!("Usage:");
                 eprintln!("  pickbrain [options] [query]");
                 eprintln!("  pickbrain --dump <session-id|channel|thr:ts> [--turns N-M] [--since T] [--no-thinking]");
+                eprintln!("  pickbrain --mcp");
                 eprintln!("  pickbrain --nuke");
                 eprintln!("  pickbrain --ingest-only [--quiet]");
                 eprintln!("  pickbrain --watch [--delay SECONDS] [--max-delay SECONDS]");
@@ -2481,6 +2501,7 @@ fn main() -> Result<()> {
                 eprintln!("  --log-level LEVEL    log level: error, warn, info, debug (default: info)");
                 eprintln!("  -q, --quiet          suppress ingest progress output");
                 eprintln!("  --ingest-only        ingest and index, then exit without searching");
+                eprintln!("  --mcp                start stdio MCP server");
                 eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
                 eprintln!("  --dm                 only DMs (Slack)");
                 eprintln!("  --no-dm              exclude DMs (Slack)");
@@ -2502,6 +2523,9 @@ fn main() -> Result<()> {
             "--version" | "-V" => {
                 println!("pickbrain {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
+            }
+            "--mcp" => {
+                is_mcp = true;
             }
             "--quiet" | "-q" => {
                 quiet = true;
@@ -2641,13 +2665,18 @@ fn main() -> Result<()> {
         }
     }
 
+    let db_name = db_path();
+    let assets = assets_path();
+
+    if is_mcp {
+        let _ = log::set_max_level(LevelFilter::Off);
+        return mcp::start_server(&db_name, &assets);
+    }
+
     use std::io::IsTerminal;
     if !quiet && std::io::stderr().is_terminal() {
         eprintln!("pickbrain {} — Copyright (c) 2026 Dropbox Inc.", env!("CARGO_PKG_VERSION"));
     }
-
-    let db_name = db_path();
-    let assets = assets_path();
 
     // Migrate DB from old location (~/.claude/pickbrain.db)
     if !pickbrain_dir_overridden() && !db_name.exists() {
