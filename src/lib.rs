@@ -330,13 +330,10 @@ pub struct QueryEmbeddings {
 pub fn embed_query_for_search(embedder: &Embedder, text: &str) -> Result<QueryEmbeddings> {
     if query_token_salience_enabled() {
         let output = embedder.embed_query_with_gate_scores_and_tokens(text)?;
-        let weights = output
-            .gate_scores
-            .map(query_weights_from_gate_scores)
-            .ok_or_else(|| anyhow::anyhow!("WARP_QUERY_TOKEN_SALIENCE requires token_gate tensors in ModernBERT assets"))?;
+        let weights = output.gate_scores.map(query_weights_from_gate_scores);
         Ok(QueryEmbeddings {
             embeddings: output.embeddings.get(0)?,
-            weights: Some(weights),
+            weights,
         })
     } else {
         let (embeddings, _) = embedder.embed_query(text)?;
@@ -3205,29 +3202,32 @@ pub fn cached_embeddings_from_output(
         .to_device(&Device::Cpu)?
         .to_dtype(DType::F32)?;
     let counts = token_counts_for_lens(body, lens, &output.offsets)?;
-    let gate_scores = output.gate_scores.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("document token pruning requires token_gate tensors in ModernBERT assets")
-    })?;
-    let unpruned_rows = embeddings.dims2()?.0;
-    let pruned = prune_document_embeddings_by_gate_fraction(
-        &embeddings,
-        &output.offsets,
-        &output.tokens,
-        &counts,
-        gate_scores,
-        document_token_keep_fraction(),
-    )?;
-    let embeddings = pruned.embeddings;
-    let counts = pruned.counts;
+    let (embeddings, counts) = if let Some(gate_scores) = output.gate_scores.as_ref() {
+        let unpruned_rows = embeddings.dims2()?.0;
+        let pruned = prune_document_embeddings_by_gate_fraction(
+            &embeddings,
+            &output.offsets,
+            &output.tokens,
+            &counts,
+            gate_scores,
+            document_token_keep_fraction(),
+        )?;
+        let embeddings = pruned.embeddings;
+        let counts = pruned.counts;
+        let (rows, _cols) = embeddings.dims2()?;
+        let dt = now.elapsed().as_secs_f64();
+        debug!(
+            "embedder took {} ms ({} rows/s), pruned {}/{} document tokens.",
+            now.elapsed().as_millis(),
+            ((rows as f64) / dt).round(),
+            rows,
+            unpruned_rows,
+        );
+        (embeddings, counts)
+    } else {
+        (embeddings, counts)
+    };
     let (rows, cols) = embeddings.dims2()?;
-    let dt = now.elapsed().as_secs_f64();
-    debug!(
-        "embedder took {} ms ({} rows/s), pruned {}/{} document tokens.",
-        now.elapsed().as_millis(),
-        ((rows as f64) / dt).round(),
-        rows,
-        unpruned_rows,
-    );
 
     debug!(
         "got embedding for chunk {:?} {:?}",

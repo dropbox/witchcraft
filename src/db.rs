@@ -397,6 +397,10 @@ impl DB {
 
     fn open_internal(db_fn: PathBuf, fast: bool) -> SQLResult<Self> {
         let mut first_creation = !db_fn.exists();
+        if first_creation {
+            Self::remove_sidecars(&db_fn);
+            Self::remove_bucket_data_sidecars(&db_fn);
+        }
         let mut connection = Connection::open(&db_fn)?;
 
         let db_ok = fast || first_creation || Self::integrity_ok(&connection);
@@ -540,6 +544,11 @@ impl DB {
 
     pub fn remove_all_bucket_data_sidecars(&self) {
         Self::remove_bucket_data_sidecars(&self.db_fn);
+    }
+
+    pub fn remove_all_sidecars(db_fn: &Path) {
+        Self::remove_sidecars(db_fn);
+        Self::remove_bucket_data_sidecars(db_fn);
     }
 
     pub fn execute(&self, sql: &str) -> SQLResult<()> {
@@ -764,6 +773,23 @@ mod tests {
             db.query("SELECT 1 FROM document_fts_stopword WHERE term = 'the'")?;
         let found: i64 = stopword_query.query_row((), |row| row.get(0))?;
         assert_eq!(found, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn new_database_removes_orphaned_sidecars() -> rusqlite::Result<()> {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pickbrain.db");
+        let stale_bucket = dir.path().join("pickbrain.db.buckets.2.stale");
+        let stale_manifest = dir.path().join("pickbrain.db.index");
+
+        std::fs::write(&stale_bucket, b"stale_t5_buckets").unwrap();
+        std::fs::write(&stale_manifest, b"stale_manifest").unwrap();
+
+        let _db = DB::new(db_path)?;
+        assert!(!stale_bucket.exists());
+        assert!(!stale_manifest.exists());
 
         Ok(())
     }

@@ -2378,6 +2378,7 @@ fn main() -> Result<()> {
                 } else {
                     eprintln!("no database to remove");
                 }
+                witchcraft::DB::remove_all_sidecars(&db_name);
                 watermark::remove(&watermark::claude_path());
                 watermark::remove(&watermark::codex_path());
                 watermark::remove(&watermark::pi_path());
