@@ -106,7 +106,8 @@ impl Sources {
         anyhow::ensure!(home.is_dir(), "home directory does not exist: {}", home.display());
         let mut roots = Vec::new();
         for (default, extra) in [(".claude", "EXTRA_CLAUDE_DIRS"),
-            (".codex", "EXTRA_CODEX_DIRS"), (".pi/agent", "EXTRA_PI_DIRS")] {
+            (".codex", "EXTRA_CODEX_DIRS"), (".pi/agent", "EXTRA_PI_DIRS"),
+            (".gemini/antigravity/brain", "EXTRA_GEMINI_DIRS")] {
             roots.push(normalize(&home.join(default)));
             if let Some(extra) = env::var_os(extra) {
                 roots.extend(env::split_paths(&extra).filter(|path| !path.as_os_str().is_empty())

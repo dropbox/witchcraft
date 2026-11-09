@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
-use log::{Level, LevelFilter, Metadata, Record};
+use log::{LevelFilter, Metadata, Record};
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;
 
 mod claude_code;
 mod codex;
+mod gemini;
 mod pi;
 mod slack;
 mod watermark;
@@ -15,7 +16,7 @@ use witchcraft::{DB, Embedder};
 struct SimpleLogger;
 impl log::Log for SimpleLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Warn
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &Record) {
@@ -42,9 +43,18 @@ fn pickbrain_dir_overridden() -> bool {
         .unwrap_or(false)
 }
 
+static PRINTED_INGEST_NOTICE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn print_ingest_path(path: &std::path::Path, quiet: bool) {
     if !quiet {
-        eprintln!("{}", path.display());
+        if log::max_level() >= LevelFilter::Debug {
+            eprintln!("{}", path.display());
+        } else if log::max_level() == LevelFilter::Info
+            && !PRINTED_INGEST_NOTICE.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("Ingesting... (run with '--log-level debug' to see messages)");
+        }
     }
 }
 
@@ -230,6 +240,13 @@ fn needs_ingest(
         return Ok(true);
     }
 
+    if wants_source(types, "gemini") {
+        let gemini_skip = skip_session.filter(|_| watermark::is_fresh(&watermark::gemini_path(), stale_ms));
+        if gemini::has_work(gemini_skip)? {
+            return Ok(true);
+        }
+    }
+
     Ok(false)
 }
 
@@ -241,6 +258,7 @@ fn reset_ingest_watermarks() {
     watermark::remove(&watermark::claude_path());
     watermark::remove(&watermark::codex_path());
     watermark::remove(&watermark::pi_path());
+    watermark::remove(&watermark::gemini_path());
     slack::remove_watermark();
 }
 
@@ -252,6 +270,8 @@ fn active_session_id_from_env(mut get_var: impl FnMut(&str) -> Option<String>) -
         "CODEX_SESSION_ID",
         "CODEX_THREAD_ID",
         "PI_SESSION_ID",
+        "GEMINI_SESSION_ID",
+        "ANTIGRAVITY_CONVERSATION_ID",
     ] {
         if let Some(value) = get_var(key) {
             let value = value.trim();
@@ -365,17 +385,30 @@ fn ingest(
         0
     };
 
-    let total = sessions + memories + authored + configs + codex_sessions + pi_sessions + slack_conversations;
+    let gemini_sessions = if want("gemini") {
+        let gemini_skip = skip_session.filter(|_| watermark::is_fresh(&watermark::gemini_path(), stale_ms));
+        gemini::ingest_gemini(&mut db, gemini_skip, quiet)?
+    } else {
+        0
+    };
+
+    let total = sessions + memories + authored + configs + codex_sessions + pi_sessions + slack_conversations + gemini_sessions;
     if total == 0 {
-        if !quiet {
+        if !quiet && log::max_level() >= LevelFilter::Debug {
             eprintln!("No new sessions to ingest.");
         }
         return Ok(0);
     }
     if !quiet {
-        eprintln!(
-            "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {pi_sessions} pi sessions, {slack_conversations} slack conversations, {memories} memory files, {authored} authored files, {configs} config files"
-        );
+        if log::max_level() >= LevelFilter::Debug {
+            eprintln!(
+                "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {pi_sessions} pi sessions, {slack_conversations} slack conversations, {gemini_sessions} gemini sessions, {memories} memory files, {authored} authored files, {configs} config files"
+            );
+        } else if log::max_level() == LevelFilter::Info
+            && !PRINTED_INGEST_NOTICE.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("Ingesting... (run with '--log-level debug' to see messages)");
+        }
     }
     Ok(total)
 }
@@ -493,6 +526,8 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
             v.get("message")?.get("content")?
         };
         extract_pi_content_text(content)?
+    } else if source == "gemini" {
+        v.get("content").and_then(|c| c.as_str())?.to_string()
     } else {
         // Claude Code
         let msg = v.get("message")?;
@@ -2108,7 +2143,103 @@ fn parse_range(s: &str) -> (usize, usize) {
     }
 }
 
-fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms: Option<i64>) -> Result<()> {
+pub(crate) fn filter_turn_body(body: &str, is_channel: bool, no_thinking: bool) -> Vec<String> {
+    if is_channel {
+        return body.lines().map(|s| s.to_string()).collect();
+    }
+
+    let lines: Vec<&str> = body
+        .lines()
+        .skip_while(|l| {
+            l.starts_with('[')
+                && !l.starts_with("[User]")
+                && !l.starts_with("[Claude]")
+                && !l.starts_with("[Codex]")
+                && !l.starts_with("[Pi]")
+                && !l.starts_with("[Gemini]")
+                && !l.starts_with("[Thinking]")
+        })
+        .collect();
+
+    if !no_thinking {
+        return lines.into_iter().map(|s| s.to_string()).collect();
+    }
+
+    fn is_block_header(line: &str) -> Option<&'static str> {
+        if line.starts_with("[User]") {
+            Some("[User]")
+        } else if line.starts_with("[Gemini]") {
+            Some("[Gemini]")
+        } else if line.starts_with("[Thinking]") {
+            Some("[Thinking]")
+        } else if line.starts_with("[Claude]") {
+            Some("[Claude]")
+        } else if line.starts_with("[Codex]") {
+            Some("[Codex]")
+        } else if line.starts_with("[Pi]") {
+            Some("[Pi]")
+        } else {
+            None
+        }
+    }
+
+    struct Block<'a> {
+        tag: &'a str,
+        lines: Vec<&'a str>,
+    }
+
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut current_block: Option<Block> = None;
+
+    for line in lines {
+        if let Some(tag) = is_block_header(line) {
+            if let Some(b) = current_block.take() {
+                blocks.push(b);
+            }
+            current_block = Some(Block {
+                tag,
+                lines: vec![line],
+            });
+        } else if let Some(ref mut b) = current_block {
+            b.lines.push(line);
+        } else {
+            current_block = Some(Block {
+                tag: "",
+                lines: vec![line],
+            });
+        }
+    }
+    if let Some(b) = current_block {
+        blocks.push(b);
+    }
+
+    let last_gemini_idx = blocks.iter().rposition(|b| b.tag == "[Gemini]");
+
+    let mut result = Vec::new();
+    for (idx, b) in blocks.into_iter().enumerate() {
+        if b.tag == "[Thinking]" {
+            continue;
+        }
+        if b.tag == "[Gemini]" {
+            if let Some(last_idx) = last_gemini_idx {
+                if idx != last_idx {
+                    continue;
+                }
+            }
+        }
+        result.extend(b.lines.into_iter().map(|s| s.to_string()));
+    }
+
+    result
+}
+
+fn dump(
+    db_name: &PathBuf,
+    session_id: &str,
+    turns_range: Option<&str>,
+    since_ms: Option<i64>,
+    no_thinking: bool,
+) -> Result<()> {
     use witchcraft::types::*;
     use witchcraft::sql_generator::build_filter_sql_and_params;
 
@@ -2263,14 +2394,7 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
         } else {
             writeln!(buf, "turn {}  {}", *turn, format_date(date))?;
         }
-        for line in body.lines().skip_while(|l| {
-            !is_channel
-                && l.starts_with('[')
-                && !l.starts_with("[User]")
-                && !l.starts_with("[Claude]")
-                && !l.starts_with("[Codex]")
-                && !l.starts_with("[Pi]")
-        }) {
+        for line in filter_turn_body(body, is_channel, no_thinking) {
             writeln!(buf, "{line}")?;
         }
     }
@@ -2294,8 +2418,18 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
     Ok(())
 }
 
+fn parse_log_level(val: &str) -> Option<LevelFilter> {
+    match val.to_lowercase().as_str() {
+        "error" => Some(LevelFilter::Error),
+        "warn" => Some(LevelFilter::Warn),
+        "info" => Some(LevelFilter::Info),
+        "debug" => Some(LevelFilter::Debug),
+        _ => None,
+    }
+}
+
 fn main() -> Result<()> {
-    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Warn));
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Info));
 
     let args: Vec<String> = env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--register") {
@@ -2319,6 +2453,8 @@ fn main() -> Result<()> {
     let mut exclude_current = false;
     let mut quiet = false;
     let mut ingest_only = false;
+    let mut log_level: Option<LevelFilter> = None;
+    let mut no_thinking = false;
     let mut query_args: Vec<&str> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -2326,7 +2462,7 @@ fn main() -> Result<()> {
             "--help" | "-h" => {
                 eprintln!("Usage:");
                 eprintln!("  pickbrain [options] [query]");
-                eprintln!("  pickbrain --dump <session-id|channel|thr:ts> [--turns N-M] [--since T]");
+                eprintln!("  pickbrain --dump <session-id|channel|thr:ts> [--turns N-M] [--since T] [--no-thinking]");
                 eprintln!("  pickbrain --nuke");
                 eprintln!("  pickbrain --ingest-only [--quiet]");
                 eprintln!("  pickbrain --watch [--delay SECONDS] [--max-delay SECONDS]");
@@ -2341,7 +2477,8 @@ fn main() -> Result<()> {
                 eprintln!("  --exclude-current    exclude the calling session");
                 eprintln!("  --session ID         search within a session, channel, or thread");
                 eprintln!("  --since 24h|7d|2w    only search recent history");
-                eprintln!("  --type claude,codex,pi,slack  filter by source");
+                eprintln!("  --type claude,codex,gemini,pi,slack  filter by source");
+                eprintln!("  --log-level LEVEL    log level: error, warn, info, debug (default: info)");
                 eprintln!("  -q, --quiet          suppress ingest progress output");
                 eprintln!("  --ingest-only        ingest and index, then exit without searching");
                 eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
@@ -2350,6 +2487,7 @@ fn main() -> Result<()> {
                 eprintln!("  --unread             only unread conversations (Slack)");
                 eprintln!("  --dump ID            dump a session, channel, or thread");
                 eprintln!("  --turns N-M          limit turns/conversations in dump");
+                eprintln!("  --no-thinking        omit internal thinking blocks when dumping turns");
                 eprintln!("  -V, --version        print version and exit");
                 eprintln!();
                 eprintln!("Environment:");
@@ -2358,6 +2496,7 @@ fn main() -> Result<()> {
                 eprintln!("  EXTRA_CODEX_DIRS    colon-separated additional .codex directories");
                 eprintln!("  EXTRA_CLAUDE_DIRS   colon-separated additional .claude directories");
                 eprintln!("  EXTRA_PI_DIRS       colon-separated additional .pi/agent directories");
+                eprintln!("  EXTRA_GEMINI_DIRS   colon-separated additional .gemini/antigravity directories");
                 std::process::exit(0);
             }
             "--version" | "-V" => {
@@ -2382,6 +2521,7 @@ fn main() -> Result<()> {
                 watermark::remove(&watermark::claude_path());
                 watermark::remove(&watermark::codex_path());
                 watermark::remove(&watermark::pi_path());
+                watermark::remove(&watermark::gemini_path());
                 slack::remove_watermark();
                 std::process::exit(0);
             }
@@ -2448,6 +2588,33 @@ fn main() -> Result<()> {
             "--unread" => {
                 unread_only = true;
             }
+            "--log-level" => {
+                if let Some(val) = iter.next() {
+                    match parse_log_level(val) {
+                        Some(lvl) => log_level = Some(lvl),
+                        None => {
+                            eprintln!("invalid --log-level: {val} (use error, warn, info, debug)");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    eprintln!("--log-level requires an argument (error, warn, info, debug)");
+                    std::process::exit(1);
+                }
+            }
+            s if s.starts_with("--log-level=") => {
+                let val = s.strip_prefix("--log-level=").unwrap();
+                match parse_log_level(val) {
+                    Some(lvl) => log_level = Some(lvl),
+                    None => {
+                        eprintln!("invalid --log-level: {val} (use error, warn, info, debug)");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "--no-thinking" => {
+                no_thinking = true;
+            }
             s if s.starts_with('-') => {
                 eprintln!("unknown option: {s}");
                 std::process::exit(1);
@@ -2457,6 +2624,13 @@ fn main() -> Result<()> {
             }
         }
     }
+
+    let effective_log_level = log_level.unwrap_or(if quiet {
+        LevelFilter::Warn
+    } else {
+        LevelFilter::Info
+    });
+    log::set_max_level(effective_log_level);
 
     // Resolve `--branch .` to the current git branch
     if branch_filter.as_deref() == Some(".") {
@@ -2572,7 +2746,7 @@ fn main() -> Result<()> {
         || has_branch;
 
     if let Some(ref sid) = dump_session {
-        dump(&db_name, sid, turns_range.as_deref(), since_ms)?;
+        dump(&db_name, sid, turns_range.as_deref(), since_ms, no_thinking)?;
     } else if !query_args.is_empty() || has_filters {
         let q = query_args.join(" ");
         if std::io::stdout().is_terminal() {
@@ -2778,5 +2952,119 @@ mod tests {
         check_many("🇯🇵", 0..4, 0);
         check_many("🇯🇵", 4..8, 4);
         check_many("🇯🇵", 8..10, 8);
+    }
+
+    #[test]
+    fn test_parse_log_level_valid_and_case_insensitive() {
+        assert_eq!(parse_log_level("error"), Some(LevelFilter::Error));
+        assert_eq!(parse_log_level("ERROR"), Some(LevelFilter::Error));
+        assert_eq!(parse_log_level("warn"), Some(LevelFilter::Warn));
+        assert_eq!(parse_log_level("Warn"), Some(LevelFilter::Warn));
+        assert_eq!(parse_log_level("info"), Some(LevelFilter::Info));
+        assert_eq!(parse_log_level("INFO"), Some(LevelFilter::Info));
+        assert_eq!(parse_log_level("debug"), Some(LevelFilter::Debug));
+        assert_eq!(parse_log_level("DeBuG"), Some(LevelFilter::Debug));
+        assert_eq!(parse_log_level("invalid"), None);
+    }
+
+    #[test]
+    fn test_filter_turn_body_no_thinking_strips_thinking_blocks() {
+        let body = "\
+[gemini:antigravity] Session abc-123
+[User] How do I fix the container?
+[Thinking] Checking cgroups and systemd units...
+Inspecting logs...
+[Gemini] Run systemctl restart container.";
+
+        let filtered = filter_turn_body(body, false, true);
+        assert_eq!(
+            filtered,
+            vec![
+                "[User] How do I fix the container?",
+                "[Gemini] Run systemctl restart container."
+            ]
+        );
+
+        let unfiltered = filter_turn_body(body, false, false);
+        assert_eq!(
+            unfiltered,
+            vec![
+                "[User] How do I fix the container?",
+                "[Thinking] Checking cgroups and systemd units...",
+                "Inspecting logs...",
+                "[Gemini] Run systemctl restart container."
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_turn_body_no_thinking_keeps_only_final_gemini_block() {
+        let body = "\
+[gemini:antigravity] Session abc-123
+[User] Perform migration
+[Gemini] Running step 1: database schema
+Done schema
+[Gemini] Running step 2: data migration
+Done data
+[Gemini] Migration complete!";
+
+        let filtered = filter_turn_body(body, false, true);
+        assert_eq!(
+            filtered,
+            vec![
+                "[User] Perform migration",
+                "[Gemini] Migration complete!"
+            ]
+        );
+
+        let unfiltered = filter_turn_body(body, false, false);
+        assert_eq!(
+            unfiltered,
+            vec![
+                "[User] Perform migration",
+                "[Gemini] Running step 1: database schema",
+                "Done schema",
+                "[Gemini] Running step 2: data migration",
+                "Done data",
+                "[Gemini] Migration complete!"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_turn_body_no_thinking_strips_both_thinking_and_intermediate_gemini() {
+        let body = "\
+[gemini:antigravity] Session abc-123
+[User] Build release
+[Thinking] Considering flags...
+[Gemini] Running cargo build --release
+Compiling...
+[Gemini] Build succeeded.";
+
+        let filtered = filter_turn_body(body, false, true);
+        assert_eq!(
+            filtered,
+            vec![
+                "[User] Build release",
+                "[Gemini] Build succeeded."
+            ]
+        );
+    }
+
+    #[test]
+    fn test_filter_turn_body_preserves_claude_and_codex() {
+        let body = "\
+[claude:homelab] Session xyz-789
+[User] Fix the tests
+[Claude] Ran pytest and all 15 tests passed.";
+
+        let filtered = filter_turn_body(body, false, true);
+        assert_eq!(
+            filtered,
+            vec![
+                "[User] Fix the tests",
+                "[Claude] Ran pytest and all 15 tests passed."
+            ]
+        );
     }
 }

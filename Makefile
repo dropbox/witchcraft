@@ -203,12 +203,13 @@ pickbrain: prereqs download
 
 pickbrain-install: pickbrain
 	@pkill -u "$$(id -u)" -x pickbrain || test $$? -eq 1
-	mkdir -p ~/bin ~/.claude/skills/pickbrain ~/.codex/skills/pickbrain ~/.pi/agent/skills/pickbrain ~/.pi/agent/extensions/pickbrain
+	mkdir -p ~/bin ~/.claude/skills/pickbrain ~/.codex/skills/pickbrain ~/.pi/agent/skills/pickbrain ~/.pi/agent/extensions/pickbrain ~/.gemini/antigravity/skills/pickbrain
 	ln -f $(realpath pickbrain) ~/bin/pickbrain
 	rm -f ~/.claude/skills/pickbrain/skill.md ~/.codex/skills/pickbrain/skill.md ~/.pi/agent/skills/pickbrain/skill.md
 	cp skills/pickbrain/SKILL.md ~/.claude/skills/pickbrain/SKILL.md
 	cp skills/pickbrain-codex/SKILL.md ~/.codex/skills/pickbrain/SKILL.md
 	cp skills/pickbrain-pi/SKILL.md ~/.pi/agent/skills/pickbrain/SKILL.md
+	cp skills/pickbrain/GEMINI_SKILL.md ~/.gemini/antigravity/skills/pickbrain/SKILL.md
 	cp extensions/pickbrain-pi/index.ts ~/.pi/agent/extensions/pickbrain/index.ts
 ifeq ($(UNAME_S),Linux)
 	@if systemctl --user show-environment >/dev/null 2>&1; then \

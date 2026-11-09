@@ -71,6 +71,10 @@ pub fn pi_path() -> PathBuf {
     watermark_path(".pi/agent")
 }
 
+pub fn gemini_path() -> PathBuf {
+    watermark_path(".gemini/antigravity")
+}
+
 pub fn mtime_ms(path: &Path) -> i64 {
     fs::metadata(path)
         .ok()
