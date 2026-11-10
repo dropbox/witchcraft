@@ -425,11 +425,11 @@ pub(crate) fn embed_and_index(db: &DB, embedder: &Embedder, _device: &candle_cor
 // --- Search result data ---
 
 #[derive(Clone)]
-pub(crate) struct TurnMeta {
-    pub(crate) role: String,
-    pub(crate) timestamp: String,
-    pub(crate) byte_offset: u64,
-    pub(crate) byte_len: u64,
+struct TurnMeta {
+    role: String,
+    timestamp: String,
+    byte_offset: u64,
+    byte_len: u64,
 }
 
 #[derive(Clone)]
@@ -440,30 +440,30 @@ pub(crate) struct SearchResult {
     pub(crate) session_name: String,
     pub(crate) turn: u64,
     pub(crate) path: String,
-    pub(crate) cwd: String,
+    cwd: String,
     pub(crate) source: String,
-    pub(crate) remote_host: String,
+    remote_host: String,
     pub(crate) branch: String,
     pub(crate) conv_key: String,
-    pub(crate) slack_open: Option<SlackOpenTarget>,
+    slack_open: Option<SlackOpenTarget>,
     pub(crate) bodies: Vec<String>,
     pub(crate) match_idx: usize,
-    pub(crate) turns: Vec<TurnMeta>,
+    turns: Vec<TurnMeta>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SlackOpenTarget {
-    pub(crate) team_id: String,
-    pub(crate) channel_id: String,
-    pub(crate) root_ts: String,
-    pub(crate) conv_key: String,
+struct SlackOpenTarget {
+    team_id: String,
+    channel_id: String,
+    root_ts: String,
+    conv_key: String,
 }
 
 // A turn from the original JSONL session file
-pub(crate) struct SessionTurn {
-    pub(crate) role: String,
-    pub(crate) text: String,
-    pub(crate) timestamp: String,
+struct SessionTurn {
+    role: String,
+    text: String,
+    timestamp: String,
 }
 
 fn read_jsonl_line(path: &str, offset: u64, len: u64) -> Option<String> {
@@ -579,8 +579,45 @@ fn build_sql_filter(
     no_dm: bool,
     unread_only: bool,
 ) -> Option<witchcraft::types::SqlStatementInternal> {
+    build_sql_filter_with_project(
+        session,
+        None,
+        branch,
+        exclude,
+        since_ms,
+        types,
+        dm_only,
+        no_dm,
+        unread_only,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_sql_filter_with_project(
+    session: Option<&str>,
+    project: Option<&str>,
+    branch: Option<&str>,
+    exclude: &[String],
+    since_ms: Option<i64>,
+    types: &[String],
+    dm_only: bool,
+    no_dm: bool,
+    unread_only: bool,
+) -> Option<witchcraft::types::SqlStatementInternal> {
     use witchcraft::types::*;
     let mut conditions: Vec<SqlStatementInternal> = Vec::new();
+    if let Some(proj) = project {
+        conditions.push(SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.project".to_string(),
+                operator: SqlOperator::Equals,
+                value: Some(SqlValue::String(proj.to_string())),
+            }),
+            logic: None,
+            statements: None,
+        });
+    }
     if let Some(id) = session {
         let name = id.strip_prefix('#').unwrap_or(id);
         let thread_ts = name.strip_prefix("thr:").unwrap_or(name);
@@ -890,29 +927,43 @@ fn run_search(
     Ok((parse_search_results(results), search_ms))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_search_with(
     db: &DB,
     embedder: &Embedder,
+    cache: &mut witchcraft::EmbeddingsCache,
     q: &str,
     session: Option<&str>,
+    project: Option<&str>,
     branch: Option<&str>,
     exclude: &[String],
     since_ms: Option<i64>,
     types: &[String],
+    num_results: usize,
     dm_only: bool,
     no_dm: bool,
     unread_only: bool,
 ) -> Result<(Vec<SearchResult>, u128)> {
-    let mut cache = witchcraft::EmbeddingsCache::new(1);
-    let sql_filter = build_sql_filter(session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only);
+    let sql_filter = build_sql_filter_with_project(
+        session,
+        project,
+        branch,
+        exclude,
+        since_ms,
+        types,
+        dm_only,
+        no_dm,
+        unread_only,
+    );
+    let effective_limit = if num_results == 0 { usize::MAX } else { num_results };
     let now = std::time::Instant::now();
     let results = witchcraft::search(
         db,
         Some(embedder),
-        &mut cache,
+        cache,
         q,
         0.5,
-        10,
+        effective_limit,
         true,
         sql_filter.as_ref(),
     )?;
@@ -953,9 +1004,10 @@ fn search_tui(
             return Ok(None);
         }
     };
+    let mut tui_cache = witchcraft::EmbeddingsCache::new(1);
     let (mut results, mut search_ms) = match q {
         Some(q) if !q.is_empty() => {
-            run_search_with(&db, &embedder, q, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only)?
+            run_search_with(&db, &embedder, &mut tui_cache, q, session, None, branch, exclude, since_ms, types, 10, dm_only, no_dm, unread_only)?
         }
         Some(_) => {
             // Empty query with filters: use filter-only search
@@ -1340,7 +1392,7 @@ fn search_tui(
                         search_filter.pop();
                         if search_filter.chars().count() >= 3 && search_filter != active_query {
                             if let Ok((new_results, ms)) = run_search_with(
-                                &db, &embedder, &search_filter, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only,
+                                &db, &embedder, &mut tui_cache, &search_filter, session, None, branch, exclude, since_ms, types, 10, dm_only, no_dm, unread_only,
                             ) {
                                 active_query = search_filter.clone();
                                 results = new_results;
@@ -1365,7 +1417,7 @@ fn search_tui(
                         search_filter.push(c);
                         if search_filter.chars().count() >= 3 && search_filter != active_query {
                             if let Ok((new_results, ms)) = run_search_with(
-                                &db, &embedder, &search_filter, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only,
+                                &db, &embedder, &mut tui_cache, &search_filter, session, None, branch, exclude, since_ms, types, 10, dm_only, no_dm, unread_only,
                             ) {
                                 active_query = search_filter.clone();
                                 results = new_results;
@@ -2241,6 +2293,18 @@ pub(crate) fn fetch_session_text(
     since_ms: Option<i64>,
     no_thinking: bool,
 ) -> Result<String> {
+    fetch_session_text_bounded(db, session_id, turns_range, since_ms, no_thinking, None, None)
+}
+
+pub(crate) fn fetch_session_text_bounded(
+    db: &DB,
+    session_id: &str,
+    turns_range: Option<&str>,
+    since_ms: Option<i64>,
+    no_thinking: bool,
+    default_turn_window: Option<usize>,
+    max_chars: Option<usize>,
+) -> Result<String> {
     use witchcraft::types::*;
     use witchcraft::sql_generator::build_filter_sql_and_params;
 
@@ -2376,8 +2440,17 @@ pub(crate) fn fetch_session_text(
         anyhow::bail!("No session or channel found for {session_id}");
     }
 
+    let total_rows = rows.len();
+    let first_total_turn = rows.first().map(|(_, _, t)| *t).unwrap_or(0);
+    let last_total_turn = rows.last().map(|(_, _, t)| *t).unwrap_or(0);
+
+    let (shown_rows, turn_truncated) = match (turns_range, default_turn_window) {
+        (None, Some(max_turns)) if total_rows > max_turns => (&rows[..max_turns], true),
+        _ => (&rows[..], false),
+    };
+
     let mut buf = Vec::new();
-    for (date, body, turn) in &rows {
+    for (date, body, turn) in shown_rows {
         writeln!(buf, "---")?;
         if is_channel {
             writeln!(buf, "conv {}  {}", *turn, format_date(date))?;
@@ -2392,17 +2465,45 @@ pub(crate) fn fetch_session_text(
         writeln!(buf, "---")?;
     }
 
-    Ok(String::from_utf8(buf)?)
+    let mut out = String::from_utf8(buf)?;
+
+    if let Some(limit_chars) = max_chars {
+        if out.chars().count() > limit_chars {
+            let byte_idx = out
+                .char_indices()
+                .nth(limit_chars)
+                .map(|(i, _)| i)
+                .unwrap_or(out.len());
+            out.truncate(byte_idx);
+            out.push_str(&format!(
+                "\n... [Output truncated at {limit_chars} characters to conserve context tokens. Pass a narrower `turns=\"N-M\"` range (available turns: {first_total_turn}-{last_total_turn}) to `read_session` to inspect specific turns.]\n"
+            ));
+            return Ok(out);
+        }
+    }
+
+    if turn_truncated {
+        let first_shown = shown_rows.first().map(|(_, _, t)| *t).unwrap_or(0);
+        let last_shown = shown_rows.last().map(|(_, _, t)| *t).unwrap_or(0);
+        let next_start = last_shown + 1;
+        let next_end = (next_start + (shown_rows.len() as i64) - 1).min(last_total_turn);
+        out.push_str(&format!(
+            "\n... [Showing {} of {total_rows} turns (turns {first_shown}-{last_shown} of {first_total_turn}-{last_total_turn}). To read more, call `read_session` with `turns=\"{next_start}-{next_end}\"` (or any `turns=\"N-M\"` range), `since=\"24h\"`/`\"7d\"`, or `include_thinking=true`.]\n",
+            shown_rows.len()
+        ));
+    }
+
+    Ok(out)
 }
 
 fn dump(
-    db_name: &PathBuf,
+    db_name: &std::path::Path,
     session_id: &str,
     turns_range: Option<&str>,
     since_ms: Option<i64>,
     no_thinking: bool,
 ) -> Result<()> {
-    let db = match DB::new_reader(db_name.clone()) {
+    let db = match DB::new_reader(db_name.to_path_buf()) {
         Ok(db) => db,
         Err(e) => {
             eprintln!(
@@ -2413,13 +2514,7 @@ fn dump(
         }
     };
 
-    let output = match fetch_session_text(&db, session_id, turns_range, since_ms, no_thinking) {
-        Ok(out) => out,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
+    let output = fetch_session_text(&db, session_id, turns_range, since_ms, no_thinking)?;
 
     use std::io::IsTerminal;
     if std::io::stdout().is_terminal() {
@@ -2668,23 +2763,25 @@ fn main() -> Result<()> {
     let db_name = db_path();
     let assets = assets_path();
 
+    // Migrate DB from old location (~/.claude/pickbrain.db) before MCP or CLI dispatch
+    if !pickbrain_dir_overridden() && !db_name.exists() {
+        let old_db = home_dir().join(".claude/pickbrain.db");
+        if old_db.exists() {
+            if !is_mcp {
+                eprintln!("migrating database from {} to {}", old_db.display(), db_name.display());
+            }
+            std::fs::rename(&old_db, &db_name).ok();
+        }
+    }
+
     if is_mcp {
-        let _ = log::set_max_level(LevelFilter::Off);
+        log::set_max_level(LevelFilter::Off);
         return mcp::start_server(&db_name, &assets);
     }
 
     use std::io::IsTerminal;
     if !quiet && std::io::stderr().is_terminal() {
         eprintln!("pickbrain {} — Copyright (c) 2026 Dropbox Inc.", env!("CARGO_PKG_VERSION"));
-    }
-
-    // Migrate DB from old location (~/.claude/pickbrain.db)
-    if !pickbrain_dir_overridden() && !db_name.exists() {
-        let old_db = home_dir().join(".claude/pickbrain.db");
-        if old_db.exists() {
-            eprintln!("migrating database from {} to {}", old_db.display(), db_name.display());
-            std::fs::rename(&old_db, &db_name).ok();
-        }
     }
 
     // Detect the calling session once — used for both ingest-skip and --current filter.
@@ -2775,7 +2872,10 @@ fn main() -> Result<()> {
         || has_branch;
 
     if let Some(ref sid) = dump_session {
-        dump(&db_name, sid, turns_range.as_deref(), since_ms, no_thinking)?;
+        if let Err(e) = dump(&db_name, sid, turns_range.as_deref(), since_ms, no_thinking) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     } else if !query_args.is_empty() || has_filters {
         let q = query_args.join(" ");
         if std::io::stdout().is_terminal() {

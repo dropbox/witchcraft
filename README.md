@@ -94,6 +94,7 @@ make pickbrain
 ./pickbrain auth middleware fix    # search across all sessions (auto-ingests new sessions)
 ./pickbrain --session <UUID> auth  # search within one session
 ./pickbrain --dump <UUID>          # print full conversation
+./pickbrain --mcp                  # run long-lived stdio MCP server (see examples/pickbrain/gemini_mcp.json)
 ```
 
 Set `PRE_INGEST_COMMAND` to a shell command that runs before pickbrain checks for new sessions (for example, an `rsync` from another host). Set `EXTRA_CODEX_DIRS`, `EXTRA_CLAUDE_DIRS`, or `EXTRA_PI_DIRS` to additional data directories separated by `:` on Unix or `;` on Windows. Each entry should have the same layout as `~/.codex`, `~/.claude`, or `~/.pi/agent`, respectively. Pickbrain scans these alongside the default directories.

@@ -1,30 +1,58 @@
 use serde_json::{json, Value};
 
+const DEFAULT_READ_TURN_WINDOW: usize = 20;
+const MAX_READ_SESSION_CHARS: usize = 32_000;
+const MAX_SEARCH_INTERACTION_CHARS: usize = 2_000;
+const VALID_SOURCES: &[&str] = &["gemini", "claude", "codex", "pi", "slack"];
+
+#[derive(Debug, Clone)]
+pub enum ToolError {
+    InvalidParams(String),
+    ExecutionFailed(String),
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolError::InvalidParams(msg) | ToolError::ExecutionFailed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchParams {
+    pub query: String,
+    pub session_id: Option<String>,
+    pub project: Option<String>,
+    pub source: Option<String>,
+    pub limit: usize,
+}
+
 pub fn list_tools() -> Value {
     json!({
         "tools": [
             {
                 "name": "search_ai_history",
-                "description": "Searches across all historical AI pair-programming sessions (Gemini, Claude, Codex, Pi, Slack) for the requested context.",
+                "description": "Searches indexed historical AI pair-programming and Slack sessions (Gemini, Claude, Codex, Pi, Slack) in pickbrain.db. Run `pickbrain` or `pickbrain --watch` to keep the index fresh.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string" },
-                        "session_id": { "type": "string" },
-                        "project": { "type": "string" },
+                        "query": { "type": "string", "description": "Non-empty semantic search query." },
+                        "session_id": { "type": "string", "description": "Optional session ID, Slack channel name/ID, or Slack thread key (thr:...)." },
+                        "project": { "type": "string", "description": "Optional workspace directory basename filter (exact match, e.g. 'witchcraft'; see list_projects)." },
                         "source": { "type": "string", "enum": ["gemini", "claude", "codex", "pi", "slack"] },
-                        "limit": { "type": "integer", "description": "Maximum number of results to return (default: 5)" }
+                        "limit": { "type": "integer", "description": "Maximum number of results to return (default: 5, 0 = unlimited)" }
                     },
                     "required": ["query"]
                 }
             },
             {
                 "name": "read_session",
-                "description": "Reads full conversation context from a specific session ID.",
+                "description": "Reads conversation turns from a specific session ID, Slack channel, or Slack thread (thr:...). Defaults to the first 20 turns when `turns` is omitted to conserve context tokens.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "session_id": { "type": "string" },
+                        "session_id": { "type": "string", "description": "Session ID, channel name/ID, or Slack thread key (thr:...)." },
                         "turns": { "type": "string", "description": "Optional turn range like '7-9' or single turn '7' to conserve context tokens" },
                         "since": { "type": "string", "description": "Optional duration filter like '24h', '7d', '2w'" },
                         "include_thinking": { "type": "boolean", "description": "Include intermediate thinking blocks (default: false)" }
@@ -34,133 +62,290 @@ pub fn list_tools() -> Value {
             },
             {
                 "name": "list_projects",
-                "description": "Lists all projects (repositories) that have been indexed.",
+                "description": "Lists all indexed project directory basenames (and session counts) in pickbrain.db.",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "list_recent_sessions",
-                "description": "Lists the last 20 AI sessions chronologically.",
+                "description": "Lists the 20 most recently indexed AI sessions in pickbrain.db with a 150-character preview.",
                 "inputSchema": { "type": "object", "properties": {} }
             }
         ]
     })
 }
 
-pub fn handle_tool_call(
+fn extract_optional_string(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, ToolError> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err(ToolError::InvalidParams(format!(
+            "Invalid argument '{key}': expected a string"
+        ))),
+    }
+}
+
+pub fn parse_search_params(params: Option<&Value>) -> Result<SearchParams, ToolError> {
+    let Some(obj) = params.and_then(|p| p.as_object()) else {
+        return Err(ToolError::InvalidParams(
+            "Missing required arguments object for search_ai_history".to_string(),
+        ));
+    };
+
+    let query = match obj.get("query") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+        Some(Value::String(_)) | None | Some(Value::Null) => {
+            return Err(ToolError::InvalidParams(
+                "Missing or empty required argument: 'query'".to_string(),
+            ));
+        }
+        Some(_) => {
+            return Err(ToolError::InvalidParams(
+                "Invalid argument 'query': expected a non-empty string".to_string(),
+            ));
+        }
+    };
+
+    let session_id = extract_optional_string(obj, "session_id")?;
+    let project = extract_optional_string(obj, "project")?;
+    let source = extract_optional_string(obj, "source")?;
+    if let Some(ref src) = source {
+        if !VALID_SOURCES.contains(&src.as_str()) {
+            return Err(ToolError::InvalidParams(format!(
+                "Invalid 'source' value '{src}': expected one of {}",
+                VALID_SOURCES.join(", ")
+            )));
+        }
+    }
+
+    let limit = match obj.get("limit") {
+        None | Some(Value::Null) => 5usize,
+        Some(Value::Number(n)) => {
+            if let Some(u) = n.as_u64() {
+                u as usize
+            } else {
+                return Err(ToolError::InvalidParams(
+                    "Invalid argument 'limit': expected a non-negative integer".to_string(),
+                ));
+            }
+        }
+        Some(_) => {
+            return Err(ToolError::InvalidParams(
+                "Invalid argument 'limit': expected a non-negative integer".to_string(),
+            ));
+        }
+    };
+
+    Ok(SearchParams {
+        query,
+        session_id,
+        project,
+        source,
+        limit,
+    })
+}
+
+pub fn validate_db_tool_args(name: &str, params: Option<&Value>) -> Result<(), ToolError> {
+    match name {
+        "read_session" => {
+            let Some(obj) = params.and_then(|p| p.as_object()) else {
+                return Err(ToolError::InvalidParams(
+                    "Missing required arguments object for read_session".to_string(),
+                ));
+            };
+            match obj.get("session_id") {
+                Some(Value::String(s)) if !s.trim().is_empty() => {}
+                Some(Value::String(_)) | None | Some(Value::Null) => {
+                    return Err(ToolError::InvalidParams(
+                        "Missing required argument: session_id".to_string(),
+                    ));
+                }
+                Some(_) => {
+                    return Err(ToolError::InvalidParams(
+                        "Invalid argument 'session_id': expected a string".to_string(),
+                    ));
+                }
+            }
+            let _ = extract_optional_string(obj, "turns")?;
+            if let Some(since_str) = extract_optional_string(obj, "since")? {
+                if crate::parse_since(&since_str).is_none() {
+                    return Err(ToolError::InvalidParams(format!(
+                        "Invalid 'since' value '{since_str}' (use e.g. '24h', '7d', '2w')"
+                    )));
+                }
+            }
+            if let Some(v) = obj.get("include_thinking") {
+                if !v.is_null() && !v.is_boolean() {
+                    return Err(ToolError::InvalidParams(
+                        "Invalid argument 'include_thinking': expected a boolean".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "list_projects" | "list_recent_sessions" => Ok(()),
+        _ => Err(ToolError::InvalidParams(format!("Unknown tool: {name}"))),
+    }
+}
+
+pub fn execute_search(
+    params: SearchParams,
+    db: &witchcraft::DB,
+    embedder: &witchcraft::Embedder,
+    cache: &mut witchcraft::EmbeddingsCache,
+) -> Result<Value, ToolError> {
+    let types: Vec<String> = params
+        .source
+        .as_ref()
+        .map(|s| vec![s.clone()])
+        .unwrap_or_default();
+
+    match crate::run_search_with(
+        db,
+        embedder,
+        cache,
+        &params.query,
+        params.session_id.as_deref(),
+        params.project.as_deref(),
+        None,
+        &[],
+        None,
+        &types,
+        params.limit,
+        false,
+        false,
+        false,
+    ) {
+        Ok((results, _ms)) => {
+            let effective_limit = if params.limit == 0 {
+                usize::MAX
+            } else {
+                params.limit
+            };
+            let mut formatted = String::new();
+            for r in results.iter().take(effective_limit) {
+                let raw_interaction = r
+                    .bodies
+                    .get(r.match_idx)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let read_target = if !r.conv_key.is_empty() && r.conv_key.starts_with("thr:") {
+                    r.conv_key.as_str()
+                } else {
+                    r.session_id.as_str()
+                };
+                let interaction = if raw_interaction.chars().count() > MAX_SEARCH_INTERACTION_CHARS
+                {
+                    let byte_idx = raw_interaction
+                        .char_indices()
+                        .nth(MAX_SEARCH_INTERACTION_CHARS)
+                        .map(|(i, _)| i)
+                        .unwrap_or(raw_interaction.len());
+                    format!(
+                        "{}\n... [Turn snippet truncated at {} chars; call `read_session` with `session_id=\"{}\"` and `turns=\"{}\"` for full turn text.]",
+                        &raw_interaction[..byte_idx],
+                        MAX_SEARCH_INTERACTION_CHARS,
+                        read_target,
+                        r.turn
+                    )
+                } else {
+                    raw_interaction.to_string()
+                };
+
+                let mut meta_lines = format!(
+                    "Source: {} | Session: {}",
+                    r.source, r.session_id
+                );
+                if !r.session_name.is_empty() {
+                    meta_lines.push_str(&format!(" | Title: {}", r.session_name));
+                }
+                if !r.timestamp.is_empty() {
+                    meta_lines.push_str(&format!(" | Date: {}", r.timestamp));
+                }
+                meta_lines.push('\n');
+                meta_lines.push_str(&format!("Project: {} | Turn: {}", r.project, r.turn));
+                if !r.branch.is_empty() {
+                    meta_lines.push_str(&format!(" | Branch: {}", r.branch));
+                }
+                if !r.conv_key.is_empty() {
+                    meta_lines.push_str(&format!(" | ConvKey: {}", r.conv_key));
+                }
+                if !r.path.is_empty() {
+                    meta_lines.push_str(&format!(" | Path: {}", r.path));
+                }
+
+                formatted.push_str(&format!(
+                    "{meta_lines}\nInteraction:\n{interaction}\n\n"
+                ));
+            }
+            if formatted.is_empty() {
+                formatted = "No relevant history found.".to_string();
+            }
+            Ok(json!({ "content": [{ "type": "text", "text": formatted }] }))
+        }
+        Err(e) => Err(ToolError::ExecutionFailed(format!("Search error: {e}"))),
+    }
+}
+
+pub fn handle_db_only_tool_call(
     name: &str,
     params: Option<Value>,
     db: &witchcraft::DB,
-    embedder: &witchcraft::Embedder,
-    _cache: &mut witchcraft::EmbeddingsCache,
-) -> Result<Value, String> {
+) -> Result<Value, ToolError> {
+    validate_db_tool_args(name, params.as_ref())?;
     match name {
-        "search_ai_history" => {
-            let q = params
-                .as_ref()
-                .and_then(|p| p.get("query"))
-                .and_then(|q| q.as_str())
-                .unwrap_or("");
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("session_id"))
-                .and_then(|s| s.as_str());
-            let proj = params
-                .as_ref()
-                .and_then(|p| p.get("project"))
-                .and_then(|s| s.as_str());
-            let src = params
-                .as_ref()
-                .and_then(|p| p.get("source"))
-                .and_then(|s| s.as_str());
-            let limit = params
-                .as_ref()
-                .and_then(|p| p.get("limit"))
-                .and_then(|l| l.as_u64())
-                .unwrap_or(5) as usize;
-
-            let types: Vec<String> = src.map(|s| vec![s.to_string()]).unwrap_or_default();
-
-            match crate::run_search_with(
-                db,
-                embedder,
-                q,
-                sid,
-                None,
-                &[],
-                None,
-                &types,
-                false,
-                false,
-                false,
-            ) {
-                Ok((results, _ms)) => {
-                    let mut formatted = String::new();
-                    let filtered: Box<dyn Iterator<Item = &crate::SearchResult>> = match proj {
-                        Some(p) => Box::new(results.iter().filter(move |r| r.project == p)),
-                        None => Box::new(results.iter()),
-                    };
-                    for r in filtered.take(limit) {
-                        // Smart Context: Grouped by interaction naturally by Ingestor bodies
-                        let interaction =
-                            r.bodies.get(r.match_idx).map(|s| s.as_str()).unwrap_or("");
-                        formatted.push_str(&format!(
-                            "Source: {} | Session: {}\nProject: {}\nTurn: {}\nInteraction:\n{}\n\n",
-                            r.source, r.session_id, r.project, r.turn, interaction
-                        ));
-                    }
-                    if formatted.is_empty() {
-                        formatted = "No relevant history found.".to_string();
-                    }
-                    Ok(json!({ "content": [{ "type": "text", "text": formatted }] }))
-                }
-                Err(e) => Err(format!("Search error: {}", e)),
-            }
-        }
         "read_session" => {
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("session_id"))
-                .and_then(|s| s.as_str());
-            let turns = params
-                .as_ref()
-                .and_then(|p| p.get("turns"))
-                .and_then(|s| s.as_str());
-            let since = params
-                .as_ref()
-                .and_then(|p| p.get("since"))
-                .and_then(|s| s.as_str());
-            let since_ms = since.and_then(crate::parse_since);
-            let include_thinking = params
-                .as_ref()
-                .and_then(|p| p.get("include_thinking"))
+            let obj = params.as_ref().and_then(|p| p.as_object()).unwrap();
+            let session_id = obj
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .unwrap()
+                .trim();
+            let turns = extract_optional_string(obj, "turns")?;
+            let since = extract_optional_string(obj, "since")?;
+            let since_ms = since.as_deref().and_then(crate::parse_since);
+            let include_thinking = obj
+                .get("include_thinking")
                 .and_then(|b| b.as_bool())
                 .unwrap_or(false);
 
-            if let Some(session_id) = sid {
-                match crate::fetch_session_text(
-                    db,
-                    session_id,
-                    turns,
-                    since_ms,
-                    !include_thinking,
-                ) {
-                    Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
-                    Err(e) => Err(format!("Failed to read session {}: {}", session_id, e)),
-                }
-            } else {
-                Err("Missing required argument: session_id".to_string())
+            match crate::fetch_session_text_bounded(
+                db,
+                session_id,
+                turns.as_deref(),
+                since_ms,
+                !include_thinking,
+                Some(DEFAULT_READ_TURN_WINDOW),
+                Some(MAX_READ_SESSION_CHARS),
+            ) {
+                Ok(text) => Ok(json!({ "content": [{ "type": "text", "text": text }] })),
+                Err(e) => Err(ToolError::ExecutionFailed(format!(
+                    "Failed to read session {session_id}: {e}"
+                ))),
             }
         }
         "list_projects" => {
-            let mut stmt = db.query(
-                "SELECT DISTINCT json_extract(metadata, '$.project') as proj, COUNT(*) as sessions 
-                 FROM document 
-                 WHERE json_extract(metadata, '$.turn') = 0 
-                 GROUP BY proj 
-                 ORDER BY sessions DESC"
-            ).map_err(|e| e.to_string())?;
+            let mut stmt = db
+                .query(
+                    "SELECT COALESCE(NULLIF(json_extract(metadata, '$.project'), ''), '(unknown)') as proj,
+                            COUNT(DISTINCT json_extract(metadata, '$.session_id')) as sessions
+                     FROM document
+                     WHERE json_extract(metadata, '$.session_id') IS NOT NULL
+                     GROUP BY proj
+                     ORDER BY sessions DESC, proj ASC",
+                )
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-            let projects: Vec<String> = stmt
+            let rows = stmt
                 .query_map((), |row| {
                     Ok(format!(
                         "{} ({} sessions)",
@@ -168,9 +353,11 @@ pub fn handle_tool_call(
                         row.get::<_, i64>(1)?
                     ))
                 })
-                .map_err(|e| e.to_string())?
-                .filter_map(|r| r.ok())
-                .collect();
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+            let projects = rows
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
             let out = if projects.is_empty() {
                 "No projects found.".to_string()
@@ -182,18 +369,27 @@ pub fn handle_tool_call(
         "list_recent_sessions" => {
             let mut stmt = db
                 .query(
-                    "SELECT json_extract(metadata, '$.session_id'), 
-                        json_extract(metadata, '$.project'), 
-                        date, 
-                        SUBSTR(body, 0, 150)
-                 FROM document 
-                 WHERE json_extract(metadata, '$.turn') = 0 
-                 ORDER BY date DESC 
-                 LIMIT 20",
+                    "SELECT COALESCE(json_extract(d.metadata, '$.session_id'), '(unknown)') as sid,
+                            COALESCE(NULLIF(json_extract(d.metadata, '$.project'), ''), '(unknown)') as proj,
+                            d.date,
+                            SUBSTR(d.body, 1, 150)
+                     FROM document d
+                     INNER JOIN (
+                         SELECT json_extract(metadata, '$.session_id') as sid,
+                                MIN(CAST(COALESCE(json_extract(metadata, '$.turn'), 0) AS INTEGER)) as min_turn
+                         FROM document
+                         WHERE json_extract(metadata, '$.session_id') IS NOT NULL
+                         GROUP BY sid
+                     ) first_turns
+                       ON json_extract(d.metadata, '$.session_id') = first_turns.sid
+                      AND CAST(COALESCE(json_extract(d.metadata, '$.turn'), 0) AS INTEGER) = first_turns.min_turn
+                     GROUP BY sid
+                     ORDER BY d.date DESC
+                     LIMIT 20",
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-            let sessions: Vec<String> = stmt
+            let rows = stmt
                 .query_map((), |row| {
                     Ok(format!(
                         "ID: {} | Project: {} | Date: {}\nPreview: {}...",
@@ -203,9 +399,11 @@ pub fn handle_tool_call(
                         row.get::<_, String>(3)?
                     ))
                 })
-                .map_err(|e| e.to_string())?
-                .filter_map(|r| r.ok())
-                .collect();
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+            let sessions = rows
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
             let out = if sessions.is_empty() {
                 "No sessions found.".to_string()
@@ -214,24 +412,44 @@ pub fn handle_tool_call(
             };
             Ok(json!({ "content": [{ "type": "text", "text": out }] }))
         }
-        _ => Err(format!("Unknown tool: {}", name)),
+        _ => Err(ToolError::InvalidParams(format!("Unknown tool: {name}"))),
     }
+}
+
+pub fn handle_tool_call_typed(
+    name: &str,
+    params: Option<Value>,
+    db: &witchcraft::DB,
+    embedder: &witchcraft::Embedder,
+    cache: &mut witchcraft::EmbeddingsCache,
+) -> Result<Value, ToolError> {
+    match name {
+        "search_ai_history" => {
+            let search_params = parse_search_params(params.as_ref())?;
+            execute_search(search_params, db, embedder, cache)
+        }
+        "read_session" | "list_projects" | "list_recent_sessions" => {
+            handle_db_only_tool_call(name, params, db)
+        }
+        _ => Err(ToolError::InvalidParams(format!("Unknown tool: {name}"))),
+    }
+}
+
+pub fn handle_tool_call(
+    name: &str,
+    params: Option<Value>,
+    db: &witchcraft::DB,
+    embedder: &witchcraft::Embedder,
+    cache: &mut witchcraft::EmbeddingsCache,
+) -> Result<Value, String> {
+    handle_tool_call_typed(name, params, db, embedder, cache).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-    use std::sync::OnceLock;
+    use crate::mcp::tests::shared_embedder;
     use uuid::Uuid;
-
-    fn shared_embedder() -> &'static witchcraft::Embedder {
-        static EMBEDDER: OnceLock<witchcraft::Embedder> = OnceLock::new();
-        EMBEDDER.get_or_init(|| {
-            let device = witchcraft::make_device();
-            witchcraft::Embedder::new(&device, Path::new("assets")).unwrap()
-        })
-    }
 
     #[test]
     fn test_list_projects_and_recent_sessions_include_sessions_without_turn_zero_and_full_150_char_preview() {
@@ -259,7 +477,7 @@ mod tests {
         )
         .unwrap();
 
-        let proj_res = handle_tool_call("list_projects", None, &db, embedder, &mut cache).unwrap();
+        let proj_res = handle_tool_call("list_projects", None, &db, &embedder, &mut cache).unwrap();
         let proj_text = proj_res["content"][0]["text"].as_str().unwrap();
         assert!(
             proj_text.contains("partial-repo (1 sessions)"),
@@ -267,7 +485,7 @@ mod tests {
         );
 
         let recent_res =
-            handle_tool_call("list_recent_sessions", None, &db, embedder, &mut cache).unwrap();
+            handle_tool_call("list_recent_sessions", None, &db, &embedder, &mut cache).unwrap();
         let recent_text = recent_res["content"][0]["text"].as_str().unwrap();
         assert!(
             recent_text.contains("sess-no-turn-0"),
@@ -313,7 +531,7 @@ mod tests {
             "read_session",
             Some(json!({"session_id": "long-session-30"})),
             &db,
-            embedder,
+            &embedder,
             &mut cache,
         )
         .unwrap();
@@ -392,7 +610,7 @@ mod tests {
             .unwrap();
         }
 
-        crate::embed_and_index(&db, embedder, &device).unwrap();
+        crate::embed_and_index(&db, &embedder, &device).unwrap();
 
         // 1. Filtering by project="needle-proj" must find needle-proj even though noise-proj has 12 closer hits
         let proj_res = handle_tool_call(
@@ -403,7 +621,7 @@ mod tests {
                 "limit": 5
             })),
             &db,
-            embedder,
+            &embedder,
             &mut cache,
         )
         .unwrap();
@@ -430,7 +648,7 @@ mod tests {
                 "limit": 0
             })),
             &db,
-            embedder,
+            &embedder,
             &mut cache,
         )
         .unwrap();

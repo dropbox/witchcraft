@@ -343,9 +343,13 @@ def test_mcp_server():
             assert "noise-sess-10" in recent_text
             assert "alpha-sess-main" in recent_text
             # Verify SUBSTR(body, 1, 150) returns full 150 characters before '...'
-            preview_lines = [line for line in recent_text.splitlines() if line.startswith("Preview: ")]
-            assert any(len(line) == len("Preview: ") + 150 + len("...") for line in preview_lines), (
-                f"Expected 150-char preview line, got lengths: {[len(l) for l in preview_lines]}"
+            previews = [
+                block.split("\nPreview: ", 1)[1][:-3]
+                for block in recent_text.split("\n\n---\n\n")
+                if "\nPreview: " in block
+            ]
+            assert any(len(p) == 150 for p in previews), (
+                f"Expected 150-char preview, got lengths: {[len(p) for p in previews]}"
             )
 
             # 8. Test 'search_ai_history' with project pushdown, limit=0, and metadata (Findings #3, #4, #10)
