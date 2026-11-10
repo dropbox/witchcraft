@@ -25,6 +25,7 @@ pub struct SearchParams {
     pub session_id: Option<String>,
     pub project: Option<String>,
     pub source: Option<String>,
+    pub since_ms: Option<i64>,
     pub limit: usize,
 }
 
@@ -41,6 +42,7 @@ pub fn list_tools() -> Value {
                         "session_id": { "type": "string", "description": "Optional session ID, Slack channel name/ID, or Slack thread key (thr:...)." },
                         "project": { "type": "string", "description": "Optional workspace directory basename filter (exact match, e.g. 'witchcraft'; see list_projects)." },
                         "source": { "type": "string", "enum": ["gemini", "claude", "codex", "pi", "slack"] },
+                        "since": { "type": "string", "description": "Optional duration filter like '24h', '7d', '2w'" },
                         "limit": { "type": "integer", "description": "Maximum number of results to return (default: 5, 0 = unlimited)" }
                     },
                     "required": ["query"]
@@ -127,6 +129,19 @@ pub fn parse_search_params(params: Option<&Value>) -> Result<SearchParams, ToolE
         }
     }
 
+    let since_ms = if let Some(since_str) = extract_optional_string(obj, "since")? {
+        match crate::parse_since(&since_str) {
+            Some(ms) => Some(ms),
+            None => {
+                return Err(ToolError::InvalidParams(format!(
+                    "Invalid 'since' value '{since_str}' (use e.g. '24h', '7d', '2w')"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
     let limit = match obj.get("limit") {
         None | Some(Value::Null) => 5usize,
         Some(Value::Number(n)) => {
@@ -150,8 +165,37 @@ pub fn parse_search_params(params: Option<&Value>) -> Result<SearchParams, ToolE
         session_id,
         project,
         source,
+        since_ms,
         limit,
     })
+}
+
+fn validate_turns_syntax(s: &str) -> Result<(usize, usize), ToolError> {
+    if let Some((a, b)) = s.split_once('-') {
+        let start = a.trim().parse::<usize>().map_err(|_| {
+            ToolError::InvalidParams(format!(
+                "Invalid 'turns' range '{s}': expected 'N' or 'N-M' with non-negative integers"
+            ))
+        })?;
+        let end = b.trim().parse::<usize>().map_err(|_| {
+            ToolError::InvalidParams(format!(
+                "Invalid 'turns' range '{s}': expected 'N' or 'N-M' with non-negative integers"
+            ))
+        })?;
+        if start > end {
+            return Err(ToolError::InvalidParams(format!(
+                "Invalid 'turns' range '{s}': start ({start}) must be <= end ({end})"
+            )));
+        }
+        Ok((start, end))
+    } else {
+        let n = s.trim().parse::<usize>().map_err(|_| {
+            ToolError::InvalidParams(format!(
+                "Invalid 'turns' value '{s}': expected 'N' or 'N-M' with non-negative integers"
+            ))
+        })?;
+        Ok((n, n))
+    }
 }
 
 pub fn validate_db_tool_args(name: &str, params: Option<&Value>) -> Result<(), ToolError> {
@@ -175,7 +219,9 @@ pub fn validate_db_tool_args(name: &str, params: Option<&Value>) -> Result<(), T
                     ));
                 }
             }
-            let _ = extract_optional_string(obj, "turns")?;
+            if let Some(turns_str) = extract_optional_string(obj, "turns")? {
+                validate_turns_syntax(&turns_str)?;
+            }
             if let Some(since_str) = extract_optional_string(obj, "since")? {
                 if crate::parse_since(&since_str).is_none() {
                     return Err(ToolError::InvalidParams(format!(
@@ -192,7 +238,16 @@ pub fn validate_db_tool_args(name: &str, params: Option<&Value>) -> Result<(), T
             }
             Ok(())
         }
-        "list_projects" | "list_recent_sessions" => Ok(()),
+        "list_projects" | "list_recent_sessions" => {
+            if let Some(p) = params {
+                if !p.is_null() && !p.is_object() {
+                    return Err(ToolError::InvalidParams(format!(
+                        "Invalid arguments for {name}: expected a JSON object"
+                    )));
+                }
+            }
+            Ok(())
+        }
         _ => Err(ToolError::InvalidParams(format!("Unknown tool: {name}"))),
     }
 }
@@ -218,7 +273,7 @@ pub fn execute_search(
         params.project.as_deref(),
         None,
         &[],
-        None,
+        params.since_ms,
         &types,
         params.limit,
         false,
@@ -371,12 +426,13 @@ pub fn handle_db_only_tool_call(
                 .query(
                     "SELECT COALESCE(json_extract(d.metadata, '$.session_id'), '(unknown)') as sid,
                             COALESCE(NULLIF(json_extract(d.metadata, '$.project'), ''), '(unknown)') as proj,
-                            d.date,
+                            first_turns.last_active,
                             SUBSTR(d.body, 1, 150)
                      FROM document d
                      INNER JOIN (
                          SELECT json_extract(metadata, '$.session_id') as sid,
-                                MIN(CAST(COALESCE(json_extract(metadata, '$.turn'), 0) AS INTEGER)) as min_turn
+                                MIN(CAST(COALESCE(json_extract(metadata, '$.turn'), 0) AS INTEGER)) as min_turn,
+                                MAX(date) as last_active
                          FROM document
                          WHERE json_extract(metadata, '$.session_id') IS NOT NULL
                          GROUP BY sid
@@ -384,7 +440,7 @@ pub fn handle_db_only_tool_call(
                        ON json_extract(d.metadata, '$.session_id') = first_turns.sid
                       AND CAST(COALESCE(json_extract(d.metadata, '$.turn'), 0) AS INTEGER) = first_turns.min_turn
                      GROUP BY sid
-                     ORDER BY d.date DESC
+                     ORDER BY first_turns.last_active DESC
                      LIMIT 20",
                 )
                 .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;

@@ -2311,8 +2311,8 @@ pub(crate) fn fetch_session_text_bounded(
     let name = session_id.strip_prefix('#').unwrap_or(session_id);
 
     // Try as session_id first, then thread conv_key, then channel_id/channel_name
-    let (rows, is_channel) = {
-        let (turn_start, turn_end) = turns_range.map(parse_range).unwrap_or((0, usize::MAX));
+    let (turn_start, turn_end) = turns_range.map(parse_range).unwrap_or((0, usize::MAX));
+    let (all_rows, is_channel) = {
         let thread_ts = name.strip_prefix("thr:").unwrap_or(name);
         let thread_like = format!("%-{thread_ts}");
 
@@ -2321,8 +2321,6 @@ pub(crate) fn fetch_session_text_bounded(
             db: &DB,
             filter: &SqlStatementInternal,
             order: &str,
-            turn_start: usize,
-            turn_end: usize,
         ) -> Result<Vec<(String, String, i64)>> {
             let (filter_sql, params) = build_filter_sql_and_params(Some(filter))?;
             let sql = format!(
@@ -2336,7 +2334,6 @@ pub(crate) fn fetch_session_text_bounded(
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?
                 .filter_map(|r| r.ok())
-                .filter(|(_, _, t)| (*t as usize) >= turn_start && (*t as usize) <= turn_end)
                 .collect();
             Ok(rows)
         }
@@ -2352,7 +2349,7 @@ pub(crate) fn fetch_session_text_bounded(
             logic: None,
             statements: None,
         };
-        let rows = query_filter(db, &session_match, "turn", turn_start, turn_end)?;
+        let rows = query_filter(db, &session_match, "turn")?;
         if !rows.is_empty() {
             (rows, false)
         } else {
@@ -2367,7 +2364,7 @@ pub(crate) fn fetch_session_text_bounded(
                 logic: None,
                 statements: None,
             };
-            let rows = query_filter(db, &thread_match, "date", turn_start, turn_end)?;
+            let rows = query_filter(db, &thread_match, "date")?;
             if !rows.is_empty() {
                 (rows, true)
             } else {
@@ -2431,18 +2428,30 @@ pub(crate) fn fetch_session_text_bounded(
                     statements: Some(filters),
                 }
             };
-            let rows = query_filter(db, &combined, "turn DESC", turn_start, turn_end)?;
+            let rows = query_filter(db, &combined, "turn DESC")?;
             (rows, true)
         }}
     };
 
-    if rows.is_empty() {
+    if all_rows.is_empty() {
         anyhow::bail!("No session or channel found for {session_id}");
     }
 
-    let total_rows = rows.len();
-    let first_total_turn = rows.first().map(|(_, _, t)| *t).unwrap_or(0);
-    let last_total_turn = rows.last().map(|(_, _, t)| *t).unwrap_or(0);
+    let total_rows = all_rows.len();
+    let first_total_turn = all_rows.first().map(|(_, _, t)| *t).unwrap_or(0);
+    let last_total_turn = all_rows.last().map(|(_, _, t)| *t).unwrap_or(0);
+
+    let rows: Vec<(String, String, i64)> = all_rows
+        .into_iter()
+        .filter(|(_, _, t)| (*t as usize) >= turn_start && (*t as usize) <= turn_end)
+        .collect();
+
+    if rows.is_empty() {
+        anyhow::bail!(
+            "Session {session_id} has turns {first_total_turn}-{last_total_turn}, but no turns matched requested range '{}'",
+            turns_range.unwrap_or("")
+        );
+    }
 
     let (shown_rows, turn_truncated) = match (turns_range, default_turn_window) {
         (None, Some(max_turns)) if total_rows > max_turns => (&rows[..max_turns], true),

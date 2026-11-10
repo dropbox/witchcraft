@@ -15,6 +15,7 @@ Searches your indexed history for relevant context.
 - **`session_id`**: (Optional) Filter by session ID, Slack channel name/ID, or Slack thread key (`thr:...`).
 - **`source`**: (Optional) Filter by `gemini`, `claude`, `codex`, `pi`, or `slack`.
 - **`project`**: (Optional) Filter by workspace directory basename (exact match, e.g. `witchcraft`; see `list_projects`).
+- **`since`**: (Optional) Duration filter like `"24h"`, `"7d"`, `"2w"`.
 - **`limit`**: (Optional) Maximum number of results to return (default: `5`, `0` = unlimited).
 
 **When to use**: Whenever the user asks "What did we talk about regarding X?" or "Find where we implemented Y."
