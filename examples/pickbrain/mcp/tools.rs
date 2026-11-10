@@ -667,4 +667,164 @@ mod tests {
     fn limit_zero_zero_text(val: &Value) -> &str {
         val["content"][0]["text"].as_str().unwrap_or("")
     }
+
+    #[test]
+    fn test_list_recent_sessions_orders_by_latest_turn_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        // Session A started earlier (Nov 1) but had a turn more recently (Nov 10)
+        db.add_doc(
+            None,
+            &Uuid::from_u128(10),
+            iso8601_timestamp::Timestamp::parse("2026-11-01T10:00:00Z"),
+            &json!({"project": "proj-a", "session_id": "sess-resumed-recently", "turn": 0, "source": "claude"}).to_string(),
+            "Initial turn on Nov 1",
+            Some(vec![21]),
+        )
+        .unwrap();
+        db.add_doc(
+            None,
+            &Uuid::from_u128(11),
+            iso8601_timestamp::Timestamp::parse("2026-11-10T18:00:00Z"),
+            &json!({"project": "proj-a", "session_id": "sess-resumed-recently", "turn": 1, "source": "claude"}).to_string(),
+            "Follow-up turn on Nov 10",
+            Some(vec![24]),
+        )
+        .unwrap();
+
+        // Session B started on Nov 5 and never had further activity
+        db.add_doc(
+            None,
+            &Uuid::from_u128(12),
+            iso8601_timestamp::Timestamp::parse("2026-11-05T10:00:00Z"),
+            &json!({"project": "proj-b", "session_id": "sess-stale", "turn": 0, "source": "claude"}).to_string(),
+            "Single turn on Nov 5",
+            Some(vec![20]),
+        )
+        .unwrap();
+
+        let recent_res =
+            handle_tool_call("list_recent_sessions", None, &db, &embedder, &mut cache).unwrap();
+        let recent_text = recent_res["content"][0]["text"].as_str().unwrap();
+        let pos_resumed = recent_text
+            .find("sess-resumed-recently")
+            .expect("sess-resumed-recently should appear");
+        let pos_stale = recent_text
+            .find("sess-stale")
+            .expect("sess-stale should appear");
+        assert!(
+            pos_resumed < pos_stale,
+            "expected session with latest turn activity (Nov 10) to sort before stale session (Nov 5), got:\n{recent_text}"
+        );
+    }
+
+    #[test]
+    fn test_read_session_out_of_range_turns_reports_available_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        for turn in 0..3u64 {
+            let body = format!("[User] Turn {turn}\n[Claude] Reply {turn}\n");
+            let len = body.chars().count();
+            db.add_doc(
+                None,
+                &Uuid::from_u128(50 + turn as u128),
+                iso8601_timestamp::Timestamp::parse("2026-11-10T12:00:00Z"),
+                &json!({"project": "repo", "session_id": "short-sess", "turn": turn, "source": "claude"}).to_string(),
+                &body,
+                Some(vec![len]),
+            )
+            .unwrap();
+        }
+
+        let err = handle_tool_call(
+            "read_session",
+            Some(json!({"session_id": "short-sess", "turns": "50-60"})),
+            &db,
+            &embedder,
+            &mut cache,
+        )
+        .expect_err("out-of-range turns should return an execution error with available range");
+        assert!(
+            err.contains("0-2"),
+            "expected out-of-range error to report available turns 0-2 instead of claiming session not found, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_search_ai_history_supports_since_filter_and_snippet_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let device = witchcraft::make_device();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let recent_iso = chrono::DateTime::from_timestamp(now_secs - 3600, 0)
+            .unwrap()
+            .to_rfc3339();
+        let old_iso = chrono::DateTime::from_timestamp(now_secs - 30 * 86400, 0)
+            .unwrap()
+            .to_rfc3339();
+
+        let long_body = format!(
+            "[User] Configure authentication middleware {}\n",
+            "Z".repeat(2400)
+        );
+        db.add_doc(
+            None,
+            &Uuid::from_u128(3001),
+            iso8601_timestamp::Timestamp::parse(&recent_iso),
+            &json!({"project": "proj", "session_id": "recent-sess", "turn": 0, "source": "claude"}).to_string(),
+            &long_body,
+            Some(vec![long_body.chars().count()]),
+        )
+        .unwrap();
+
+        let old_body = "[User] Configure authentication middleware old session\n";
+        db.add_doc(
+            None,
+            &Uuid::from_u128(3002),
+            iso8601_timestamp::Timestamp::parse(&old_iso),
+            &json!({"project": "proj", "session_id": "old-sess", "turn": 0, "source": "claude"}).to_string(),
+            old_body,
+            Some(vec![old_body.chars().count()]),
+        )
+        .unwrap();
+
+        crate::embed_and_index(&db, &embedder, &device).unwrap();
+
+        let res = handle_tool_call(
+            "search_ai_history",
+            Some(json!({
+                "query": "Configure authentication middleware",
+                "since": "24h"
+            })),
+            &db,
+            &embedder,
+            &mut cache,
+        )
+        .unwrap();
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("recent-sess"),
+            "expected recent-sess in since='24h' search results, got: {text}"
+        );
+        assert!(
+            !text.contains("old-sess"),
+            "expected old-sess (30d old) to be excluded by since='24h', got: {text}"
+        );
+        assert!(
+            text.contains("Turn snippet truncated at 2000 chars"),
+            "expected 2400-char interaction body to be truncated with notice, got: {text}"
+        );
+    }
 }

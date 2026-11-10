@@ -275,6 +275,9 @@ def test_mcp_server():
             assert {"search_ai_history", "read_session", "list_projects", "list_recent_sessions"} <= set(
                 tool_map.keys()
             )
+            assert "since" in tool_map["search_ai_history"]["inputSchema"]["properties"], (
+                "Expected 'since' parameter in search_ai_history inputSchema"
+            )
 
             # 6. Test argument validation & error codes (Finding #2 & #5)
             unknown_tool_resp = client.send_request(
@@ -426,6 +429,55 @@ def test_mcp_server():
             read_range_text = read_range_resp["result"]["content"][0]["text"]
             assert "turn 0" in read_range_text and "turn 1" in read_range_text
             assert "turn 2" not in read_range_text
+
+            # 10. Test live DB reload after --nuke + re-ingest while MCP server is running (Finding #7)
+            live_dir = tmp_path / ".gemini" / "antigravity" / "brain" / "live-sess-99" / ".system_generated" / "logs"
+            live_dir.mkdir(parents=True, exist_ok=True)
+            (live_dir / "transcript.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "USER_INPUT",
+                                "content": "Command Working Directory: /workspace/live-reloaded-proj\nVerify hot reload of recreated database",
+                                "created_at": "2026-11-10T22:00:00Z",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "content": "Database recreated and reloaded cleanly.",
+                                "created_at": "2026-11-10T22:00:05Z",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            nuke_res = subprocess.run([binary, "--nuke"], env=env, capture_output=True, text=True, timeout=15)
+            assert nuke_res.returncode == 0, f"--nuke failed: {nuke_res.stderr}"
+            reingest_res = subprocess.run(
+                [binary, "--ingest-only", "--type", "gemini", "-q"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            assert reingest_res.returncode == 0, f"Re-ingest failed: {reingest_res.stderr}"
+
+            proj_after_reload = client.send_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 60,
+                    "method": "tools/call",
+                    "params": {"name": "list_projects", "arguments": {}},
+                }
+            )
+            proj_reload_text = proj_after_reload["result"]["content"][0]["text"]
+            assert "live-reloaded-proj (1 sessions)" in proj_reload_text, (
+                f"Expected running MCP server to detect recreated DB and list live-reloaded-proj, got: {proj_reload_text}"
+            )
 
         finally:
             client.close()

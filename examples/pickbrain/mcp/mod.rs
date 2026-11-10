@@ -775,6 +775,54 @@ mod tests {
     }
 
     #[test]
+    fn test_handle_request_invalid_turns_and_since_return_32602() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        for bad_turns in ["abc", "9-3", "-5", "1-2-3"] {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 40,
+                "method": "tools/call",
+                "params": {
+                    "name": "read_session",
+                    "arguments": {
+                        "session_id": "any-sess",
+                        "turns": bad_turns
+                    }
+                }
+            });
+            let resp_str = handle_request(&req.to_string(), &db, &embedder, &mut cache).unwrap();
+            let resp: Value = serde_json::from_str(&resp_str).unwrap();
+            assert_eq!(
+                resp["error"]["code"], -32602,
+                "expected -32602 for invalid turns='{bad_turns}', got {resp}"
+            );
+        }
+
+        let bad_search_since = json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "search_ai_history",
+                "arguments": {
+                    "query": "auth",
+                    "since": "invalid-duration"
+                }
+            }
+        });
+        let resp_str = handle_request(&bad_search_since.to_string(), &db, &embedder, &mut cache).unwrap();
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(
+            resp["error"]["code"], -32602,
+            "expected -32602 for invalid search_ai_history since, got {resp}"
+        );
+    }
+
+    #[test]
     fn test_handle_request_runtime_failure_returns_is_error_true() {
         let dir = tempfile::tempdir().unwrap();
         let db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
