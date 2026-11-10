@@ -216,3 +216,217 @@ pub fn handle_request(
         execute_tool_call(id, params, db, embedder, cache)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    fn shared_embedder() -> &'static witchcraft::Embedder {
+        static EMBEDDER: OnceLock<witchcraft::Embedder> = OnceLock::new();
+        EMBEDDER.get_or_init(|| {
+            let device = witchcraft::make_device();
+            witchcraft::Embedder::new(&device, Path::new("assets")).unwrap()
+        })
+    }
+
+    fn dummy_on_tool_call(
+        id: Option<JsonRpcId>,
+        _params: Option<Value>,
+    ) -> JsonRpcResponse {
+        JsonRpcResponse {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: Some(json!({})),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn test_dispatch_unparseable_json_returns_parse_error_32700() {
+        let raw = r#"{"jsonrpc":"2.0","id":9,"method":"#;
+        let resp_str = dispatch_request(raw, dummy_on_tool_call)
+            .expect("unparseable JSON must return a -32700 error response, not None");
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(resp["error"]["code"], -32700);
+        assert!(resp["id"].is_null());
+    }
+
+    #[test]
+    fn test_dispatch_missing_method_returns_invalid_request_32600() {
+        let raw = r#"{"jsonrpc":"2.0","id":10}"#;
+        let resp_str = dispatch_request(raw, dummy_on_tool_call)
+            .expect("request missing method must return -32600, not None");
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(resp["error"]["code"], -32600);
+        assert_eq!(resp["id"], 10);
+    }
+
+    #[test]
+    fn test_dispatch_batch_array_returns_invalid_request_32600() {
+        let raw = r#"[{"jsonrpc":"2.0","id":11,"method":"ping"}]"#;
+        let resp_str = dispatch_request(raw, dummy_on_tool_call)
+            .expect("batch request array must not be silently dropped");
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(resp["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn test_dispatch_explicit_null_id_returns_response() {
+        let raw = r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#;
+        let resp_str = dispatch_request(raw, dummy_on_tool_call)
+            .expect("request with explicit id:null is not a notification and must return a response");
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp.get("result").is_some() || resp.get("error").is_some());
+    }
+
+    #[test]
+    fn test_dispatch_negative_and_float_id_returns_response() {
+        let raw_neg = r#"{"jsonrpc":"2.0","id":-5,"method":"ping"}"#;
+        let resp_str = dispatch_request(raw_neg, dummy_on_tool_call)
+            .expect("request with negative integer id must not be silently dropped");
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(resp["id"], -5);
+        assert_eq!(resp["result"], json!({}));
+
+        let raw_float = r#"{"jsonrpc":"2.0","id":1.5,"method":"ping"}"#;
+        let resp_float_str = dispatch_request(raw_float, dummy_on_tool_call)
+            .expect("request with fractional id must not be silently dropped");
+        let resp_float: Value = serde_json::from_str(&resp_float_str).unwrap();
+        assert_eq!(resp_float["id"], 1.5);
+    }
+
+    #[test]
+    fn test_dispatch_genuine_notification_returns_none() {
+        let raw = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(dispatch_request(raw, dummy_on_tool_call).is_none());
+    }
+
+    #[test]
+    fn test_handle_request_unknown_tool_returns_32602() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "nonexistent_tool",
+                "arguments": {}
+            }
+        });
+        let resp_str = handle_request(&req.to_string(), &db, embedder, &mut cache).unwrap();
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn test_handle_request_missing_or_empty_query_returns_32602() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        for args in [json!({}), json!({"query": ""}), json!({"query": "   "})] {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_ai_history",
+                    "arguments": args
+                }
+            });
+            let resp_str = handle_request(&req.to_string(), &db, embedder, &mut cache).unwrap();
+            let resp: Value = serde_json::from_str(&resp_str).unwrap();
+            assert_eq!(
+                resp["error"]["code"], -32602,
+                "expected -32602 for invalid search_ai_history arguments {args}, got {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_handle_request_invalid_limit_type_returns_32602() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        for bad_limit in [json!("5"), json!(-1), json!(true)] {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "search_ai_history",
+                    "arguments": {
+                        "query": "auth",
+                        "limit": bad_limit
+                    }
+                }
+            });
+            let resp_str = handle_request(&req.to_string(), &db, embedder, &mut cache).unwrap();
+            let resp: Value = serde_json::from_str(&resp_str).unwrap();
+            assert_eq!(
+                resp["error"]["code"], -32602,
+                "expected -32602 for bad limit {bad_limit}, got {resp}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_handle_request_missing_session_id_returns_32602() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "read_session",
+                "arguments": {}
+            }
+        });
+        let resp_str = handle_request(&req.to_string(), &db, embedder, &mut cache).unwrap();
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(resp["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn test_handle_request_runtime_failure_returns_is_error_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "read_session",
+                "arguments": {
+                    "session_id": "nope"
+                }
+            }
+        });
+        let resp_str = handle_request(&req.to_string(), &db, embedder, &mut cache).unwrap();
+        let resp: Value = serde_json::from_str(&resp_str).unwrap();
+        assert!(
+            resp.get("error").is_none(),
+            "runtime tool failure must not return JSON-RPC error: {resp}"
+        );
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("nope"), "expected error text to mention session id, got: {text}");
+    }
+}

@@ -218,5 +218,235 @@ pub fn handle_tool_call(
     }
 }
 
-// In unit tests we omit state execution by ignoring test outputs
-// We only run mcp struct tests on a mock integration suite within core tests.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::OnceLock;
+    use uuid::Uuid;
+
+    fn shared_embedder() -> &'static witchcraft::Embedder {
+        static EMBEDDER: OnceLock<witchcraft::Embedder> = OnceLock::new();
+        EMBEDDER.get_or_init(|| {
+            let device = witchcraft::make_device();
+            witchcraft::Embedder::new(&device, Path::new("assets")).unwrap()
+        })
+    }
+
+    #[test]
+    fn test_list_projects_and_recent_sessions_include_sessions_without_turn_zero_and_full_150_char_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        let body_200 = "X".repeat(200);
+        let meta = json!({
+            "project": "partial-repo",
+            "session_id": "sess-no-turn-0",
+            "turn": 2,
+            "source": "claude"
+        })
+        .to_string();
+        let date = iso8601_timestamp::Timestamp::parse("2026-11-10T12:00:00Z");
+        db.add_doc(
+            None,
+            &Uuid::from_u128(1),
+            date,
+            &meta,
+            &body_200,
+            Some(vec![body_200.len()]),
+        )
+        .unwrap();
+
+        let proj_res = handle_tool_call("list_projects", None, &db, embedder, &mut cache).unwrap();
+        let proj_text = proj_res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            proj_text.contains("partial-repo (1 sessions)"),
+            "expected partial-repo in list_projects even without turn 0, got: {proj_text}"
+        );
+
+        let recent_res =
+            handle_tool_call("list_recent_sessions", None, &db, embedder, &mut cache).unwrap();
+        let recent_text = recent_res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            recent_text.contains("sess-no-turn-0"),
+            "expected sess-no-turn-0 in list_recent_sessions even without turn 0, got: {recent_text}"
+        );
+        let expected_preview = format!("Preview: {}...", "X".repeat(150));
+        assert!(
+            recent_text.contains(&expected_preview),
+            "expected 150-char preview (not 149 from SUBSTR(body, 0, 150)), got: {recent_text}"
+        );
+    }
+
+    #[test]
+    fn test_read_session_default_turn_window_and_truncation_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        for turn in 0..30u64 {
+            let body = format!("[claude:repo] Title\n[User] Question {turn}\n[Claude] Answer {turn}\n");
+            let len = body.chars().count();
+            let meta = json!({
+                "project": "repo",
+                "session_id": "long-session-30",
+                "turn": turn,
+                "source": "claude"
+            })
+            .to_string();
+            let date = iso8601_timestamp::Timestamp::parse("2026-11-10T12:00:00Z");
+            db.add_doc(
+                None,
+                &Uuid::from_u128(100 + turn as u128),
+                date,
+                &meta,
+                &body,
+                Some(vec![len]),
+            )
+            .unwrap();
+        }
+
+        let res = handle_tool_call(
+            "read_session",
+            Some(json!({"session_id": "long-session-30"})),
+            &db,
+            embedder,
+            &mut cache,
+        )
+        .unwrap();
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("turns"),
+            "expected truncation guidance mentioning `turns` parameter when reading a 30-turn session without `turns`, got: {text}"
+        );
+        assert!(
+            !text.contains("Question 29") || !text.contains("Question 0"),
+            "expected default turn window to bound a 30-turn session rather than dumping all 30 turns"
+        );
+    }
+
+    #[test]
+    fn test_search_ai_history_project_pushdown_limit_zero_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = witchcraft::DB::new(dir.path().join("test.db")).unwrap();
+        let device = witchcraft::make_device();
+        let embedder = shared_embedder();
+        let mut cache = witchcraft::EmbeddingsCache::new(1);
+
+        // Insert 12 noise documents in "noise-proj" and 2 target documents in "needle-proj"
+        for i in 0..12u64 {
+            let body = format!(
+                "[User] OAuth authentication token middleware configuration step {i}\n[Claude] Updated OAuth middleware step {i}.\n"
+            );
+            let len = body.chars().count();
+            let meta = json!({
+                "project": "noise-proj",
+                "session_id": format!("noise-sess-{i}"),
+                "session_name": format!("Noise Session {i}"),
+                "turn": 0,
+                "branch": "main",
+                "path": format!("/tmp/noise-{i}.jsonl"),
+                "source": "claude"
+            })
+            .to_string();
+            let date = iso8601_timestamp::Timestamp::parse("2026-11-10T12:00:00Z");
+            db.add_doc(
+                None,
+                &Uuid::from_u128(1000 + i as u128),
+                date,
+                &meta,
+                &body,
+                Some(vec![len]),
+            )
+            .unwrap();
+        }
+
+        for i in 0..2u64 {
+            let body = format!(
+                "[User] Discussed authentication middleware in Slack thread {i}\n[Slack] Replied on authentication middleware {i}.\n"
+            );
+            let len = body.chars().count();
+            let meta = json!({
+                "project": "needle-proj",
+                "session_id": "C12345",
+                "session_name": "security-arch",
+                "turn": i,
+                "branch": "feat/auth",
+                "path": "/tmp/slack.db",
+                "conv_key": format!("thr:C12345-170000000{i}.000100"),
+                "source": "slack"
+            })
+            .to_string();
+            let date = iso8601_timestamp::Timestamp::parse("2026-11-09T08:30:00Z");
+            db.add_doc(
+                None,
+                &Uuid::from_u128(2000 + i as u128),
+                date,
+                &meta,
+                &body,
+                Some(vec![len]),
+            )
+            .unwrap();
+        }
+
+        crate::embed_and_index(&db, embedder, &device).unwrap();
+
+        // 1. Filtering by project="needle-proj" must find needle-proj even though noise-proj has 12 closer hits
+        let proj_res = handle_tool_call(
+            "search_ai_history",
+            Some(json!({
+                "query": "OAuth authentication token middleware configuration",
+                "project": "needle-proj",
+                "limit": 5
+            })),
+            &db,
+            embedder,
+            &mut cache,
+        )
+        .unwrap();
+        let proj_text = proj_res["content"][0]["text"].as_str().unwrap();
+        assert!(
+            proj_text.contains("needle-proj"),
+            "expected project filter to push down to SQL and return needle-proj results, got: {proj_text}"
+        );
+        // Verify rich metadata (timestamp, session_name, branch, conv_key) is present
+        assert!(
+            proj_text.contains("thr:C12345-170000000"),
+            "expected search result to include conv_key for Slack threads, got: {proj_text}"
+        );
+        assert!(
+            proj_text.contains("feat/auth"),
+            "expected search result to include branch metadata, got: {proj_text}"
+        );
+
+        // 2. limit: 0 must act as unlimited (or not return false-negative "No relevant history found.")
+        let limit_zero_res = handle_tool_call(
+            "search_ai_history",
+            Some(json!({
+                "query": "authentication middleware",
+                "limit": 0
+            })),
+            &db,
+            embedder,
+            &mut cache,
+        )
+        .unwrap();
+        let limit_zero_text = limit_zero_zero_text(&limit_zero_res);
+        assert!(
+            !limit_zero_text.contains("No relevant history found."),
+            "limit: 0 must not return false-negative 'No relevant history found.'"
+        );
+        assert!(
+            limit_zero_text.matches("Session:").count() > 10,
+            "expected limit: 0 (unlimited) to return >10 matches across 14 documents, got {}",
+            limit_zero_text.matches("Session:").count()
+        );
+    }
+
+    fn limit_zero_zero_text(val: &Value) -> &str {
+        val["content"][0]["text"].as_str().unwrap_or("")
+    }
+}

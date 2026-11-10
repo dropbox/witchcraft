@@ -414,7 +414,7 @@ fn ingest(
     Ok(total)
 }
 
-fn embed_and_index(db: &DB, embedder: &Embedder, _device: &candle_core::Device) -> Result<()> {
+pub(crate) fn embed_and_index(db: &DB, embedder: &Embedder, _device: &candle_core::Device) -> Result<()> {
     let _embedded = witchcraft::embed_chunks(db, embedder, None)?;
     let options = witchcraft::IndexOptions::default().force_flush();
     witchcraft::index_chunks_with_options(db, None, false, options)?;
