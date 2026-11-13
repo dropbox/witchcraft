@@ -64,9 +64,11 @@ PICKBRAIN_FEATURES := $(CLI_FEATURES),sqlite,embed-assets
 # Binary path
 ifdef TARGET
   CLI_BIN := target/$(TARGET)/release/warp-cli
+  PICKBRAIN_BIN := target/$(TARGET)/release/examples/pickbrain
   BUILD_TARGET := --target $(TARGET)
 else
   CLI_BIN := target/release/warp-cli
+  PICKBRAIN_BIN := target/release/examples/pickbrain
   BUILD_TARGET :=
 endif
 
@@ -199,7 +201,11 @@ dylib: prereqs download
 
 pickbrain: prereqs download
 	cargo build --release $(BUILD_TARGET) --features $(PICKBRAIN_FEATURES) --example pickbrain
-	ln -sf target/$(TARGET)/release/examples/pickbrain ./pickbrain
+	ln -sf $(PICKBRAIN_BIN) ./pickbrain
+
+pickbrain-test: pickbrain
+	cargo test --release $(BUILD_TARGET) --features $(PICKBRAIN_FEATURES) --example pickbrain
+	python3 examples/pickbrain/mcp_test.py ./pickbrain
 
 pickbrain-install: pickbrain
 	@pkill -u "$$(id -u)" -x pickbrain || test $$? -eq 1
@@ -241,7 +247,7 @@ module: prereqs neso-kernels-metal neso-kernels-metal-nosimd download
 	lipo -create target/aarch64-apple-darwin/release/libwitchcraft.dylib target/x86_64-apple-darwin/release/libwitchcraft.dylib -output target/release/warp-macos-universal.node
 	ln -sf target/release/warp-macos-universal.node warp.node
 
-test: prereqs download
+test: prereqs download pickbrain-test
 	RUST_LOG=debug cargo llvm-cov nextest --release --features napi,$(CLI_FEATURES) --lcov --output-path lcov.info
 
 #genhtml lcov.info
@@ -418,6 +424,7 @@ distclean:
 	trec-score \
 	pickbrain \
 	pickbrain-install \
+	pickbrain-test \
 	prereqs \
 	python-build-deps \
 	python-dev \
