@@ -1102,12 +1102,42 @@ pub fn fulltext_search_with_prefix_wildcard(
     Ok(fts_matches)
 }
 
+const DEFAULT_MAX_BATCH_BYTES: usize = 32 * 1024;
+
+fn embedding_batch_max_bytes() -> usize {
+    std::env::var("WITCHCRAFT_EMBED_BATCH_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(DEFAULT_MAX_BATCH_BYTES)
+}
+
 pub fn embed_chunks_with_cache(
     db: &DB,
     embedder: &Embedder,
     cache: &dyn EmbeddingCache,
     limit: Option<usize>,
 ) -> Result<usize> {
+    embed_chunks_with_cache_limits(
+        db,
+        embedder,
+        cache,
+        limit,
+        crate::embedder::embedding_batch_size(),
+        embedding_batch_max_bytes(),
+    )
+}
+
+pub(crate) fn embed_chunks_with_cache_limits(
+    db: &DB,
+    embedder: &Embedder,
+    cache: &dyn EmbeddingCache,
+    limit: Option<usize>,
+    batch_size: usize,
+    max_batch_bytes: usize,
+) -> Result<usize> {
+    let batch_size = batch_size.max(1);
+    let max_batch_bytes = max_batch_bytes.max(1);
     let _priority_mgr = crate::priority::PriorityManager::new();
 
     let mut progress = {
@@ -1129,7 +1159,6 @@ pub fn embed_chunks_with_cache(
         ProgressReporter::new("embed", total)
     };
 
-    let batch_size = crate::embedder::embedding_batch_size();
     // Do not hold one read transaction open while inserting all cache rows.
     // In WAL mode that pins the initial snapshot and prevents checkpoints, so
     // a large corpus makes the WAL grow for the full duration of embedding.
@@ -1138,6 +1167,7 @@ pub fn embed_chunks_with_cache(
     let mut pending_hashes = Vec::with_capacity(batch_size);
     let mut pending_bodies = Vec::with_capacity(batch_size);
     let mut pending_lens = Vec::with_capacity(batch_size);
+    let mut pending_bytes = 0usize;
     let mut count = 0;
     let mut last_rowid = 0i64;
     let mut remaining = limit.unwrap_or(usize::MAX);
@@ -1182,10 +1212,11 @@ pub fn embed_chunks_with_cache(
                 );
             }
 
+            pending_bytes = pending_bytes.saturating_add(body.len());
             pending_hashes.push(hash);
             pending_bodies.push(body);
             pending_lens.push(lens);
-            if pending_hashes.len() == batch_size {
+            if pending_hashes.len() >= batch_size || pending_bytes >= max_batch_bytes {
                 let computed = flush_embedding_batch(
                     cache,
                     embedder,
@@ -1193,6 +1224,7 @@ pub fn embed_chunks_with_cache(
                     &mut pending_bodies,
                     &mut pending_lens,
                 )?;
+                pending_bytes = 0;
                 count += computed;
                 progress.inc(computed);
             }

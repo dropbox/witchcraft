@@ -1386,6 +1386,64 @@ mod tests {
     }
 
     #[test]
+    fn test_embed_chunks_flushes_large_batches_incrementally() -> anyhow::Result<()> {
+        struct RecordingCache {
+            events: std::sync::Mutex<Vec<&'static str>>,
+        }
+
+        impl crate::EmbeddingCache for RecordingCache {
+            fn get(&self, _hash: &str) -> anyhow::Result<Option<crate::CachedEmbeddings>> {
+                self.events.lock().unwrap().push("get");
+                Ok(None)
+            }
+
+            fn put(&self, _hash: &str, _embeddings: &crate::CachedEmbeddings) -> anyhow::Result<()> {
+                self.events.lock().unwrap().push("put");
+                Ok(())
+            }
+        }
+
+        let dir = tempdir()?;
+        let path = dir.path().join("incremental_flush_test.sqlite");
+        let assets = PathBuf::from("assets");
+        let mut db = DB::new(path)?;
+        let device = crate::make_device();
+        let embedder = crate::Embedder::new(&device, &assets)?;
+
+        // Three ~150-byte docs exceed the 200-byte budget while staying well below batch_size=32.
+        let sample_body = "alpha beta gamma delta ".repeat(6);
+        for i in 0..3 {
+            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("large-{i}").as_bytes());
+            db.add_doc(None, &uuid, None, "{}", &format!("{sample_body} doc{i}"), None)?;
+        }
+
+        let cache = RecordingCache {
+            events: std::sync::Mutex::new(Vec::new()),
+        };
+        let count = crate::sqlite_index::embed_chunks_with_cache_limits(
+            &db,
+            &embedder,
+            &cache,
+            None,
+            32,
+            200,
+        )?;
+        assert_eq!(count, 3);
+
+        let events = cache.events.lock().unwrap().clone();
+        let first_put = events.iter().position(|&e| e == "put").expect("expected put events");
+        let last_get = events.iter().rposition(|&e| e == "get").expect("expected get events");
+        assert!(
+            first_put < last_get,
+            "expected incremental flush before scanning all docs, got events: {events:?}"
+        );
+
+        db.clear();
+        db.shutdown();
+        Ok(())
+    }
+
+    #[test]
     fn fts5_query_splits_punctuation_and_uses_or_terms() {
         let stopwords = std::collections::HashSet::new();
         let (query, normalized) =
