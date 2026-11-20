@@ -1102,15 +1102,7 @@ pub fn fulltext_search_with_prefix_wildcard(
     Ok(fts_matches)
 }
 
-const DEFAULT_MAX_BATCH_BYTES: usize = 32 * 1024;
-
-fn embedding_batch_max_bytes() -> usize {
-    std::env::var("WITCHCRAFT_EMBED_BATCH_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or(DEFAULT_MAX_BATCH_BYTES)
-}
+const MAX_BATCH_BYTES: usize = 32 * 1024;
 
 pub fn embed_chunks_with_cache(
     db: &DB,
@@ -1124,7 +1116,7 @@ pub fn embed_chunks_with_cache(
         cache,
         limit,
         crate::embedder::embedding_batch_size(),
-        embedding_batch_max_bytes(),
+        MAX_BATCH_BYTES,
     )
 }
 
