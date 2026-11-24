@@ -20,9 +20,9 @@ anyhow = "*"
 serde = "*"
 serde_json = "*"
 
-candle-core = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645" }
-candle-nn = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645" }
-candle-transformers = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645" }
+candle-core = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e" }
+candle-nn = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e" }
+candle-transformers = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e" }
 
 tokenizers = { version = "0.22", features = ["fancy-regex"] }
 serde_plain = "1.0.2"
@@ -64,9 +64,9 @@ chromium-idb = { path = "crates/chromium-idb" }
 
 # Apple Silicon (ARM) - enable Metal support
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-candle-core = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645", features = ["metal"] }
-candle-nn = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645", features = ["metal"] }
-candle-metal-kernels = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645", optional=true }
+candle-core = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e", features = ["metal"] }
+candle-nn = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e", features = ["metal"] }
+candle-metal-kernels = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e", optional=true }
 metal = { version = "0.33.0", features = ["mps"], optional = true }
 ug-metal = { version = "0.5.0", optional = true }
 dispatch2 = { version = "0.3", optional = true }
@@ -74,9 +74,9 @@ objc2-metal = { version = "0.3", optional = true }
 
 # Intel (x86_64) - Neso-generated scalar Metal kernels
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
-candle-core = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645", features = ["metal"] }
-candle-nn = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645", features = ["metal"] }
-candle-metal-kernels = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645", optional=true }
+candle-core = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e", features = ["metal"] }
+candle-nn = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e", features = ["metal"] }
+candle-metal-kernels = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e", optional=true }
 metal = { version = "0.33.0", features = ["mps"], optional = true }
 ug-metal = { version = "0.5.0", optional = true }
 dispatch2 = { version = "0.3", optional = true }
@@ -85,7 +85,7 @@ objc2-metal = { version = "0.3", optional = true }
 # Windows - priority management
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
-candle-d3d12-kernels = { git = "https://github.com/jacobgorm/candle", rev = "2f819fe896d42ee12e2e8a411f917d5aac655645", optional = true }
+candle-d3d12-kernels = { git = "https://github.com/jacobgorm/candle", rev = "c1fbd33c903a567cae37917fefa2baea6430e08e", optional = true }
 
 [build-dependencies]
 cbindgen = "0.29.3"
