@@ -49,7 +49,7 @@ else ifeq ($(UNAME_S),Linux)
     PYTHON_FEATURES := $(ENCODER),python
   else
     # Linux x86_64 CPU-only
-    CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress
+    CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress,sqlite
     CAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
     PYTHON_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,python
