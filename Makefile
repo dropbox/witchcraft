@@ -14,15 +14,13 @@ endif
 # toolkit is newer than the versions it knows about, e.g. `Unsupported cuda
 # toolkit version: 13.5`. Newer minor releases keep the same API surface, so pin
 # cudarc to the newest toolkit version it supports in the same major series.
+# The logic lives in scripts/pin_cuda_version.sh: GNU Make 3.81 chokes on nested
+# $(...) refs inside a long $(shell ...) (bogus "unterminated call to function
+# 'shell'" from its expansion-buffer bug), so the call must stay short.
 CUDARC_MAX_MAJOR ?= 13
 CUDARC_MAX_MINOR ?= 4
 CUDA_TOOLKIT_VERSION := $(shell $(or $(NVCC),nvcc) --version 2>/dev/null | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1.\2/p' | head -n 1)
-CUDARC_CUDA_VERSION ?= $(shell \
-	v='$(CUDA_TOOLKIT_VERSION)'; \
-	maj=$${v%%.*}; min=$${v#*.}; \
-	if [ -n "$$v" ] && [ "$$maj" = '$(CUDARC_MAX_MAJOR)' ] && [ "$$min" -gt '$(CUDARC_MAX_MINOR)' ] 2>/dev/null; then \
-		printf '%s0%s0\n' "$$maj" '$(CUDARC_MAX_MINOR)'; \
-	fi)
+CUDARC_CUDA_VERSION ?= $(shell ./scripts/pin_cuda_version.sh '$(CUDA_TOOLKIT_VERSION)' '$(CUDARC_MAX_MAJOR)' '$(CUDARC_MAX_MINOR)')
 ifneq ($(strip $(CUDARC_CUDA_VERSION)),)
   export CUDARC_CUDA_VERSION
 endif
