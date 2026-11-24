@@ -43,7 +43,7 @@ else ifeq ($(UNAME_S),Linux)
     PYTHON_FEATURES := $(ENCODER),cuda,hybrid-dequant,python
   else ifeq ($(UNAME_M),aarch64)
     # Linux ARM (Graviton, Pi, Ampere): fbgemm/hybrid-dequant are x86-only
-    CLI_FEATURES := $(ENCODER),progress
+    CLI_FEATURES := $(ENCODER),progress,sqlite
     CAPI_FEATURES := $(ENCODER),capi-embed-cache
     NAPI_FEATURES := $(ENCODER),napi
     PYTHON_FEATURES := $(ENCODER),python
