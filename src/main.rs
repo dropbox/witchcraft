@@ -382,25 +382,14 @@ fn main() -> Result<()> {
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let db = DB::new_fast(db_name).unwrap();
         let _got = witchcraft::embed_chunks(&db, &embedder, None).unwrap();
-    } else if args.len() == 2 && &args[1] == "index" {
-        let device = witchcraft::make_device();
-        let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
-        let db = DB::new_fast(db_name).unwrap();
-        witchcraft::index_chunks_with_options(
-            &db,
-            Some(&embedder),
-            false,
-            witchcraft::IndexOptions::default().force_flush(),
-        )
-        .unwrap();
-    } else if args.len() == 2 && &args[1] == "reindex" {
+    } else if args.len() == 2 && (&args[1] == "index" || &args[1] == "reindex") {
         println!("reindex: opening {}", db_name.display());
         let db = DB::new_fast(db_name).unwrap();
         println!("reindex: rebuilding semantic index from cached embeddings");
         witchcraft::index_chunks_with_options(
             &db,
             None,
-            true,
+            &args[1] == "reindex",
             witchcraft::IndexOptions::default().force_flush(),
         )
         .unwrap();
