@@ -367,6 +367,7 @@ fn validate_semantic_search(db: &DB, embedder: Option<&witchcraft::Embedder>) ->
 }
 
 fn main() -> Result<()> {
+    witchcraft::init_thread_pool();
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Info));
 
     let args: Vec<String> = env::args().collect();

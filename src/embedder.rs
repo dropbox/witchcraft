@@ -65,6 +65,7 @@ pub struct EmbeddingOutput {
 
 impl Embedder {
     pub fn new(device: &Device, assets: &std::path::Path) -> Result<Self> {
+        crate::init_thread_pool();
         let (builder, tokenizer) = t5_encoder::T5ModelBuilder::load(assets)?;
         let query_tokenizer = tokenizer_for_queries(&tokenizer);
         let model = builder.build_encoder(device, assets)?;

@@ -397,7 +397,71 @@ fn load_cached_embeddings(
     }
 }
 
+static THREAD_POOL_INIT: std::sync::Once = std::sync::Once::new();
+
+fn configured_thread_count() -> usize {
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .or_else(|| {
+            std::env::var("CANDLE_NUM_THREADS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&value| value > 0)
+        })
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|value| value.get())
+                .unwrap_or(1)
+        })
+}
+
+fn set_thread_env(name: &str, threads: usize) {
+    if std::env::var_os(name).is_none() {
+        std::env::set_var(name, threads.to_string());
+    }
+}
+
+/// Configure the process-wide rayon thread pool once, before heavy work starts.
+///
+/// Candle's CPU kernels call `num_cpus::get_physical()` for every matmul unless
+/// `RAYON_NUM_THREADS` is set, and on Linux `num_cpus` re-opens `/proc/cpuinfo`
+/// on every call. Building the global rayon pool up front and pinning the
+/// resolved thread count in the environment keeps that probe to one call for
+/// the life of the process.
+///
+/// Safe to call multiple times; initialization happens exactly once.
+pub fn init_thread_pool() {
+    THREAD_POOL_INIT.call_once(|| {
+        let threads = configured_thread_count();
+
+        #[cfg(feature = "hybrid-dequant")]
+        {
+            // `build_global` fails if rayon was already initialized elsewhere;
+            // in that case adopt the existing pool's size below.
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build_global();
+            let threads = rayon::current_num_threads();
+            set_thread_env("RAYON_NUM_THREADS", threads);
+            set_thread_env("CANDLE_NUM_THREADS", threads);
+        }
+
+        #[cfg(not(feature = "hybrid-dequant"))]
+        {
+            // Without the rayon feature we cannot build the pool directly, but
+            // candle still consults these variables before falling back to
+            // `num_cpus`, which probes `/proc/cpuinfo` on every matmul.
+            set_thread_env("RAYON_NUM_THREADS", threads);
+            set_thread_env("CANDLE_NUM_THREADS", threads);
+        }
+    });
+}
+
 pub fn make_device() -> Device {
+    init_thread_pool();
+
     if cfg!(target_os = "macos") && (cfg!(target_arch = "aarch64") || cfg!(feature = "neso-metal")) {
         let previous_panic_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
