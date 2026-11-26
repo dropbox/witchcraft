@@ -149,6 +149,11 @@ impl DB {
 
     fn configure(connection: &Connection) -> SQLResult<()> {
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        // WAL + NORMAL (SQLite's recommended default): commits are ordinary
+        // writes — no fsync per commit, only at WAL checkpoints. Corruption is
+        // still impossible; a power/hardware failure can only lose the most
+        // recent transactions.
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
         Ok(())

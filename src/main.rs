@@ -168,12 +168,32 @@ fn split_doc(body: String) -> Vec<String> {
 pub fn read_csv(db: &mut DB, csvname: std::path::PathBuf) -> Result<()> {
     println!("register documents from CSV...");
 
+    // synchronous=NORMAL is the global WAL default now; batching amortizes
+    // commits over all rows in a chunk (one statement + one commit per batch).
+
+    const BATCH_SIZE: usize = 512;
     let file = File::open(csvname)?;
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(b'\t')
         .has_headers(false)
         .from_reader(file);
 
+    let mut batch: Vec<(Option<u64>, Uuid, String, String, Option<Vec<usize>>)> =
+        Vec::with_capacity(BATCH_SIZE);
+    // Flushing an empty batch is fine: add_docs_batch returns early for it.
+    fn add_batch(
+        db: &mut DB,
+        batch: &mut Vec<(Option<u64>, Uuid, String, String, Option<Vec<usize>>)>,
+    ) {
+        let docs: Vec<_> = batch
+            .iter()
+            .map(|(rowid, uuid, metadata, body, lens)| {
+                (*rowid, *uuid, None, metadata.as_str(), body.as_str(), lens.clone())
+            })
+            .collect();
+        db.add_docs_batch(&docs).unwrap();
+        batch.clear();
+    }
     for result in rdr.deserialize() {
         let record: CSVRecord = result?;
         let metadata = CorpusMetaData { key: record.name };
@@ -184,9 +204,13 @@ pub fn read_csv(db: &mut DB, csvname: std::path::PathBuf) -> Result<()> {
         let lens = bodies.iter().map(|b| b.chars().count()).collect();
         let body = bodies.join("");
         let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-        db.add_doc(None, &uuid, None, &metadata, &body, Some(lens))
-            .unwrap();
+        batch.push((None, uuid, metadata, body, Some(lens)));
+
+        if batch.len() >= BATCH_SIZE {
+            add_batch(db, &mut batch);
+        }
     }
+    add_batch(db, &mut batch);
 
     Ok(())
 }
@@ -378,6 +402,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         let csvname = &args[2];
         read_csv(&mut db, csvname.into()).unwrap();
+        db.shutdown();
     } else if args.len() == 2 && &args[1] == "embed" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
